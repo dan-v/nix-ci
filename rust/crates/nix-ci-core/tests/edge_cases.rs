@@ -615,6 +615,5 @@ async fn heartbeat_keeps_live_job_fresh(pool: PgPool) {
         .create_job(&CreateJobRequest { external_ref: None })
         .await
         .unwrap();
-    let resp = client.heartbeat(job.id).await.unwrap();
-    assert!(resp.ok);
+    client.heartbeat(job.id).await.unwrap();
 }

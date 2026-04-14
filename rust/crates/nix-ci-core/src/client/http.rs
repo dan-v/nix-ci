@@ -9,8 +9,8 @@ use serde::de::DeserializeOwned;
 use crate::error::{Error, Result};
 use crate::types::{
     ClaimId, ClaimResponse, CompleteRequest, CompleteResponse, CreateJobRequest, CreateJobResponse,
-    HeartbeatResponse, IngestBatchRequest, IngestBatchResponse, IngestDrvRequest,
-    IngestDrvResponse, JobId, JobStatusResponse, SealJobResponse,
+    IngestBatchRequest, IngestBatchResponse, IngestDrvRequest, IngestDrvResponse, JobId,
+    JobStatusResponse, SealJobResponse,
 };
 
 #[derive(Clone)]
@@ -83,13 +83,17 @@ impl CoordinatorClient {
         decode(resp).await
     }
 
-    pub async fn heartbeat(&self, job_id: JobId) -> Result<HeartbeatResponse> {
+    pub async fn heartbeat(&self, job_id: JobId) -> Result<()> {
         let url = format!("{}/jobs/{}/heartbeat", self.base, job_id);
         let resp = self.http.post(&url).send().await?;
-        if resp.status() == StatusCode::GONE {
-            return Err(Error::Gone("job is terminal".into()));
+        match resp.status() {
+            s if s.is_success() => Ok(()),
+            StatusCode::GONE => Err(Error::Gone("job is terminal".into())),
+            s => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(Error::Internal(format!("heartbeat {s}: {body}")))
+            }
         }
-        decode(resp).await
     }
 
     pub async fn claim(

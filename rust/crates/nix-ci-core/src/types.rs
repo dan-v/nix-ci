@@ -229,11 +229,6 @@ pub struct FailJobRequest {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatResponse {
-    pub ok: bool,
-}
-
 // ─── API: claim & complete ────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
