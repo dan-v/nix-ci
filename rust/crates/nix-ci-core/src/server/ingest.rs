@@ -6,7 +6,9 @@
 use axum::extract::{Path, State};
 use axum::Json;
 
-use super::ingest_common::{arm_if_leaf, attach_step_to_submission, reject_if_terminal, wire_dep};
+use super::ingest_common::{
+    arm_if_leaf, attach_step_to_submission, failed_output_hits, reject_if_terminal, wire_dep,
+};
 use super::AppState;
 use crate::dispatch::Step;
 use crate::durable::writeback::{self, UpsertDrv};
@@ -28,9 +30,9 @@ pub async fn submit_drv(
 
     reject_if_terminal(&state, id).await?;
 
-    let is_known_failed = writeback::is_failed_output(&state.pool, &req.drv_path)
+    let is_known_failed = failed_output_hits(&state, &[req.drv_path.as_str()])
         .await
-        .unwrap_or(false);
+        .contains(&req.drv_path);
 
     let sub = state
         .dispatcher

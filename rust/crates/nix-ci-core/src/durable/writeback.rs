@@ -50,8 +50,12 @@ pub async fn heartbeat_job(pool: &PgPool, job_id: JobId) -> Result<bool> {
     Ok(updated.rows_affected() > 0)
 }
 
-pub async fn seal_job(pool: &PgPool, job_id: JobId) -> Result<()> {
-    sqlx::query(
+/// Seal a job. Returns `true` if the row was updated, `false` if the
+/// job does not exist. The caller uses the return value to distinguish
+/// 404 (unknown job_id) from a successful no-op; a job that is already
+/// sealed is still considered a success.
+pub async fn seal_job(pool: &PgPool, job_id: JobId) -> Result<bool> {
+    let res = sqlx::query(
         r#"
         UPDATE jobs SET sealed = TRUE
         WHERE id = $1
@@ -60,10 +64,14 @@ pub async fn seal_job(pool: &PgPool, job_id: JobId) -> Result<()> {
     .bind(job_id.0)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn fail_job_eval(pool: &PgPool, job_id: JobId, message: &str) -> Result<()> {
+    // `done_at IS NULL` guard is deliberate: if the job is already
+    // terminal, leave its existing terminal state alone. Zero rows is
+    // a valid no-op here (idempotent retry), so we don't inspect
+    // rows_affected.
     sqlx::query(
         r#"
         UPDATE jobs
@@ -80,8 +88,16 @@ pub async fn fail_job_eval(pool: &PgPool, job_id: JobId, message: &str) -> Resul
     Ok(())
 }
 
-pub async fn transition_job_terminal(pool: &PgPool, job_id: JobId, status: &str) -> Result<()> {
-    sqlx::query(
+/// Transition a job to a terminal state. Returns `true` if this call
+/// won the write (job was non-terminal) and `false` if the job was
+/// already terminal or does not exist — in either of those cases the
+/// caller should not re-publish JobDone events.
+pub async fn transition_job_terminal(
+    pool: &PgPool,
+    job_id: JobId,
+    status: &str,
+) -> Result<bool> {
+    let res = sqlx::query(
         r#"
         UPDATE jobs
         SET status = $2, done_at = now()
@@ -92,7 +108,7 @@ pub async fn transition_job_terminal(pool: &PgPool, job_id: JobId, status: &str)
     .bind(status)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 pub struct UpsertDrv<'a> {
@@ -358,13 +374,23 @@ pub async fn upsert_drv_and_deps(
     Ok(())
 }
 
+/// Flip a derivation's durable state from `pending` to `building`.
+///
+/// Returns `Err(Conflict)` if zero rows were updated — meaning the
+/// durable state has already diverged from the in-memory dispatcher
+/// (the row is in `done`, `failed`, or another `building`). The
+/// caller at `server/claim.rs` unwinds: drops the in-memory claim,
+/// re-arms the step, and propagates the error so the worker retries
+/// via a fresh `/claim`. Silently succeeding here would leave us with
+/// an in-memory claim that has no durable counterpart, which rehydrate
+/// can't reconcile until the coordinator restarts.
 pub async fn mark_building(
     pool: &PgPool,
     drv_hash: &DrvHash,
     claim_id: ClaimId,
     attempt: i32,
 ) -> Result<()> {
-    sqlx::query(
+    let res = sqlx::query(
         r#"
         UPDATE derivations
         SET state = 'building',
@@ -378,6 +404,11 @@ pub async fn mark_building(
     .bind(attempt)
     .execute(pool)
     .await?;
+    if res.rows_affected() == 0 {
+        return Err(crate::Error::Conflict(format!(
+            "mark_building: drv {drv_hash} not in pending state"
+        )));
+    }
     Ok(())
 }
 
@@ -532,16 +563,3 @@ pub async fn mark_terminal_failure(pool: &PgPool, failed: MarkFailed<'_>) -> Res
     Ok(propagated.into_iter().map(|(h,)| h).collect())
 }
 
-pub async fn is_failed_output(pool: &PgPool, drv_path: &str) -> Result<bool> {
-    let row: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT output_path FROM failed_outputs
-        WHERE output_path = $1 AND expires_at > now()
-        LIMIT 1
-        "#,
-    )
-    .bind(drv_path)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.is_some())
-}

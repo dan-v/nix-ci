@@ -85,16 +85,22 @@ async fn reap_stale_jobs(pool: &PgPool, dispatcher: &Dispatcher, timeout: Durati
     let mut tx = pool.begin().await?;
     let uuids: Vec<sqlx::types::Uuid> = stale_ids.iter().map(|(u,)| *u).collect();
 
-    // Release assigned drvs belonging to these jobs (via job_roots closure)
+    // Release assigned drvs belonging to these jobs — including
+    // transitive, non-root derivations. The previous query only
+    // touched `job_roots`, leaving any building child drv wedged
+    // until its 2h claim deadline expired. For a large DAG with
+    // thousands of build nodes, that was most of the drvs.
     sqlx::query(
         r#"
+        WITH RECURSIVE closure AS (
+            SELECT drv_hash FROM job_roots WHERE job_id = ANY($1::uuid[])
+            UNION
+            SELECT d.dep_hash FROM deps d JOIN closure c ON c.drv_hash = d.drv_hash
+        )
         UPDATE derivations
         SET state = 'pending', assigned_claim_id = NULL
         WHERE state = 'building'
-          AND drv_hash IN (
-              SELECT jr.drv_hash FROM job_roots jr
-              WHERE jr.job_id = ANY($1::uuid[])
-          )
+          AND drv_hash IN (SELECT drv_hash FROM closure)
         "#,
     )
     .bind(&uuids)

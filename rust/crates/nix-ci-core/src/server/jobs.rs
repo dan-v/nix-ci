@@ -54,7 +54,11 @@ pub async fn seal(
         return Err(Error::NotFound(format!("job {id}")));
     };
     sub.seal();
-    writeback::seal_job(&state.pool, id).await?;
+    // seal_job returning false means the durable row does not exist —
+    // surface as 404 rather than silently "succeeding."
+    if !writeback::seal_job(&state.pool, id).await? {
+        return Err(Error::NotFound(format!("job {id}")));
+    }
     // A sealed submission whose toplevels are already terminal
     // (including the empty-toplevels case) must transition to Done
     // immediately — otherwise the client waits forever for a
@@ -81,11 +85,45 @@ pub async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<JobId>,
 ) -> Result<Json<SealJobResponse>> {
-    writeback::transition_job_terminal(&state.pool, id, "cancelled").await?;
+    // Release any derivations this job holds in `building` — including
+    // transitive, non-root drvs. Without this, a cancelled job leaves
+    // its in-flight drvs wedged at `state='building'` in Postgres
+    // until the claim deadline (2h default) expires; another job that
+    // shares those drvs via cross-job dedup would be blocked on them.
+    // The in-memory dispatcher removes the submission in transition_to
+    // below; workers' pending /complete calls are rejected via the
+    // claim_id-matching guard in complete.rs.
+    release_job_building_drvs(&state.pool, id).await?;
+
+    let _transitioned = writeback::transition_job_terminal(&state.pool, id, "cancelled").await?;
     transition_to(&state, id, JobStatus::Cancelled, Vec::new());
     Ok(Json(SealJobResponse {
         status: JobStatus::Cancelled,
     }))
+}
+
+/// Release all `building` derivations reachable from this job's roots
+/// back to `pending` with their claim cleared. Transitive deps are
+/// included via a recursive CTE — matches the closure logic used in
+/// `counts_from_db` so we don't orphan non-root drvs.
+async fn release_job_building_drvs(pool: &sqlx::PgPool, job_id: JobId) -> Result<()> {
+    sqlx::query(
+        r#"
+        WITH RECURSIVE closure AS (
+            SELECT drv_hash FROM job_roots WHERE job_id = $1
+            UNION
+            SELECT d.dep_hash FROM deps d JOIN closure c ON c.drv_hash = d.drv_hash
+        )
+        UPDATE derivations
+        SET state = 'pending', assigned_claim_id = NULL
+        WHERE state = 'building'
+          AND drv_hash IN (SELECT drv_hash FROM closure)
+        "#,
+    )
+    .bind(job_id.0)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Consolidated terminal-transition path for seal/fail/cancel. Does:

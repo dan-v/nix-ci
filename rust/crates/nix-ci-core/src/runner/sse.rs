@@ -15,9 +15,21 @@ use crate::types::{JobEvent, JobId, JobStatus};
 
 const MAX_RECONNECTS: u32 = 10;
 
+/// Consume the coordinator's SSE stream. Returns when the job reaches
+/// a terminal state, or when `shutdown_rx` flips to true.
+///
+/// On any terminal event observed over SSE, we **signal `shutdown_tx`
+/// ourselves** so the rest of the orchestrator (worker, heartbeat,
+/// submitter, eval kill guard) winds down promptly. Without this, an
+/// external `POST /jobs/{id}/cancel` publishes JobDone{Cancelled}
+/// here but the worker keeps long-polling on /claim (returning 410
+/// per request) until the next claim cycle, and the submitter keeps
+/// posting drvs whose ingest fails with 410 Gone. Propagating
+/// shutdown from SSE closes that window.
 pub async fn print_events(
     client: Arc<CoordinatorClient>,
     job_id: JobId,
+    shutdown_tx: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<JobStatus> {
     let mut reconnect_attempt: u32 = 0;
@@ -67,6 +79,7 @@ pub async fn print_events(
                             if let Ok(parsed) = serde_json::from_str::<JobEvent>(&e.data) {
                                 print_event(&parsed);
                                 if let JobEvent::JobDone { status, .. } = parsed {
+                                    let _ = shutdown_tx.send(true);
                                     return Ok(status);
                                 }
                             }

@@ -323,7 +323,12 @@ pub(super) async fn check_and_publish_terminal(
         JobStatus::Done
     };
 
-    writeback::transition_job_terminal(&state.pool, sub.id, final_status.as_str()).await?;
+    // `transition_job_terminal` is idempotent on `done_at IS NULL`;
+    // a zero-rows result means another path already concluded the job
+    // — still safe to proceed, the in-memory CAS below is the
+    // authoritative gate for event publication.
+    let _transitioned =
+        writeback::transition_job_terminal(&state.pool, sub.id, final_status.as_str()).await?;
 
     if !sub.mark_terminal() {
         return Ok(());

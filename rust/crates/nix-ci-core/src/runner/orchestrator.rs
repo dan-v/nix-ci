@@ -51,11 +51,17 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // SSE listener
+    // SSE listener. Passes `shutdown_tx` in as well so that a terminal
+    // event observed on the stream (e.g., external cancel) immediately
+    // tells the worker, submitter, and heartbeat loops to wind down —
+    // otherwise the worker keeps long-polling on /claim (which 410s)
+    // and the submitter keeps ingesting into a terminated job until
+    // the eval stream ends.
     let sse_handle = {
         let client = client.clone();
+        let tx = shutdown_tx.clone();
         let rx = shutdown_rx.clone();
-        tokio::spawn(async move { sse::print_events(client, job_id, rx).await })
+        tokio::spawn(async move { sse::print_events(client, job_id, tx, rx).await })
     };
 
     // Worker loop
@@ -99,7 +105,7 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
         }
     });
 
-    let submit_stats = submitter::run(client.clone(), job_id, eval_rx).await?;
+    let submit_stats = submitter::run(client.clone(), job_id, eval_rx, shutdown_rx.clone()).await?;
     tracing::info!(
         new = submit_stats.new_drvs,
         deduped = submit_stats.dedup_skipped,

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 
 use crate::client::CoordinatorClient;
 use crate::error::{Error, Result};
@@ -43,6 +44,7 @@ pub async fn run(
     client: Arc<CoordinatorClient>,
     job_id: JobId,
     mut eval_rx: Receiver<EvalLine>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<SubmitStats> {
     let mut stats = SubmitStats {
         new_drvs: 0,
@@ -60,7 +62,18 @@ pub async fn run(
     // re-POST to the coordinator.
     let mut submitted: HashSet<String> = HashSet::new();
 
-    while let Some(line) = eval_rx.recv().await {
+    loop {
+        let line = tokio::select! {
+            maybe = eval_rx.recv() => match maybe {
+                Some(l) => l,
+                None => break,
+            },
+            // Shutdown flipped: the job is gone (cancel / reaper / SSE
+            // saw JobDone). Stop consuming the eval stream — further
+            // ingest POSTs would 410 and waste work. The eval kill
+            // guard in the orchestrator handles the nix-eval-jobs child.
+            _ = shutdown.changed() => break,
+        };
         // Per-attribute eval errors are NOT fatal for the submission.
         // nix-eval-jobs emits them inline ({"attr":"broken","error":
         // "…"}) and keeps going; we do the same. The attr is skipped

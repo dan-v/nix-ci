@@ -102,6 +102,48 @@ pub(crate) fn placeholder_name_from(drv_path: &str) -> String {
         .to_string()
 }
 
+/// Look up cached failed-output paths for a set of drv_paths in one
+/// round-trip. Returns the subset of `drv_paths` that appear in the
+/// unexpired `failed_outputs` cache. Callers use this to pre-mark
+/// matching steps as `previous_failure + finished` so the dispatcher
+/// short-circuits retries of paths we recently burned on.
+///
+/// A DB error here is **not** fatal for ingest — we just don't get
+/// the cache benefit. Log and return an empty set so the ingest path
+/// still makes forward progress. Previously the single-drv path had
+/// this fallback but the batch path lacked a failed-output check
+/// entirely, creating policy drift between the two.
+pub(super) async fn failed_output_hits(
+    state: &AppState,
+    drv_paths: &[&str],
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    if drv_paths.is_empty() {
+        return HashSet::new();
+    }
+    let paths: Vec<&str> = drv_paths.iter().copied().collect();
+    let rows: Result<Vec<(String,)>, sqlx::Error> = sqlx::query_as(
+        r#"
+        SELECT output_path FROM failed_outputs
+        WHERE output_path = ANY($1::text[])
+          AND expires_at > now()
+        "#,
+    )
+    .bind(&paths)
+    .fetch_all(&state.pool)
+    .await;
+    match rows {
+        Ok(r) => r.into_iter().map(|(p,)| p).collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed_outputs lookup failed; ingest continuing without cache"
+            );
+            HashSet::new()
+        }
+    }
+}
+
 /// Reject if a job is terminal in Postgres (independent of in-memory
 /// submission state — it may have been transitioned by another
 /// coordinator instance). Used by all ingest endpoints.

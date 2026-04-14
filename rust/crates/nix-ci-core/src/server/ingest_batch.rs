@@ -12,7 +12,9 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::Json;
 
-use super::ingest_common::{arm_if_leaf, attach_step_to_submission, reject_if_terminal, wire_dep};
+use super::ingest_common::{
+    arm_if_leaf, attach_step_to_submission, failed_output_hits, reject_if_terminal, wire_dep,
+};
 use super::AppState;
 use crate::dispatch::Step;
 use crate::durable::writeback::{self, BatchDrv};
@@ -36,6 +38,13 @@ pub async fn submit_batch(
         .dispatcher
         .submissions
         .get_or_insert(id, state.cfg.submission_event_capacity);
+
+    // Bulk-lookup failed-output cache hits so we can pre-finish any
+    // drv whose output path recently failed. Matches the per-drv
+    // check in `ingest::submit_drv`; kept in one place so the two
+    // ingest paths don't drift.
+    let drv_path_refs: Vec<&str> = req.drvs.iter().map(|d| d.drv_path.as_str()).collect();
+    let known_failed = failed_output_hits(&state, &drv_path_refs).await;
 
     // Phase 1: look up or create every Step. Hold NO per-Step locks
     // beyond the brief write inside Steps::get_or_create.
@@ -63,6 +72,14 @@ pub async fn submit_batch(
         });
         let is_new = outcome.is_new();
         let step = outcome.into_step();
+        if is_new && known_failed.contains(&d.drv_path) {
+            // Pre-mark as a known failure so the dispatcher short-
+            // circuits the build loop without contacting a worker.
+            step.previous_failure
+                .store(true, std::sync::atomic::Ordering::Release);
+            step.finished
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         primary.push((d, step, is_new));
     }
 
