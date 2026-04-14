@@ -2,20 +2,42 @@
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use super::AppState;
-use crate::error::Result;
 use crate::types::{AdminSnapshot, DrvState};
 
+/// Liveness: the process is up and the axum task is scheduling. Used
+/// as the systemd / orchestrator restart probe — deliberately cheap
+/// (no DB hit) so a slow Postgres doesn't trigger a restart storm.
 pub async fn healthz() -> &'static str {
     "ok"
 }
 
-pub async fn readyz(State(state): State<AppState>) -> Result<&'static str> {
-    sqlx::query("SELECT 1").fetch_one(&state.pool).await?;
-    Ok("ok")
+/// Readiness: we can take traffic. Verifies a cheap DB round-trip so
+/// a coordinator that's still starting up (migrations running,
+/// rehydrate loop bootstrapping) or whose pool has saturated returns
+/// 503. An orchestrator uses this to decide whether to route traffic
+/// to this instance; unlike healthz, a failure here should NOT
+/// restart the process — it just parks us out of rotation.
+pub async fn readyz(State(state): State<AppState>) -> Response {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query("SELECT 1").fetch_one(&state.pool),
+    )
+    .await
+    {
+        Ok(Ok(_)) => (StatusCode::OK, "ok").into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "readyz: DB query failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "db error").into_response()
+        }
+        Err(_) => {
+            tracing::warn!("readyz: DB query timed out");
+            (StatusCode::SERVICE_UNAVAILABLE, "db timeout").into_response()
+        }
+    }
 }
 
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {

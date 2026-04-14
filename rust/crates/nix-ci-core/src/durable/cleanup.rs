@@ -3,17 +3,29 @@
 use std::time::Duration;
 
 use sqlx::PgPool;
+use tokio::sync::watch;
 use tokio::time::interval;
 
 use crate::error::Result;
 
-pub async fn run(pool: PgPool, tick: Duration, retention_days: u32) {
+pub async fn run(
+    pool: PgPool,
+    tick: Duration,
+    retention_days: u32,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut ticker = interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // skip first tick — we ran cleanup at startup
     ticker.tick().await;
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.changed() => {
+                tracing::info!("cleanup: shutdown");
+                return;
+            }
+        }
         if let Err(e) = sweep(&pool, retention_days).await {
             tracing::warn!(error = %e, "cleanup sweep failed");
         }

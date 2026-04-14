@@ -33,6 +33,13 @@ pub struct ServerConfig {
     /// Backoff step for flaky retries. Total backoff is
     /// `step_ms × attempt`.
     pub flaky_retry_backoff_step_ms: i64,
+    /// How long to wait for axum to finish draining in-flight requests
+    /// and for background tasks (reaper / cleanup) to observe the
+    /// shutdown signal before we force the process to exit. Without a
+    /// bound, a stuck handler can wedge SIGTERM indefinitely; systemd
+    /// would eventually SIGKILL, leaving Postgres transactions to
+    /// roll back uncleanly.
+    pub graceful_shutdown_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -51,6 +58,7 @@ impl Default for ServerConfig {
             sse_keepalive_secs: 15,
             max_claim_wait_secs: 60,
             flaky_retry_backoff_step_ms: 30_000,
+            graceful_shutdown_secs: 30,
         }
     }
 }

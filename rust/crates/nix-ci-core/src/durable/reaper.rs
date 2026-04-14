@@ -15,6 +15,7 @@
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
+use tokio::sync::watch;
 use tokio::time::interval;
 
 use crate::dispatch::Dispatcher;
@@ -26,11 +27,18 @@ pub async fn run(
     dispatcher: Dispatcher,
     tick: Duration,
     job_heartbeat_timeout: Duration,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.changed() => {
+                tracing::info!("reaper: shutdown");
+                return;
+            }
+        }
         if let Err(e) = reap_stale_jobs(&pool, &dispatcher, job_heartbeat_timeout).await {
             tracing::warn!(error = %e, "reap_stale_jobs failed");
         }
