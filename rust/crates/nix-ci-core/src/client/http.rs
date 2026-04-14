@@ -64,6 +64,15 @@ impl CoordinatorClient {
         decode(resp).await
     }
 
+    /// Cancel a job. Idempotent: cancelling an already-terminal job
+    /// succeeds silently. Used by tests and by external orchestrators
+    /// (e.g. a CI system dropping a cancelled PR's CI job).
+    pub async fn cancel(&self, job_id: JobId) -> Result<SealJobResponse> {
+        let url = format!("{}/jobs/{}/cancel", self.base, job_id);
+        let resp = self.http.delete(&url).send().await?;
+        decode(resp).await
+    }
+
     pub async fn heartbeat(&self, job_id: JobId) -> Result<HeartbeatResponse> {
         let url = format!("{}/jobs/{}/heartbeat", self.base, job_id);
         let resp = self.http.post(&url).send().await?;

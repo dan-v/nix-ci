@@ -33,6 +33,17 @@ impl Drop for ServerHandle {
 }
 
 pub async fn spawn_server(pool: PgPool) -> ServerHandle {
+    spawn_server_with_cfg(pool, |_| {}).await
+}
+
+/// Variant that lets a test tweak ServerConfig before the server starts
+/// (e.g., shrink `job_heartbeat_timeout_secs` so a reaper test doesn't
+/// have to wait 30s).
+#[allow(dead_code)]
+pub async fn spawn_server_with_cfg(
+    pool: PgPool,
+    mutate_cfg: impl FnOnce(&mut ServerConfig),
+) -> ServerHandle {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -57,11 +68,12 @@ pub async fn spawn_server(pool: PgPool) -> ServerHandle {
         .await
         .expect("rehydrate");
 
-    let cfg = ServerConfig {
+    let mut cfg = ServerConfig {
         database_url: String::new(),
         listen: "127.0.0.1:0".parse().unwrap(),
         ..ServerConfig::default()
     };
+    mutate_cfg(&mut cfg);
     let state = AppState {
         pool: pool.clone(),
         dispatcher: dispatcher.clone(),

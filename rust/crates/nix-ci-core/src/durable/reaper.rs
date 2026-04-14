@@ -72,7 +72,14 @@ fn sweep_terminal_submissions(dispatcher: &Dispatcher) {
 /// in-flight drvs back to pending in Postgres; our in-memory state
 /// will sync on next claim attempt (CAS on runnable will fail
 /// otherwise). The job goes to cancelled.
-async fn reap_stale_jobs(pool: &PgPool, dispatcher: &Dispatcher, timeout: Duration) -> Result<()> {
+///
+/// Exposed as `pub` for integration tests that need to exercise the
+/// reap logic deterministically without spinning up the full ticker.
+pub async fn reap_stale_jobs(
+    pool: &PgPool,
+    dispatcher: &Dispatcher,
+    timeout: Duration,
+) -> Result<()> {
     let secs = timeout.as_secs() as i64;
     let stale_ids: Vec<(sqlx::types::Uuid,)> = sqlx::query_as(
         r#"
@@ -150,7 +157,7 @@ async fn reap_stale_jobs(pool: &PgPool, dispatcher: &Dispatcher, timeout: Durati
     Ok(())
 }
 
-async fn reap_expired_claims(pool: &PgPool, dispatcher: &Dispatcher) -> Result<()> {
+pub async fn reap_expired_claims(pool: &PgPool, dispatcher: &Dispatcher) -> Result<()> {
     let now = Instant::now();
     let expired = dispatcher.claims.expired_ids(now);
     if expired.is_empty() {
