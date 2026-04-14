@@ -62,7 +62,17 @@ pub async fn claim(
         let notified = state.dispatcher.notify.notified();
         tokio::select! {
             () = notified => continue,
-            () = wait => return Ok(StatusCode::NO_CONTENT.into_response()),
+            () = wait => {
+                // A step may have become runnable at the exact tick the
+                // timer fired. Try once more before giving up — avoids a
+                // spurious 204 that sends the worker through another
+                // 30s long-poll round-trip.
+                let now_ms = Utc::now().timestamp_millis();
+                if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+                    return issue_claim(&state, &sub, id, step, start).await;
+                }
+                return Ok(StatusCode::NO_CONTENT.into_response());
+            }
         }
     }
 }

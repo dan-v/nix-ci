@@ -17,16 +17,49 @@ use crate::types::{ClaimResponse, CompleteRequest, ErrorCategory, JobId, MAX_LOG
 
 /// Seconds the server-side claim long-poll holds open.
 const CLAIM_LONG_POLL_SECS: u64 = 30;
-/// Sleep between retries of a failed HTTP call.
-const TRANSIENT_BACKOFF: Duration = Duration::from_secs(1);
+/// Initial backoff after a transient HTTP failure.
+const TRANSIENT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+/// Cap on the backoff — we keep retrying forever but never slower than this.
+const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How many times the worker retries a completion POST before giving up.
 const COMPLETE_MAX_ATTEMPTS: u32 = 5;
-/// Sleep between completion-POST retries.
-const COMPLETE_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Initial sleep between completion-POST retries.
+const COMPLETE_RETRY_DELAY_INITIAL: Duration = Duration::from_secs(2);
+/// Cap on the completion retry backoff.
+const COMPLETE_RETRY_DELAY_MAX: Duration = Duration::from_secs(30);
 /// Hard cap on build_and_report recursion (via `next_build`).
 const NEXT_BUILD_CHAIN_CAP: u32 = 64;
 /// Stderr read chunk.
 const STDERR_READ_CHUNK: usize = 4096;
+/// How long we wait for in-flight builds to respond to a shutdown kill
+/// before aborting the JoinSet task. A well-behaved child should exit
+/// within a second of SIGKILL; this gives it headroom for stderr drain.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Jittered exponential backoff. `step` is the 0-indexed attempt
+/// number (0 → initial, 1 → 2×, ...). Caps at `max`. Full jitter
+/// (random in `[0, delay]`) prevents thundering herds on coordinator
+/// restart when many workers retry in lockstep.
+fn backoff_with_jitter(step: u32, initial: Duration, max: Duration) -> Duration {
+    let factor = 1u64.checked_shl(step.min(16)).unwrap_or(u64::MAX);
+    let raw = initial.saturating_mul(factor as u32).min(max);
+    // Cheap full-jitter: xorshift-ish on a timestamp. Avoids adding a
+    // rand dep; uniformity here isn't cryptographic.
+    let nanos = raw.as_nanos() as u64;
+    if nanos == 0 {
+        return raw;
+    }
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(1);
+    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(nanos);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xFF51AFD7ED558CCD);
+    x ^= x >> 33;
+    let jittered = x % nanos.max(1);
+    Duration::from_nanos(jittered)
+}
 
 pub struct WorkerConfig {
     pub job_id: JobId,
@@ -43,6 +76,7 @@ pub async fn run(
 ) -> Result<()> {
     let active = Arc::new(AtomicU32::new(0));
     let mut join_set = tokio::task::JoinSet::new();
+    let mut transient_failures: u32 = 0;
 
     loop {
         if *shutdown.borrow() {
@@ -75,15 +109,30 @@ pub async fn run(
             }
         };
         let claim = match claim_result {
-            Ok(Some(c)) => c,
-            Ok(None) => continue,
+            Ok(Some(c)) => {
+                transient_failures = 0;
+                c
+            }
+            Ok(None) => {
+                transient_failures = 0;
+                continue;
+            }
             Err(crate::Error::Gone(_)) => {
                 tracing::info!("worker: job gone");
                 break;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "worker: claim failed");
-                tokio::time::sleep(TRANSIENT_BACKOFF).await;
+                let backoff = backoff_with_jitter(
+                    transient_failures,
+                    TRANSIENT_BACKOFF_INITIAL,
+                    TRANSIENT_BACKOFF_MAX,
+                );
+                transient_failures = transient_failures.saturating_add(1);
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {},
+                    _ = shutdown.changed() => break,
+                }
                 continue;
             }
         };
@@ -93,9 +142,11 @@ pub async fn run(
         let client_cloned = client.clone();
         let dry_run = cfg.dry_run;
         let job_id = cfg.job_id;
+        let task_shutdown = shutdown.clone();
 
         join_set.spawn(async move {
-            let outcome = build_and_report(client_cloned, job_id, claim, dry_run).await;
+            let outcome =
+                build_and_report(client_cloned, job_id, claim, dry_run, task_shutdown).await;
             active_cloned.fetch_sub(1, Ordering::AcqRel);
             if let Err(e) = outcome {
                 tracing::warn!(error = %e, "worker: build failed to report");
@@ -105,7 +156,28 @@ pub async fn run(
         while join_set.try_join_next().is_some() {}
     }
 
-    while join_set.join_next().await.is_some() {}
+    // Graceful drain with a bounded deadline. In-flight tasks observe
+    // the shutdown watch themselves (each spawned task holds a clone)
+    // and kill their nix build child via `kill_on_drop`. If a task
+    // refuses to exit within the deadline — e.g., a stuck `.await`
+    // that doesn't see the shutdown — we abort it so the process can
+    // actually exit. Without this, SIGTERM plus a hung build would
+    // leave `nix-ci run` wedged indefinitely.
+    let drain = async {
+        while join_set.join_next().await.is_some() {}
+    };
+    if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+            remaining = join_set.len(),
+            "worker: drain timed out; aborting in-flight builds"
+        );
+        join_set.abort_all();
+        while join_set.join_next().await.is_some() {}
+    }
     Ok(())
 }
 
@@ -114,6 +186,7 @@ async fn build_and_report(
     job_id: JobId,
     mut claim: ClaimResponse,
     dry_run: bool,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut chain_depth = 0u32;
     loop {
@@ -121,9 +194,19 @@ async fn build_and_report(
         let outcome = if dry_run {
             BuildOutcome::success(0)
         } else {
-            build(&claim.drv_path).await
+            build(&claim.drv_path, &mut shutdown).await
         };
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        // If the build was cancelled via shutdown, skip the completion
+        // POST. The coordinator's reaper (claim deadline or heartbeat
+        // timeout) will reclaim the drv. Reporting a synthetic failure
+        // would corrupt attempt counts and metrics for a build we
+        // never finished.
+        if outcome.cancelled {
+            tracing::info!(drv = %claim.drv_hash, "build cancelled by shutdown");
+            return Ok(());
+        }
 
         let req = CompleteRequest {
             success: outcome.success,
@@ -134,13 +217,13 @@ async fn build_and_report(
             log_tail: outcome.log_tail.clone(),
         };
 
-        let mut remaining = COMPLETE_MAX_ATTEMPTS;
+        let mut attempt: u32 = 0;
         let response = loop {
             match client.complete(job_id, claim.claim_id, &req).await {
                 Ok(resp) => break Some(resp),
                 Err(e) => {
-                    remaining -= 1;
-                    if remaining == 0 {
+                    attempt += 1;
+                    if attempt >= COMPLETE_MAX_ATTEMPTS {
                         tracing::error!(
                             error = %e,
                             drv = %claim.drv_hash,
@@ -151,10 +234,21 @@ async fn build_and_report(
                     }
                     tracing::warn!(
                         error = %e,
-                        attempts_left = remaining,
+                        attempts_left = COMPLETE_MAX_ATTEMPTS - attempt,
                         "complete POST failed; retrying"
                     );
-                    tokio::time::sleep(COMPLETE_RETRY_DELAY).await;
+                    let delay = backoff_with_jitter(
+                        attempt - 1,
+                        COMPLETE_RETRY_DELAY_INITIAL,
+                        COMPLETE_RETRY_DELAY_MAX,
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = shutdown.changed() => {
+                            tracing::info!("worker: shutdown during complete retry");
+                            return Ok(());
+                        }
+                    }
                 }
             }
         };
@@ -164,6 +258,9 @@ async fn build_and_report(
         };
         if response.ignored {
             tracing::debug!(drv = %claim.drv_hash, "completion ignored (stale claim)");
+        }
+        if *shutdown.borrow() {
+            return Ok(());
         }
         match response.next_build {
             Some(next) if !next.drv_path.is_empty() && chain_depth < NEXT_BUILD_CHAIN_CAP => {
@@ -178,6 +275,9 @@ async fn build_and_report(
 
 struct BuildOutcome {
     success: bool,
+    /// True when the build was interrupted by worker shutdown. Callers
+    /// must not POST /complete for cancelled builds.
+    cancelled: bool,
     exit_code: Option<i32>,
     category: Option<ErrorCategory>,
     message: Option<String>,
@@ -188,6 +288,7 @@ impl BuildOutcome {
     fn success(exit_code: i32) -> Self {
         Self {
             success: true,
+            cancelled: false,
             exit_code: Some(exit_code),
             category: None,
             message: None,
@@ -203,15 +304,33 @@ impl BuildOutcome {
     ) -> Self {
         Self {
             success: false,
+            cancelled: false,
             exit_code,
             category: Some(category),
             message: Some(message.into()),
             log_tail,
         }
     }
+
+    fn cancelled() -> Self {
+        Self {
+            success: false,
+            cancelled: true,
+            exit_code: None,
+            category: None,
+            message: None,
+            log_tail: None,
+        }
+    }
 }
 
-async fn build(drv_path: &str) -> BuildOutcome {
+async fn build(drv_path: &str, shutdown: &mut watch::Receiver<bool>) -> BuildOutcome {
+    // Fast-path: if shutdown is already set when we arrive (e.g., the
+    // claim raced with a cancel), skip the spawn entirely.
+    if *shutdown.borrow() {
+        return BuildOutcome::cancelled();
+    }
+
     let mut cmd = Command::new("nix");
     cmd.arg("build")
         .arg("--no-link")
@@ -219,7 +338,11 @@ async fn build(drv_path: &str) -> BuildOutcome {
         .arg("--keep-going")
         .arg(format!("{drv_path}^*"))
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // Belt-and-suspenders: if this task is dropped (e.g., JoinSet
+        // abort_all on shutdown drain timeout), tokio sends SIGKILL to
+        // the child so we don't orphan nix builds.
+        .kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -235,7 +358,21 @@ async fn build(drv_path: &str) -> BuildOutcome {
     let stderr = child.stderr.take();
     let tail_handle = tokio::spawn(stderr_ring_tail(stderr));
 
-    let status = child.wait().await;
+    // Race the build against shutdown. On shutdown, start_kill() sends
+    // SIGKILL to the nix build child group; we then wait() to reap it
+    // and drain stderr so the tokio-spawned reader task completes.
+    // Reaping is important — without it the child is a zombie until
+    // the parent process exits.
+    let status = tokio::select! {
+        s = child.wait() => s,
+        _ = shutdown.changed() => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = tail_handle.await;
+            return BuildOutcome::cancelled();
+        }
+    };
+
     let tail = tail_handle.await.unwrap_or_default();
     match status {
         Ok(s) if s.success() => BuildOutcome::success(s.code().unwrap_or(0)),
@@ -277,20 +414,106 @@ async fn stderr_ring_tail(stderr: Option<tokio::process::ChildStderr>) -> String
     String::from_utf8_lossy(&tail).into_owned()
 }
 
+/// Classify a failed build from its stderr tail.
+///
+/// Retry policy is driven by [`ErrorCategory::is_retryable`], so the
+/// default matters: an unknown error string drops through to
+/// `Transient`, which will be retried up to `max_attempts` times. This
+/// is the *conservative* choice — we'd rather re-run a flaky build a
+/// second time than turn a transient hiccup into a failed PR. The
+/// attempt counter bounds the worst case.
+///
+/// We classify as a terminal [`ErrorCategory::BuildFailure`] only when
+/// we're confident: Nix prints "error: builder for ... failed with
+/// exit code ..." for an actual build-script failure, and similar for
+/// hash/output mismatches. Those are reproducibility-deterministic and
+/// retrying won't change the outcome.
 fn classify_stderr(tail: &str) -> ErrorCategory {
     let t = tail.to_ascii_lowercase();
+
+    // Resource exhaustion — retryable, likely on a different worker.
     if t.contains("no space left on device")
         || t.contains("disk full")
         || t.contains("out of memory")
+        || t.contains("cannot allocate memory")
+        || t.contains("killed")
+            && (t.contains("oom") || t.contains("out of memory"))
     {
-        ErrorCategory::DiskFull
-    } else if t.contains("temporary failure")
-        || t.contains("network is unreachable")
-        || t.contains("connection reset")
-        || t.contains("could not connect")
+        return ErrorCategory::DiskFull;
+    }
+
+    // Deterministic build failure signatures — not retryable.
+    // These are Nix's canonical terminal-failure messages.
+    if t.contains("builder for ")
+        && (t.contains("failed with exit code")
+            || t.contains("failed to produce output path"))
     {
-        ErrorCategory::Transient
-    } else {
-        ErrorCategory::BuildFailure
+        return ErrorCategory::BuildFailure;
+    }
+    if t.contains("hash mismatch in fixed-output derivation")
+        || t.contains("output path ") && t.contains(" is not allowed to refer to ")
+    {
+        return ErrorCategory::BuildFailure;
+    }
+
+    // Everything else — network, substituter, daemon, unknown — is
+    // treated as transient. Bounded by `max_attempts` at the server.
+    ErrorCategory::Transient
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    #[test]
+    fn disk_full_variants() {
+        assert_eq!(
+            classify_stderr("error: writing to file: No space left on device"),
+            ErrorCategory::DiskFull
+        );
+        assert_eq!(
+            classify_stderr("fatal: out of memory"),
+            ErrorCategory::DiskFull
+        );
+        assert_eq!(
+            classify_stderr("Cannot allocate memory"),
+            ErrorCategory::DiskFull
+        );
+    }
+
+    #[test]
+    fn build_failure_canonical_nix_message() {
+        let tail = "error: builder for '/nix/store/xxx-foo.drv' failed with exit code 1";
+        assert_eq!(classify_stderr(tail), ErrorCategory::BuildFailure);
+    }
+
+    #[test]
+    fn build_failure_missing_output() {
+        let tail = "error: builder for '/nix/store/xxx-foo.drv' failed to produce output path";
+        assert_eq!(classify_stderr(tail), ErrorCategory::BuildFailure);
+    }
+
+    #[test]
+    fn build_failure_hash_mismatch() {
+        let tail = "error: hash mismatch in fixed-output derivation";
+        assert_eq!(classify_stderr(tail), ErrorCategory::BuildFailure);
+    }
+
+    #[test]
+    fn unknown_defaults_to_transient() {
+        // Previously classified as BuildFailure — now safely retryable.
+        assert_eq!(
+            classify_stderr("some garbage we've never seen before"),
+            ErrorCategory::Transient
+        );
+        assert_eq!(classify_stderr(""), ErrorCategory::Transient);
+    }
+
+    #[test]
+    fn network_is_transient() {
+        assert_eq!(
+            classify_stderr("curl: (7) could not connect to host"),
+            ErrorCategory::Transient
+        );
     }
 }
