@@ -1,0 +1,16 @@
+[package]
+name = "nix-ci"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[[bin]]
+name = "nix-ci"
+path = "src/main.rs"
+
+[dependencies]
+nix-ci-core.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
