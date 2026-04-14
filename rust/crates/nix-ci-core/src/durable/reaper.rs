@@ -7,6 +7,10 @@
 //! 2. Claims whose deadline has passed — re-arm the in-memory step so
 //!    another worker picks it up. A stale `/complete` from the original
 //!    worker no longer matches any active claim and is ignored.
+//!
+//! No "terminal sweep" of the submissions map: every terminal path
+//! (cancel / fail / check_and_publish_terminal / reap_stale_jobs)
+//! removes its own submission; a safety-net sweep only masked bugs.
 
 use std::time::{Duration, Instant};
 
@@ -39,20 +43,6 @@ pub async fn run(
             tracing::warn!(error = %e, "reap_stale_jobs failed");
         }
         reap_expired_claims(&dispatcher);
-        sweep_terminal_submissions(&dispatcher);
-    }
-}
-
-fn sweep_terminal_submissions(dispatcher: &Dispatcher) {
-    let all = dispatcher.submissions.all();
-    let mut removed = 0u32;
-    for sub in all {
-        if sub.is_terminal() && dispatcher.submissions.remove(sub.id).is_some() {
-            removed += 1;
-        }
-    }
-    if removed > 0 {
-        tracing::debug!(removed, "swept terminal submissions from in-memory map");
     }
 }
 

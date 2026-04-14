@@ -11,7 +11,7 @@ use crate::config::RunnerConfig;
 use crate::error::{Error, Result};
 use crate::runner::eval_jobs::EvalMode;
 use crate::runner::worker::WorkerConfig;
-use crate::runner::{fallback, sse, submitter, worker};
+use crate::runner::{sse, submitter, worker};
 use crate::types::{CreateJobRequest, JobId, JobStatus};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -29,23 +29,14 @@ pub struct RunOutcome {
 pub async fn run(args: RunArgs) -> Result<RunOutcome> {
     let client = Arc::new(CoordinatorClient::new(args.cfg.coordinator_url.clone()));
 
-    // Step 1: try to create the job. Fall back on transport failure at startup.
-    let job = match client
+    // Fail loudly if the coordinator is unreachable — hiding an outage
+    // behind a local-only build would produce "green" CI runs without
+    // dedup or visibility, which is worse than failing the run.
+    let job = client
         .create_job(&CreateJobRequest {
             external_ref: args.external_ref.clone(),
         })
-        .await
-    {
-        Ok(r) => r,
-        Err(e) if args.cfg.fallback_on_unreachable => {
-            tracing::warn!(error = %e, "coordinator unreachable — local fallback");
-            fallback::run_local(args.mode, args.cfg.eval_workers).await?;
-            return Ok(RunOutcome {
-                status: JobStatus::Done,
-            });
-        }
-        Err(e) => return Err(e),
-    };
+        .await?;
     let job_id = job.id;
     tracing::info!(%job_id, "job created");
 

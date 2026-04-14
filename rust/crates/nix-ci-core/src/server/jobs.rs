@@ -112,7 +112,10 @@ fn build_terminal_snapshot(
     let (counts, failures, sealed) = match state.dispatcher.submissions.get(id) {
         Some(sub) => (
             sub.live_counts(),
-            sub.failures.read().clone(),
+            crate::server::complete::cap_failures(
+                sub.failures.read().clone(),
+                state.cfg.max_failures_in_result,
+            ),
             sub.is_sealed(),
         ),
         None => (JobCounts::default(), Vec::new(), false),
@@ -130,6 +133,10 @@ fn build_terminal_snapshot(
 /// In-memory cleanup for cancel/fail: remove the submission, CAS
 /// terminal, publish JobDone, bump metrics. Durable write has already
 /// happened.
+///
+/// We always wake the dispatcher afterward so any in-flight long-poll
+/// `/claim` on this job notices the terminal state and returns 410
+/// instead of sleeping until its wait deadline expires.
 fn finish_in_memory(state: &AppState, id: JobId, status: JobStatus, failures: Vec<DrvFailure>) {
     let Some(sub) = state.dispatcher.submissions.remove(id) else {
         return;
@@ -145,6 +152,7 @@ fn finish_in_memory(state: &AppState, id: JobId, status: JobStatus, failures: Ve
             status: status.as_str().into(),
         })
         .inc();
+    state.dispatcher.wake();
 }
 
 pub async fn status(

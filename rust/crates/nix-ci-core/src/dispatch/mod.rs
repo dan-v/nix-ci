@@ -44,8 +44,12 @@ impl Dispatcher {
         }
     }
 
-    /// Kick the dispatcher to re-scan ready sets (idempotent).
+    /// Kick the dispatcher to re-scan ready sets. Wakes ALL currently
+    /// waiting claim long-polls, not just one — so a single cancel /
+    /// terminal event promptly reaches every worker polling the
+    /// affected job, and so a step-ready event isn't silently missed
+    /// if a future waiter happened to not be registered yet.
     pub fn wake(&self) {
-        self.notify.notify_one();
+        self.notify.notify_waiters();
     }
 }

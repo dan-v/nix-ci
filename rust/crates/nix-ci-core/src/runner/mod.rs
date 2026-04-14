@@ -1,11 +1,11 @@
 //! `nix-ci run`: streaming submitter + self-regulating worker + event
-//! printer. Falls back to local `nix-eval-jobs | nix-store --realise`
-//! if the coordinator is unreachable at startup.
+//! printer. Drives `nix-eval-jobs` → batch-ingest → coordinator; a
+//! coordinator outage fails the run loudly rather than silently
+//! degrading to local-only builds (which would hide outages from ops).
 
 pub mod drv_parser;
 pub mod drv_walk;
 pub mod eval_jobs;
-pub mod fallback;
 pub mod orchestrator;
 pub mod sse;
 pub mod submitter;

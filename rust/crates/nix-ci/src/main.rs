@@ -51,9 +51,6 @@ struct RunCmd {
     /// Number of nix-eval-jobs workers.
     #[arg(long, default_value_t = 4)]
     eval_workers: u32,
-    /// Disable local fallback if coordinator is unreachable.
-    #[arg(long)]
-    no_fallback: bool,
     /// Dry run: don't actually build, just report success.
     #[arg(long)]
     dry_run: bool,
@@ -102,7 +99,6 @@ async fn run_cmd(cmd: RunCmd) -> anyhow::Result<()> {
         coordinator_url: cmd.coordinator,
         eval_workers: cmd.eval_workers,
         dry_run: cmd.dry_run,
-        fallback_on_unreachable: !cmd.no_fallback,
         ..RunnerConfig::default()
     };
     if let Some(n) = cmd.max_parallel {

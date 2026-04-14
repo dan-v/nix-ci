@@ -87,22 +87,34 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .await
         .map_err(|e| crate::Error::Internal(format!("axum serve: {e}")))?;
 
-    // Bounded drain. Abort any handle that overruns so the stuck task
-    // drops its pool connection before `pool.close()` — otherwise
-    // close hangs forever waiting for those connections to return.
-    let drain_deadline = Duration::from_secs(cfg.graceful_shutdown_secs);
-    for (name, handle) in [("reaper", reaper_task), ("cleanup", cleanup_task)] {
-        let abort = handle.abort_handle();
-        if tokio::time::timeout(drain_deadline, handle).await.is_err() {
-            tracing::warn!(task = name, "shutdown: task overran drain; aborting");
-            abort.abort();
-        }
-    }
+    drain_background_tasks(
+        [("reaper", reaper_task), ("cleanup", cleanup_task)],
+        Duration::from_secs(cfg.graceful_shutdown_secs),
+    )
+    .await;
     pool.close().await;
 
     // Releasing _lock at end of scope drops its connection, which
     // releases the pg advisory lock implicitly.
     Ok(())
+}
+
+/// Drain a set of background JoinHandles with a per-handle timeout.
+/// Any handle that overruns is aborted so the stuck task drops any
+/// pool connection it holds before `pool.close()` is called — without
+/// this, close hangs indefinitely. Exposed for tests.
+pub async fn drain_background_tasks<I, N>(handles: I, per_task_timeout: Duration)
+where
+    I: IntoIterator<Item = (N, tokio::task::JoinHandle<()>)>,
+    N: std::fmt::Display,
+{
+    for (name, handle) in handles {
+        let abort = handle.abort_handle();
+        if tokio::time::timeout(per_task_timeout, handle).await.is_err() {
+            tracing::warn!(task = %name, "shutdown: task overran drain; aborting");
+            abort.abort();
+        }
+    }
 }
 
 async fn wait_for_signal() {
@@ -123,5 +135,42 @@ async fn wait_for_signal() {
     tokio::select! {
         () = ctrl_c => { tracing::info!("shutdown: ctrl-c"); }
         () = terminate => { tracing::info!("shutdown: SIGTERM"); }
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::drain_background_tasks;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn graceful_exit_handle_completes_without_abort() {
+        let h = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+        let start = std::time::Instant::now();
+        drain_background_tasks([("ok", h)], Duration::from_secs(5)).await;
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn stuck_task_is_aborted_after_timeout() {
+        // `std::future::pending` never resolves — simulates a wedged
+        // background task. Drain must bound its wait at the timeout
+        // and abort.
+        let h = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let abort_flag = h.abort_handle();
+        assert!(!abort_flag.is_finished());
+        let start = std::time::Instant::now();
+        drain_background_tasks([("stuck", h)], Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "drain must return promptly after timeout, took {elapsed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(abort_flag.is_finished(), "stuck task must have been aborted");
     }
 }

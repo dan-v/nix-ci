@@ -37,6 +37,20 @@ pub struct ServerConfig {
     /// terminal. Applies to fresh Step creations; in-flight Steps keep
     /// the value captured at ingest.
     pub max_attempts: i32,
+    /// Max HTTP request body in bytes. A deliberately generous default
+    /// (64 MiB) for large-DAG batch ingests; returns 413 above this.
+    /// Primarily guards against mis-configured or hostile clients.
+    pub max_request_body_bytes: usize,
+    /// Max `drv_path` length accepted on ingest. Nix store paths are
+    /// bounded by filesystem constraints in practice; a very long path
+    /// is almost always a bug. Over-long drvs return 400.
+    pub max_drv_path_bytes: usize,
+    /// Max `drv_name` length accepted on ingest.
+    pub max_drv_name_bytes: usize,
+    /// Cap on the `failures` vector inside a terminal `jobs.result`
+    /// snapshot. Prevents a catastrophic job from producing a multi-MB
+    /// JSONB row. A truncated marker is appended if exceeded.
+    pub max_failures_in_result: usize,
     /// How long to wait for axum to finish draining in-flight requests
     /// and for background tasks (reaper / cleanup) to observe the
     /// shutdown signal before we force the process to exit. Without a
@@ -63,6 +77,10 @@ impl Default for ServerConfig {
             max_claim_wait_secs: 60,
             flaky_retry_backoff_step_ms: 30_000,
             max_attempts: 2,
+            max_request_body_bytes: 64 * 1024 * 1024, // 64 MiB
+            max_drv_path_bytes: 4096,
+            max_drv_name_bytes: 1024,
+            max_failures_in_result: 500,
             graceful_shutdown_secs: 30,
         }
     }
@@ -81,9 +99,6 @@ pub struct RunnerConfig {
     pub supported_features: Vec<String>,
     pub eval_workers: u32,
     pub dry_run: bool,
-    /// Whether to fall back to local `nix-eval-jobs | nix build` if
-    /// the coordinator is unreachable at startup.
-    pub fallback_on_unreachable: bool,
 }
 
 impl Default for RunnerConfig {
@@ -95,7 +110,6 @@ impl Default for RunnerConfig {
             supported_features: Vec::new(),
             eval_workers: 4,
             dry_run: false,
-            fallback_on_unreachable: true,
         }
     }
 }

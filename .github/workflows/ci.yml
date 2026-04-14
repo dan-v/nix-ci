@@ -76,3 +76,35 @@ jobs:
         with:
           flakehub: false
       - run: nix flake check --print-build-logs
+
+  load-tests:
+    # Feature-gated production-scale fan-in DAG load test. Runs behind
+    # the `load-test` cargo feature so it only fires in CI (or when a
+    # developer explicitly opts in locally).
+    name: load tests (nixpkgs-scale)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nix_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/nix_ci_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: load tests
+        working-directory: rust
+        run: cargo test -p nix-ci-core --features load-test --test load --release -- --nocapture

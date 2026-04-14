@@ -85,19 +85,26 @@ pub(crate) fn placeholder_name_from(drv_path: &str) -> String {
         .to_string()
 }
 
-/// Reject ingest if the job is terminal in Postgres. A sealed-but-not-
-/// terminal job is still accepting ingest (the sealed flag only prevents
-/// *new roots*, not new drvs wired into existing roots).
+/// Reject ingest if the job is terminal OR sealed. Once a submission
+/// is sealed the caller has told us "no more drvs coming" — a late
+/// ingest call after seal is almost certainly a bug (or a lost
+/// retry / out-of-order client), and accepting it could re-open a
+/// submission that already fired `JobDone`. We reject with 410 Gone
+/// so the client sees a clear terminal signal.
 pub(super) async fn reject_if_terminal(state: &AppState, id: JobId) -> crate::error::Result<()> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT status FROM jobs WHERE id = $1")
-        .bind(id.0)
-        .fetch_optional(&state.pool)
-        .await?;
-    let status = row
-        .ok_or_else(|| crate::Error::NotFound(format!("job {id}")))?
-        .0;
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT status, sealed FROM jobs WHERE id = $1")
+            .bind(id.0)
+            .fetch_optional(&state.pool)
+            .await?;
+    let (status, sealed) = row.ok_or_else(|| crate::Error::NotFound(format!("job {id}")))?;
     if matches!(status.as_str(), "done" | "failed" | "cancelled") {
         return Err(crate::Error::Gone(format!("job {id} is terminal")));
+    }
+    if sealed {
+        return Err(crate::Error::Gone(format!(
+            "job {id} is sealed; no further ingest accepted"
+        )));
     }
     Ok(())
 }

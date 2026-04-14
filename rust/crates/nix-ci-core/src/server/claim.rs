@@ -39,6 +39,14 @@ pub async fn claim(
     let features_vec = q.features_vec();
 
     loop {
+        // Check submission terminal status: a concurrent cancel / fail
+        // / reap wakes the dispatcher, the notify below fires, and on
+        // the next iteration we see the terminal flag and return 410
+        // rather than sleeping to the wait deadline.
+        if sub.is_terminal() {
+            return Err(Error::Gone(format!("job {id} is terminal")));
+        }
+
         let now_ms = Utc::now().timestamp_millis();
         if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
             return issue_claim(&state, &sub, id, step, start);
@@ -53,6 +61,9 @@ pub async fn claim(
         tokio::select! {
             () = notified => continue,
             () = wait => {
+                if sub.is_terminal() {
+                    return Err(Error::Gone(format!("job {id} is terminal")));
+                }
                 // A step may have become runnable at the exact tick the
                 // timer fired. Retry once before the 204 to avoid an
                 // immediate 30s-round-trip re-poll from the worker.

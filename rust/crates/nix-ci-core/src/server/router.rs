@@ -1,7 +1,7 @@
 //! Route table.
 
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -14,6 +14,7 @@ use super::{claim, complete, events, heartbeat, ingest_batch, jobs, ops};
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
 pub fn build_router(state: AppState) -> Router {
+    let max_body = state.cfg.max_request_body_bytes;
     Router::new()
         // Jobs
         .route("/jobs", post(jobs::create))
@@ -34,6 +35,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(ops::readyz))
         .route("/metrics", get(ops::metrics))
         .route("/admin/snapshot", get(ops::admin_snapshot))
+        .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::from_fn(request_id_layer))
         .with_state(state)
 }

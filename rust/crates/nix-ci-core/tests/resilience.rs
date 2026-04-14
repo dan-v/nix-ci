@@ -455,3 +455,269 @@ async fn heartbeat_timeout_respects_configured_window(pool: PgPool) {
         .unwrap();
     assert_eq!(status_str, "cancelled");
 }
+
+// ─── 6. Propagated failures stay in owning submission ──────────────────
+
+#[sqlx::test]
+async fn propagated_failures_stay_in_owning_submission(pool: PgPool) {
+    // Two jobs share a leaf (stdenv) via dedup. Job A owns ONLY the
+    // shared leaf. Job B owns the leaf + an rdep (gcc). The leaf fails.
+    // Job A's failures list must contain only the leaf — NOT gcc. Job B
+    // must contain both. Regression for a bug where propagation
+    // recorded rdep failures on every origin submission regardless of
+    // whether the origin owned the rdep.
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    let a = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some("prop-a".into()),
+        })
+        .await
+        .unwrap();
+    let b = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some("prop-b".into()),
+        })
+        .await
+        .unwrap();
+
+    let shared = drv_path("std", "stdenv");
+    let gcc = drv_path("gcc", "gcc-13.2");
+
+    // Job A: only stdenv as a root.
+    client
+        .ingest_drv(a.id, &ingest(&shared, "stdenv", &[], true))
+        .await
+        .unwrap();
+    client.seal(a.id).await.unwrap();
+
+    // Job B: stdenv + gcc (gcc depends on stdenv). stdenv is deduped
+    // with Job A's step. gcc is owned only by Job B.
+    client
+        .ingest_drv(b.id, &ingest(&shared, "stdenv", &[], false))
+        .await
+        .unwrap();
+    client
+        .ingest_drv(b.id, &ingest(&gcc, "gcc-13.2", &[&shared], true))
+        .await
+        .unwrap();
+    client.seal(b.id).await.unwrap();
+
+    // A worker claims stdenv and reports it as a terminal build failure.
+    let c = client
+        .claim(a.id, "x86_64-linux", &[], 5)
+        .await
+        .unwrap()
+        .expect("stdenv claim");
+    client
+        .complete(
+            a.id,
+            c.claim_id,
+            &CompleteRequest {
+                success: false,
+                duration_ms: 5,
+                exit_code: Some(1),
+                error_category: Some(nix_ci_core::types::ErrorCategory::BuildFailure),
+                error_message: Some("stdenv broke".into()),
+                log_tail: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(wait_for_terminal(&client, a.id).await, JobStatus::Failed);
+    assert_eq!(wait_for_terminal(&client, b.id).await, JobStatus::Failed);
+
+    let a_status = client.status(a.id).await.unwrap();
+    let b_status = client.status(b.id).await.unwrap();
+
+    let a_hashes: Vec<_> = a_status.failures.iter().map(|f| f.drv_hash.clone()).collect();
+    let b_hashes: Vec<_> = b_status.failures.iter().map(|f| f.drv_hash.clone()).collect();
+
+    let shared_hash = nix_ci_core::types::drv_hash_from_path(&shared).unwrap();
+    let gcc_hash = nix_ci_core::types::drv_hash_from_path(&gcc).unwrap();
+
+    assert!(
+        a_hashes.contains(&shared_hash),
+        "Job A must report stdenv in failures, got {a_hashes:?}"
+    );
+    assert!(
+        !a_hashes.contains(&gcc_hash),
+        "Job A must NOT report gcc in failures (gcc is not in A's closure); got {a_hashes:?}"
+    );
+
+    assert!(
+        b_hashes.contains(&shared_hash),
+        "Job B must report stdenv, got {b_hashes:?}"
+    );
+    assert!(
+        b_hashes.contains(&gcc_hash),
+        "Job B must report gcc (propagated), got {b_hashes:?}"
+    );
+}
+
+// ─── 7. Worker dies mid-build — heartbeat reap restores state ──────────
+
+#[sqlx::test]
+async fn worker_dies_mid_build_heartbeat_reaps_cleanly(pool: PgPool) {
+    // Simulate a worker that claims a drv, then dies (never /complete,
+    // stops heartbeating). Heartbeat timeout reaper must cancel the job,
+    // evict the in-memory claim, and publish JobDone so SSE subscribers
+    // notice. A subsequent /claim on the job returns 410.
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let drv = drv_path("zw1", "solo");
+    client
+        .ingest_drv(job.id, &ingest(&drv, "solo", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    // Worker claims — never completes.
+    let _claim = client
+        .claim(job.id, "x86_64-linux", &[], 5)
+        .await
+        .unwrap()
+        .expect("leaf claim");
+    assert_eq!(handle.dispatcher.claims.len(), 1);
+
+    // "Worker dies" — no more heartbeats. Age the heartbeat out and run
+    // the reaper.
+    sqlx::query("UPDATE jobs SET last_heartbeat = now() - INTERVAL '1 hour' WHERE id = $1")
+        .bind(job.id.0)
+        .execute(&handle.pool)
+        .await
+        .unwrap();
+    nix_ci_core::durable::reaper::reap_stale_jobs(
+        &handle.pool,
+        &handle.dispatcher,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    // Claim map empty; submission gone.
+    assert_eq!(handle.dispatcher.claims.len(), 0);
+    assert!(handle.dispatcher.submissions.get(job.id).is_none());
+
+    // New /claim returns 410.
+    match client.claim(job.id, "x86_64-linux", &[], 1).await {
+        Err(nix_ci_core::Error::Gone(_)) => {}
+        other => panic!("expected 410 after reap, got {other:?}"),
+    }
+
+    // Status reflects terminal cancelled.
+    let status = client.status(job.id).await.unwrap();
+    assert_eq!(status.status, JobStatus::Cancelled);
+}
+
+// ─── 8. Two concurrent /complete on the same claim_id ──────────────────
+
+#[sqlx::test]
+async fn concurrent_complete_same_claim_exactly_one_wins(pool: PgPool) {
+    // Fire two /complete POSTs with the same claim_id simultaneously.
+    // The in-memory `Claims::take` is atomic: exactly one handler must
+    // see a live claim (ignored=false), the other must see it already
+    // taken (ignored=true). Regression guard against any path that
+    // lets two workers both successfully report completion for the
+    // same build attempt.
+    let handle = spawn_server(pool).await;
+    let base = handle.base_url.clone();
+    let client = CoordinatorClient::new(&base);
+
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let drv = drv_path("cc1", "solo");
+    client
+        .ingest_drv(job.id, &ingest(&drv, "solo", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let claim = client
+        .claim(job.id, "x86_64-linux", &[], 5)
+        .await
+        .unwrap()
+        .expect("claim");
+
+    let req = CompleteRequest {
+        success: true,
+        duration_ms: 5,
+        exit_code: Some(0),
+        error_category: None,
+        error_message: None,
+        log_tail: None,
+    };
+
+    let c1 = CoordinatorClient::new(&base);
+    let c2 = CoordinatorClient::new(&base);
+    let req1 = req.clone();
+    let req2 = req.clone();
+    let (r1, r2) = tokio::join!(
+        async move { c1.complete(job.id, claim.claim_id, &req1).await.unwrap() },
+        async move { c2.complete(job.id, claim.claim_id, &req2).await.unwrap() },
+    );
+
+    let ignored = [r1.ignored, r2.ignored];
+    let winners = ignored.iter().filter(|i| !**i).count();
+    let losers = ignored.iter().filter(|i| **i).count();
+    assert_eq!(winners, 1, "exactly one complete must win, got {ignored:?}");
+    assert_eq!(losers, 1, "exactly one complete must see ignored=true, got {ignored:?}");
+
+    assert_eq!(wait_for_terminal(&client, job.id).await, JobStatus::Done);
+}
+
+// ─── 9. Cancel while a long-poll claim is in flight ────────────────────
+
+#[sqlx::test]
+async fn cancel_propagates_to_in_flight_long_poll(pool: PgPool) {
+    // Start a long-poll /claim with no runnable drvs. In parallel
+    // cancel the job. The long-poll must return 410 promptly (well
+    // within the poll deadline) — the submission's removal from the
+    // dispatcher map is observed either by the pop_runnable path or by
+    // the next wake. Guards against a worker hung for up to max_wait
+    // after an external cancel.
+    let handle = spawn_server(pool).await;
+    let base = handle.base_url.clone();
+    let client = CoordinatorClient::new(&base);
+
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    // No ingest — pop_runnable will always return None; claim loops
+    // until wake or deadline.
+
+    let claim_client = CoordinatorClient::new(&base);
+    let claim_task = tokio::spawn(async move {
+        // Long wait so the cancel has to propagate through notify.
+        claim_client.claim(job.id, "x86_64-linux", &[], 10).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.cancel(job.id).await.unwrap();
+
+    // The long-poll should resolve within a generous bound. It can
+    // either return 410 (if the handler re-fetched submissions) or
+    // None (if pop_runnable races through wake with the submission
+    // still present momentarily). Either is acceptable — the
+    // important property is that it resolves BEFORE the 10s deadline.
+    let result = tokio::time::timeout(Duration::from_secs(3), claim_task)
+        .await
+        .expect("claim must resolve within 3s of cancel")
+        .expect("task must not panic");
+    match result {
+        Err(nix_ci_core::Error::Gone(_)) => {}
+        Ok(None) => {}
+        Ok(Some(c)) => panic!("cancelled job should not issue a claim: {c:?}"),
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}

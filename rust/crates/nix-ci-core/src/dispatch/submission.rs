@@ -199,8 +199,10 @@ impl Submission {
         c
     }
 
-    /// Compute live status from the toplevels. Returns Pending if the
-    /// submission hasn't been sealed and has unfinished roots.
+    /// Compute live status from the toplevels. `Done` / `Failed` only
+    /// emerge from a sealed submission whose roots are all finished;
+    /// an unsealed submission is always Pending / Building regardless
+    /// of root state because more roots may still be ingested.
     pub fn live_status(&self) -> crate::types::JobStatus {
         use crate::types::JobStatus;
         let tops = self.toplevels.read();
@@ -208,19 +210,11 @@ impl Submission {
         let any_failed = tops
             .iter()
             .any(|t| t.previous_failure.load(Ordering::Acquire));
-        if !all_finished {
-            return if self.is_sealed() {
-                JobStatus::Building
-            } else {
-                JobStatus::Pending
-            };
-        }
-        if any_failed {
-            JobStatus::Failed
-        } else if self.is_sealed() {
-            JobStatus::Done
-        } else {
-            JobStatus::Pending
+        match (self.is_sealed(), all_finished, any_failed) {
+            (true, true, true) => JobStatus::Failed,
+            (true, true, false) => JobStatus::Done,
+            (true, false, _) => JobStatus::Building,
+            (false, _, _) => JobStatus::Pending,
         }
     }
 }
@@ -273,9 +267,5 @@ impl Submissions {
 
     pub fn remove(&self, id: JobId) -> Option<Arc<Submission>> {
         self.inner.write().remove(&id)
-    }
-
-    pub fn all(&self) -> Vec<Arc<Submission>> {
-        self.inner.read().values().cloned().collect()
     }
 }

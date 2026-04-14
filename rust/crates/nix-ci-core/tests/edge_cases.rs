@@ -617,3 +617,182 @@ async fn heartbeat_keeps_live_job_fresh(pool: PgPool) {
         .unwrap();
     client.heartbeat(job.id).await.unwrap();
 }
+
+// ─── Battleproof: ingest rejected after seal ─────────────────────────
+
+#[sqlx::test]
+async fn ingest_on_sealed_job_is_rejected(pool: PgPool) {
+    // Once a job is sealed the caller has told us "no more drvs" —
+    // a late ingest after seal must 410 so a lost-retry client
+    // doesn't silently re-open a terminating submission.
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let drv = drv_path("sealed", "pkg");
+    client
+        .ingest_drv(job.id, &ingest(&drv, "pkg", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let late = drv_path("after", "late");
+    match client.ingest_drv(job.id, &ingest(&late, "late", &[], false)).await {
+        Err(nix_ci_core::Error::Gone(_)) => {}
+        other => panic!("expected 410 on sealed-ingest, got {other:?}"),
+    }
+}
+
+// ─── Battleproof: length bounds ──────────────────────────────────────
+
+#[sqlx::test]
+async fn overlong_drv_path_rejected(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    // drv_path with >4096 bytes trips max_drv_path_bytes.
+    let huge = format!("/nix/store/abcd-{}.drv", "x".repeat(5000));
+    let batch = IngestBatchRequest {
+        drvs: vec![ingest(&huge, "huge", &[], true)],
+    };
+    let resp = client.ingest_batch(job.id, &batch).await.unwrap();
+    assert_eq!(resp.errored, 1);
+    assert_eq!(resp.new_drvs, 0);
+}
+
+#[sqlx::test]
+async fn overlong_drv_name_rejected(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let name = "y".repeat(2000);
+    let p = drv_path("hhn", "ok");
+    let mut req = ingest(&p, "ok", &[], true);
+    req.drv_name = name;
+    let batch = IngestBatchRequest { drvs: vec![req] };
+    let resp = client.ingest_batch(job.id, &batch).await.unwrap();
+    assert_eq!(resp.errored, 1);
+    assert_eq!(resp.new_drvs, 0);
+}
+
+// ─── Battleproof: failures cap in terminal snapshot ──────────────────
+
+#[sqlx::test]
+async fn terminal_snapshot_caps_failures(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.max_failures_in_result = 3;
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+
+    // Cancel with a synthetic failures list would be hard — instead,
+    // ingest 5 drvs, fail each, then check the snapshot is capped. Make
+    // them independent (no deps) so each ingest + complete is a pure
+    // terminal failure.
+    let mut drvs = Vec::new();
+    for i in 0..5 {
+        let p = drv_path(&format!("cap{i}"), &format!("pkg-{i}"));
+        client
+            .ingest_drv(job.id, &ingest(&p, &format!("pkg-{i}"), &[], true))
+            .await
+            .unwrap();
+        drvs.push(p);
+    }
+    client.seal(job.id).await.unwrap();
+
+    for _ in 0..5 {
+        let c = client
+            .claim(job.id, "x86_64-linux", &[], 5)
+            .await
+            .unwrap()
+            .expect("claim");
+        client
+            .complete(
+                job.id,
+                c.claim_id,
+                &CompleteRequest {
+                    success: false,
+                    duration_ms: 1,
+                    exit_code: Some(1),
+                    error_category: Some(ErrorCategory::BuildFailure),
+                    error_message: Some("nope".into()),
+                    log_tail: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Wait for terminal.
+    for _ in 0..40 {
+        let s = client.status(job.id).await.unwrap();
+        if s.status.is_terminal() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Post-terminal: the submission is gone from memory; status reads
+    // from jobs.result JSONB. The capped list must be <= cap+1 (the +1
+    // being the truncation marker).
+    let status = client.status(job.id).await.unwrap();
+    assert_eq!(status.status, JobStatus::Failed);
+    assert!(
+        status.failures.len() <= 4,
+        "failures list must be capped (got {})",
+        status.failures.len()
+    );
+    assert!(
+        status.failures.iter().any(|f| f.drv_name == "<truncated>"),
+        "must contain a truncation marker entry"
+    );
+}
+
+// ─── Battleproof: request body size limit ────────────────────────────
+
+#[sqlx::test]
+async fn oversized_batch_rejected_with_413(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.max_request_body_bytes = 16 * 1024; // 16 KiB — tiny for test speed
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let job_resp: nix_ci_core::types::CreateJobResponse = client
+        .post(format!("{}/jobs", handle.base_url))
+        .json(&CreateJobRequest { external_ref: None })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // 200 KiB of payload — well over the configured 16 KiB cap.
+    let big = "x".repeat(200 * 1024);
+    let resp = client
+        .post(format!("{}/jobs/{}/drvs/batch", handle.base_url, job_resp.id))
+        .header("content-type", "application/json")
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "body above max_request_body_bytes must return 413"
+    );
+}

@@ -177,7 +177,7 @@ async fn handle_failure(
     }
     publish_drv_failed(&subs, step, category, &req, attempt, false);
 
-    let propagated_count = propagate_failure_inmem(step, step.drv_hash(), &subs);
+    let propagated_count = propagate_failure_inmem(step, step.drv_hash());
     if propagated_count > 0 {
         state
             .metrics
@@ -252,14 +252,38 @@ fn publish_drv_failed(
     }
 }
 
+/// Cap the terminal `failures` snapshot to keep the `jobs.result`
+/// JSONB row bounded. If we truncate, we drop the tail and record a
+/// synthetic marker so callers see that they're looking at a partial
+/// list. SSE subscribers still get the full list (delivered in-memory
+/// via `JobDone`); only the durable snapshot is capped.
+pub(crate) fn cap_failures(mut all: Vec<DrvFailure>, cap: usize) -> Vec<DrvFailure> {
+    if all.len() <= cap {
+        return all;
+    }
+    let overflow = all.len() - cap;
+    all.truncate(cap);
+    all.push(DrvFailure {
+        drv_hash: crate::types::DrvHash::new("<truncated>".to_string()),
+        drv_name: "<truncated>".to_string(),
+        error_category: ErrorCategory::PropagatedFailure,
+        error_message: Some(format!("{overflow} additional failures truncated from snapshot")),
+        log_tail: None,
+        propagated_from: None,
+    });
+    all
+}
+
 /// Flip every transitive rdep of `root` to terminal-failed, recording a
-/// propagated `DrvFailure` on every submission that owns it. Returns
-/// the number of drvs newly failed so callers can bump metrics.
-fn propagate_failure_inmem(
-    root: &Arc<crate::dispatch::Step>,
-    origin: &DrvHash,
-    origin_subs: &[Arc<Submission>],
-) -> u64 {
+/// propagated `DrvFailure` on every submission that owns the rdep.
+/// Returns the count of drvs newly failed so callers can bump metrics.
+///
+/// Failure records are attached only to submissions that actually
+/// reference each propagated drv — not to the origin submissions just
+/// because they owned the root. Without that restriction a dedup-shared
+/// originating failure would pollute every joined submission's failures
+/// list with drvs those submissions never submitted.
+fn propagate_failure_inmem(root: &Arc<crate::dispatch::Step>, origin: &DrvHash) -> u64 {
     use std::collections::VecDeque;
     let mut frontier: VecDeque<Arc<crate::dispatch::Step>> = VecDeque::new();
     {
@@ -279,10 +303,7 @@ fn propagate_failure_inmem(
         step.finished.store(true, Ordering::Release);
         count += 1;
 
-        let drv_subs = collect_submissions(&step);
-        // Union of origin-subs and this drv's subs — record the
-        // propagated failure on every submission that can see this drv.
-        for sub in origin_subs.iter().chain(drv_subs.iter()) {
+        for sub in collect_submissions(&step) {
             sub.record_failure(DrvFailure {
                 drv_hash: step.drv_hash().clone(),
                 drv_name: step.drv_name().to_string(),
@@ -330,7 +351,8 @@ pub(super) async fn check_and_publish_terminal(
     };
 
     let counts = sub.live_counts();
-    let failures = sub.failures.read().clone();
+    let failures_full = sub.failures.read().clone();
+    let failures = cap_failures(failures_full.clone(), state.cfg.max_failures_in_result);
     let snapshot = JobStatusResponse {
         id: sub.id,
         status: final_status,
@@ -355,7 +377,7 @@ pub(super) async fn check_and_publish_terminal(
 
     sub.publish(JobEvent::JobDone {
         status: final_status,
-        failures,
+        failures: failures_full,
     });
     state
         .metrics

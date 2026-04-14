@@ -52,6 +52,12 @@ pub async fn submit_batch(
             errored += 1;
             continue;
         }
+        if d.drv_path.len() > state.cfg.max_drv_path_bytes
+            || d.drv_name.len() > state.cfg.max_drv_name_bytes
+        {
+            errored += 1;
+            continue;
+        }
         let Some(drv_hash) = drv_hash_from_path(&d.drv_path) else {
             errored += 1;
             continue;
