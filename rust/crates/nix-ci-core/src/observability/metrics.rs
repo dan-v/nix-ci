@@ -30,6 +30,18 @@ pub struct MetricsInner {
 
     // Failure propagation
     pub propagated_failures: Counter,
+
+    // Reaper / retry visibility — failures that would otherwise be
+    // silent "this got cleaned up eventually" behavior.
+    /// Claims reaped by deadline timeout (workers that never responded).
+    pub claims_expired: Counter,
+    /// Jobs reaped by heartbeat timeout (worker/network lost the job).
+    pub jobs_reaped: Counter,
+    /// SSE broadcast events dropped because a subscriber was slow and
+    /// the per-submission channel overflowed. Subscribers see a
+    /// Lagged event and should re-sync; a high rate indicates a slow
+    /// consumer (often a hung client).
+    pub events_dropped: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -124,6 +136,27 @@ impl Metrics {
             propagated_failures.clone(),
         );
 
+        let claims_expired = Counter::default();
+        registry.register(
+            "nix_ci_claims_expired",
+            "Claims reaped by deadline timeout",
+            claims_expired.clone(),
+        );
+
+        let jobs_reaped = Counter::default();
+        registry.register(
+            "nix_ci_jobs_reaped",
+            "Jobs reaped by heartbeat timeout",
+            jobs_reaped.clone(),
+        );
+
+        let events_dropped = Counter::default();
+        registry.register(
+            "nix_ci_events_dropped",
+            "SSE broadcast events dropped due to slow subscriber",
+            events_dropped.clone(),
+        );
+
         Self {
             inner: Arc::new(MetricsInner {
                 registry: parking_lot::Mutex::new(registry),
@@ -137,6 +170,9 @@ impl Metrics {
                 build_duration,
                 dispatch_wait_seconds,
                 propagated_failures,
+                claims_expired,
+                jobs_reaped,
+                events_dropped,
             }),
         }
     }

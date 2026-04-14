@@ -19,9 +19,11 @@ pub async fn events(State(state): State<AppState>, Path(id): Path<JobId>) -> Res
     };
 
     let rx = sub.subscribe();
-    let stream = BroadcastStream::new(rx).map(|res| match res {
+    let metrics = state.metrics.clone();
+    let stream = BroadcastStream::new(rx).map(move |res| match res {
         Ok(ev) => Ok::<Event, Infallible>(event_from(&ev)),
         Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(missed)) => {
+            metrics.inner.events_dropped.inc_by(missed);
             Ok(event_from(&JobEvent::Lagged { missed }))
         }
     });

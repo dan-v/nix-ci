@@ -89,6 +89,11 @@ async fn reap_stale_jobs(pool: &PgPool, dispatcher: &Dispatcher, timeout: Durati
         return Ok(());
     }
     tracing::warn!(n = stale_ids.len(), "reaping stale jobs");
+    dispatcher
+        .metrics
+        .inner
+        .jobs_reaped
+        .inc_by(stale_ids.len() as u64);
 
     let mut tx = pool.begin().await?;
     let uuids: Vec<sqlx::types::Uuid> = stale_ids.iter().map(|(u,)| *u).collect();
@@ -155,6 +160,11 @@ async fn reap_expired_claims(pool: &PgPool, dispatcher: &Dispatcher) -> Result<(
         n = expired.len(),
         "reaping expired claims (deadline exceeded)"
     );
+    dispatcher
+        .metrics
+        .inner
+        .claims_expired
+        .inc_by(expired.len() as u64);
     for claim_id in expired {
         let Some(claim) = dispatcher.claims.take(claim_id) else {
             continue;
