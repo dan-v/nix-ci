@@ -4,7 +4,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +15,6 @@ use super::step::Step;
 
 pub struct Submission {
     pub id: JobId,
-    pub created_at: Instant,
     pub sealed: AtomicBool,
     /// Set when the submission status transitions to terminal.
     pub terminal: AtomicBool,
@@ -40,7 +38,6 @@ impl Submission {
         let (tx, _rx) = broadcast::channel(event_capacity);
         Arc::new(Self {
             id,
-            created_at: Instant::now(),
             sealed: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             toplevels: RwLock::new(Vec::new()),
@@ -62,17 +59,13 @@ impl Submission {
         guard.push(failure);
     }
 
-    /// Add a step to this submission's membership, holding a strong
-    /// reference. Idempotent on duplicate `drv_hash`. Returns true if
-    /// newly added.
-    pub fn add_member(&self, step: &Arc<Step>) -> bool {
+    /// Add a step to this submission's membership (strong ref).
+    /// Idempotent on duplicate `drv_hash`.
+    pub fn add_member(&self, step: &Arc<Step>) {
         let mut guard = self.members.write();
-        if guard.contains_key(step.drv_hash()) {
-            false
-        } else {
-            guard.insert(step.drv_hash().clone(), step.clone());
-            true
-        }
+        guard
+            .entry(step.drv_hash().clone())
+            .or_insert_with(|| step.clone());
     }
 
     pub fn add_root(&self, step: Arc<Step>) {
@@ -188,11 +181,6 @@ impl Submission {
 
     pub fn is_terminal(&self) -> bool {
         self.terminal.load(Ordering::Acquire)
-    }
-
-    /// Snapshot every Step this submission owns (strong refs).
-    pub fn members_snapshot(&self) -> Vec<Arc<Step>> {
-        self.members.read().values().cloned().collect()
     }
 
     /// Compute live counts from the submission's member set.
