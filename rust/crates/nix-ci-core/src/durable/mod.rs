@@ -4,7 +4,6 @@
 
 pub mod cleanup;
 pub mod reaper;
-pub mod rehydrate;
 pub mod writeback;
 
 use std::time::Duration;
@@ -31,6 +30,47 @@ pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool> {
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("database migrations up to date");
     Ok(pool)
+}
+
+/// Boot-time state repair. Every non-terminal job from a prior
+/// coordinator lifetime is flipped to `cancelled` with a sentinel
+/// result; the in-memory dispatcher was never rebuilt, so those jobs
+/// are unreachable and their workers' next poll will 410. Also evicts
+/// expired entries from the `failed_outputs` TTL cache so the first
+/// cleanup tick doesn't have to. Idempotent.
+pub async fn clear_busy(pool: &PgPool) -> Result<()> {
+    let sentinel = serde_json::json!({
+        "id": null,
+        "status": "cancelled",
+        "sealed": false,
+        "counts": { "total": 0, "pending": 0, "building": 0, "done": 0, "failed": 0 },
+        "failures": [],
+        "eval_error": "coordinator restarted; job aborted"
+    });
+
+    let res = sqlx::query(
+        r#"
+        UPDATE jobs
+        SET status = 'cancelled',
+            done_at = now(),
+            result = $1
+        WHERE status = 'pending' AND done_at IS NULL
+        "#,
+    )
+    .bind(&sentinel)
+    .execute(pool)
+    .await?;
+
+    let expired = sqlx::query("DELETE FROM failed_outputs WHERE expires_at < now()")
+        .execute(pool)
+        .await?;
+
+    tracing::info!(
+        cancelled_jobs = res.rows_affected(),
+        expired_failed_outputs = expired.rows_affected(),
+        "clear_busy complete"
+    );
+    Ok(())
 }
 
 /// Single-writer enforcement via `pg_advisory_lock`. Owns a dedicated

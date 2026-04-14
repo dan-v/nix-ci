@@ -51,19 +51,14 @@ pub struct StepState {
 }
 
 impl StepState {
-    /// Returns true if this state already records the given submission
-    /// (by id). Used by ingest helpers to avoid pushing duplicate
-    /// Weak refs when a step is re-ingested by the same submission.
-    pub fn has_submission(&self, id: crate::types::JobId) -> bool {
-        self.submissions
-            .iter()
-            .any(|w| w.upgrade().map(|s| s.id == id).unwrap_or(false))
-    }
-
     /// Idempotently attach a submission Weak ref. Returns true if
     /// newly added.
     pub fn attach_submission(&mut self, sub: &Arc<Submission>) -> bool {
-        if self.has_submission(sub.id) {
+        let already = self
+            .submissions
+            .iter()
+            .any(|w| w.upgrade().map(|s| s.id == sub.id).unwrap_or(false));
+        if already {
             false
         } else {
             self.submissions.push(Arc::downgrade(sub));

@@ -12,7 +12,7 @@ pub mod submission;
 
 pub use claim::{ActiveClaim, Claims};
 pub use step::{Step, StepState};
-pub use steps::{CreateOutcome, StepsRegistry};
+pub use steps::StepsRegistry;
 pub use submission::{Submission, Submissions};
 
 use std::sync::Arc;

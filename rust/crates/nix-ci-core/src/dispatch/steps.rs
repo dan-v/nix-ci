@@ -18,22 +18,6 @@ pub struct StepsRegistry {
     inner: RwLock<HashMap<DrvHash, Weak<Step>>>,
 }
 
-pub enum CreateOutcome {
-    New(Arc<Step>),
-    Existing(Arc<Step>),
-}
-
-impl CreateOutcome {
-    pub fn is_new(&self) -> bool {
-        matches!(self, Self::New(_))
-    }
-    pub fn into_step(self) -> Arc<Step> {
-        match self {
-            Self::New(s) | Self::Existing(s) => s,
-        }
-    }
-}
-
 impl Default for StepsRegistry {
     fn default() -> Self {
         Self::new()
@@ -63,23 +47,25 @@ impl StepsRegistry {
     /// Insert or reuse a step keyed by its `drv_hash`. `factory` is
     /// invoked only on miss — the caller constructs the step inside
     /// it so we don't do extra work on the fast path of a duplicate.
-    pub fn get_or_create<F>(&self, drv_hash: &DrvHash, factory: F) -> CreateOutcome
+    /// Returns `(step, is_new)`; `is_new` is true iff this call minted
+    /// the step (vs. reused an existing Arc).
+    pub fn get_or_create<F>(&self, drv_hash: &DrvHash, factory: F) -> (Arc<Step>, bool)
     where
         F: FnOnce() -> Arc<Step>,
     {
         // Fast path: read lock + successful upgrade.
         if let Some(existing) = self.inner.read().get(drv_hash).and_then(Weak::upgrade) {
-            return CreateOutcome::Existing(existing);
+            return (existing, false);
         }
         // Slow path: write lock. Re-check; another task might have won
         // the race.
         let mut guard = self.inner.write();
         if let Some(existing) = guard.get(drv_hash).and_then(Weak::upgrade) {
-            return CreateOutcome::Existing(existing);
+            return (existing, false);
         }
         let step = factory();
         guard.insert(drv_hash.clone(), Arc::downgrade(&step));
-        CreateOutcome::New(step)
+        (step, true)
     }
 
     /// Iterate live steps. Write-locks to GC dead weak entries in the

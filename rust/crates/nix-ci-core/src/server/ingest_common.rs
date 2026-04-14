@@ -36,20 +36,16 @@ pub(super) fn wire_dep(
 ) -> crate::error::Result<()> {
     let dep_hash = drv_hash_from_path(dep_path)
         .ok_or_else(|| crate::Error::BadRequest(format!("bad input drv_path: {dep_path}")))?;
-    let dep = state
-        .dispatcher
-        .steps
-        .get_or_create(&dep_hash, || {
-            Step::new(
-                dep_hash.clone(),
-                dep_path.to_string(),
-                placeholder_name_from(dep_path),
-                inherit_system.to_string(),
-                Vec::new(),
-                state.cfg.max_attempts,
-            )
-        })
-        .into_step();
+    let (dep, _) = state.dispatcher.steps.get_or_create(&dep_hash, || {
+        Step::new(
+            dep_hash.clone(),
+            dep_path.to_string(),
+            placeholder_name_from(dep_path),
+            inherit_system.to_string(),
+            Vec::new(),
+            state.cfg.max_attempts,
+        )
+    });
     if dep.finished.load(Ordering::Acquire) {
         return Ok(());
     }

@@ -40,18 +40,16 @@ fn build_graph(dag: &[Vec<usize>], steps: &StepsRegistry, sub: &Arc<Submission>)
     let mut nodes: Vec<Arc<Step>> = Vec::with_capacity(dag.len());
     for i in 0..dag.len() {
         let hash = DrvHash::new(format!("drv-{i:04}"));
-        let step = steps
-            .get_or_create(&hash, || {
-                Step::new(
-                    hash.clone(),
-                    format!("/nix/store/{hash}"),
-                    format!("drv-{i:04}"),
-                    "x86_64-linux".into(),
-                    Vec::new(),
-                    2,
-                )
-            })
-            .into_step();
+        let (step, _) = steps.get_or_create(&hash, || {
+            Step::new(
+                hash.clone(),
+                format!("/nix/store/{hash}"),
+                format!("drv-{i:04}"),
+                "x86_64-linux".into(),
+                Vec::new(),
+                2,
+            )
+        });
         {
             let mut st = step.state.write();
             st.submissions.push(Arc::downgrade(sub));
@@ -292,18 +290,16 @@ fn cross_submission_cas_exactly_one_winner() {
             .collect();
 
         let hash = DrvHash::new("shared".to_string());
-        let step = registry
-            .get_or_create(&hash, || {
-                Step::new(
-                    hash.clone(),
-                    format!("/nix/store/{hash}"),
-                    "shared".into(),
-                    "x86_64-linux".into(),
-                    Vec::new(),
-                    2,
-                )
-            })
-            .into_step();
+        let (step, _) = registry.get_or_create(&hash, || {
+            Step::new(
+                hash.clone(),
+                format!("/nix/store/{hash}"),
+                "shared".into(),
+                "x86_64-linux".into(),
+                Vec::new(),
+                2,
+            )
+        });
         {
             let mut st = step.state.write();
             for s in &subs {
@@ -413,7 +409,7 @@ fn property_many_submissions_overlapping_graphs() {
                     DrvHash::new(format!("sub{sub_idx}-{i:04}"))
                 };
 
-                let step_outcome = registry.get_or_create(&hash, || {
+                let (step, is_new) = registry.get_or_create(&hash, || {
                     Step::new(
                         hash.clone(),
                         format!("/nix/store/{hash}"),
@@ -423,8 +419,6 @@ fn property_many_submissions_overlapping_graphs() {
                         2,
                     )
                 });
-                let is_new = step_outcome.is_new();
-                let step = step_outcome.into_step();
 
                 // Attach submission
                 {

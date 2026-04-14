@@ -36,7 +36,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     // Cancel any non-terminal jobs from the previous lifetime. There is
     // no graph to rebuild — the dispatcher is purely in-memory.
-    durable::rehydrate::clear_busy(&pool).await?;
+    durable::clear_busy(&pool).await?;
 
     let metrics = Metrics::new();
     let dispatcher = Dispatcher::new(metrics.clone());

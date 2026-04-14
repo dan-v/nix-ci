@@ -46,7 +46,7 @@ fn arm(step: &Arc<Step>) {
 fn invariant_3_dedup_returns_same_arc() {
     let registry = StepsRegistry::new();
     let hash = DrvHash::new("aaa-foo.drv".to_string());
-    let first = registry.get_or_create(&hash, || {
+    let (a_step, a_new) = registry.get_or_create(&hash, || {
         Step::new(
             hash.clone(),
             "/nix/store/aaa-foo.drv".into(),
@@ -56,12 +56,11 @@ fn invariant_3_dedup_returns_same_arc() {
             2,
         )
     });
-    assert!(first.is_new());
-    let a_step = first.into_step();
+    assert!(a_new);
 
-    let second = registry.get_or_create(&hash, || panic!("factory must not run on dup"));
-    assert!(!second.is_new());
-    let b_step = second.into_step();
+    let (b_step, b_new) =
+        registry.get_or_create(&hash, || panic!("factory must not run on dup"));
+    assert!(!b_new);
 
     assert!(Arc::ptr_eq(&a_step, &b_step));
     assert_eq!(registry.len(), 1);
@@ -140,18 +139,16 @@ fn cross_submission_dedup_shares_step_arc() {
     let registry = StepsRegistry::new();
     let hash = DrvHash::new("shared-drv".to_string());
 
-    let a = registry
-        .get_or_create(&hash, || {
-            Step::new(
-                hash.clone(),
-                "/nix/store/shared-drv".into(),
-                "shared".into(),
-                "x86_64-linux".into(),
-                vec![],
-                2,
-            )
-        })
-        .into_step();
+    let (a, _) = registry.get_or_create(&hash, || {
+        Step::new(
+            hash.clone(),
+            "/nix/store/shared-drv".into(),
+            "shared".into(),
+            "x86_64-linux".into(),
+            vec![],
+            2,
+        )
+    });
     let sub_a = Submission::new(JobId::new(), 8);
     let sub_b = Submission::new(JobId::new(), 8);
 
@@ -165,9 +162,7 @@ fn cross_submission_dedup_shares_step_arc() {
     }
 
     // Second submission hits dedup path
-    let b = registry
-        .get_or_create(&hash, || panic!("should not run"))
-        .into_step();
+    let (b, _) = registry.get_or_create(&hash, || panic!("should not run"));
     assert!(Arc::ptr_eq(&a, &b));
 
     // Arm the step; both submissions' ready queues pick it up.
@@ -192,18 +187,16 @@ fn cross_submission_dedup_shares_step_arc() {
 fn feature_matching_skips_mismatched() {
     let registry = StepsRegistry::new();
     let hash = DrvHash::new("kvm-drv".to_string());
-    let step = registry
-        .get_or_create(&hash, || {
-            Step::new(
-                hash.clone(),
-                "/nix/store/kvm-drv".into(),
-                "kvm-test".into(),
-                "x86_64-linux".into(),
-                vec!["kvm".into()],
-                2,
-            )
-        })
-        .into_step();
+    let (step, _) = registry.get_or_create(&hash, || {
+        Step::new(
+            hash.clone(),
+            "/nix/store/kvm-drv".into(),
+            "kvm-test".into(),
+            "x86_64-linux".into(),
+            vec!["kvm".into()],
+            2,
+        )
+    });
     arm(&step);
 
     let sub = Submission::new(JobId::new(), 8);
@@ -311,18 +304,16 @@ fn weak_registry_drops_orphaned_steps() {
     let registry = StepsRegistry::new();
     let hash = DrvHash::new("ephemeral".to_string());
     {
-        let step = registry
-            .get_or_create(&hash, || {
-                Step::new(
-                    hash.clone(),
-                    "/nix/store/ephemeral".into(),
-                    "eph".into(),
-                    "x86_64-linux".into(),
-                    vec![],
-                    2,
-                )
-            })
-            .into_step();
+        let (step, _) = registry.get_or_create(&hash, || {
+            Step::new(
+                hash.clone(),
+                "/nix/store/ephemeral".into(),
+                "eph".into(),
+                "x86_64-linux".into(),
+                vec![],
+                2,
+            )
+        });
         assert_eq!(Arc::strong_count(&step), 1);
     }
     // step dropped — registry holds only a Weak

@@ -56,7 +56,7 @@ pub async fn submit_batch(
             errored += 1;
             continue;
         };
-        let outcome = state.dispatcher.steps.get_or_create(&drv_hash, || {
+        let (step, is_new) = state.dispatcher.steps.get_or_create(&drv_hash, || {
             Step::new(
                 drv_hash.clone(),
                 d.drv_path.clone(),
@@ -66,8 +66,6 @@ pub async fn submit_batch(
                 state.cfg.max_attempts,
             )
         });
-        let is_new = outcome.is_new();
-        let step = outcome.into_step();
         if is_new && known_failed.contains(&d.drv_path) {
             step.previous_failure
                 .store(true, std::sync::atomic::Ordering::Release);
