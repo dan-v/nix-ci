@@ -1,0 +1,37 @@
+[package]
+name = "nix-ci-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+eventsource-stream.workspace = true
+parking_lot.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+prometheus-client.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rand = "0.8"
+
+[features]
+default = []
+load-test = []

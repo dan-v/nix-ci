@@ -1,0 +1,28 @@
+# Rust build artifacts (Cargo.lock is committed — this is an application)
+target/
+**/*.rs.bk
+
+# Nix (flake.lock is committed — this is an application)
+result
+result-*
+.direnv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+.envrc.local
+
+# Docker / dev volumes
+*.log
+
+# Claude Code
+.claude/
