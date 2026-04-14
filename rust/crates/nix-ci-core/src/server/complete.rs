@@ -1,4 +1,11 @@
 //! `POST /jobs/{id}/claims/{claim_id}/complete`
+//!
+//! Pure in-memory state transitions on the drv graph. The only durable
+//! writes are:
+//!   * `failed_outputs` insert when a drv terminal-fails (TTL cache so
+//!     concurrent / subsequent jobs can short-circuit a known-bad drv).
+//!   * `jobs.status/done_at/result` when the submission itself reaches
+//!     a terminal state.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -9,12 +16,12 @@ use axum::Json;
 use super::AppState;
 use crate::dispatch::rdep::make_rdeps_runnable;
 use crate::dispatch::Submission;
-use crate::durable::writeback::{self, MarkFailed};
+use crate::durable::writeback;
 use crate::error::{Error, Result};
 use crate::observability::metrics::{OutcomeLabels, TerminalLabels};
 use crate::types::{
-    ClaimId, CompleteRequest, CompleteResponse, DrvFailure, ErrorCategory, JobEvent, JobId,
-    JobStatus, MAX_LOG_TAIL_BYTES,
+    ClaimId, CompleteRequest, CompleteResponse, DrvFailure, DrvHash, ErrorCategory, JobEvent,
+    JobId, JobStatus, JobStatusResponse, MAX_LOG_TAIL_BYTES,
 };
 
 pub async fn complete(
@@ -22,15 +29,12 @@ pub async fn complete(
     Path((job_id, claim_id)): Path<(JobId, ClaimId)>,
     Json(mut req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>> {
-    // Retrieve the active claim; if it's gone, the completion is stale.
     let Some(claim) = state.dispatcher.claims.take(claim_id) else {
         return Ok(Json(CompleteResponse {
             ignored: true,
             next_build: None,
         }));
     };
-    // Decrement gauge for every taken claim, including the paths below
-    // where we early-return on a GC'd step or a claim mismatch.
     state.metrics.inner.claims_in_flight.dec();
 
     if claim.job_id != job_id {
@@ -40,18 +44,15 @@ pub async fn complete(
     }
 
     let Some(step) = state.dispatcher.steps.get(&claim.drv_hash) else {
-        // The step's Arc has been GC'd — the submission that owned it
-        // is gone. Treat as stale; caller drops its result.
         return Ok(Json(CompleteResponse {
             ignored: true,
             next_build: None,
         }));
     };
 
-    // Guard against the race where failure propagation already marked
-    // this step finished in-memory while the worker's complete was in
-    // flight. Double-processing would cause duplicate PG writes and
-    // incorrect metrics.
+    // Guard against the failure-propagation race: if propagation already
+    // marked this step finished, skip processing so we don't double-
+    // count metrics or re-fire events.
     if step.finished.load(Ordering::Acquire) {
         return Ok(Json(CompleteResponse {
             ignored: true,
@@ -68,24 +69,16 @@ pub async fn complete(
         .observe((req.duration_ms as f64) / 1000.0);
 
     if req.success {
-        handle_success(&state, &claim, &step).await?;
+        handle_success(&state, &step).await?;
     } else {
         handle_failure(&state, &claim, &step, req).await?;
     }
-    // No opportunistic `next_build`: it would mark a drv `building`
-    // with an outstanding claim_id before we know the caller will
-    // consume it; if the response is dropped, the drv is stuck until
-    // the reaper catches it. Worker loops wake on notify in microseconds.
     Ok(Json(CompleteResponse {
         ignored: false,
         next_build: None,
     }))
 }
 
-/// Char-boundary-safe tail truncation. Keeps at most
-/// `MAX_LOG_TAIL_BYTES` bytes; if the byte cut falls mid-UTF-8, we
-/// step forward to the next valid boundary to avoid a `split_at`
-/// panic on multi-byte characters.
 fn truncate_log(log: &mut Option<String>) {
     let Some(s) = log else { return };
     if s.len() <= MAX_LOG_TAIL_BYTES {
@@ -101,12 +94,10 @@ fn truncate_log(log: &mut Option<String>) {
 
 async fn handle_success(
     state: &AppState,
-    claim: &crate::dispatch::claim::ActiveClaim,
     step: &Arc<crate::dispatch::Step>,
 ) -> Result<()> {
     step.finished.store(true, Ordering::Release);
 
-    let _ = writeback::mark_done(&state.pool, step.drv_hash(), claim.claim_id).await?;
     state
         .metrics
         .inner
@@ -145,24 +136,24 @@ async fn handle_failure(
     let can_retry = category.is_retryable() && attempt < step.max_tries();
 
     if can_retry {
-        return handle_flaky_retry(state, claim, step, req, category, attempt).await;
+        return handle_flaky_retry(state, step, req, category, attempt).await;
     }
 
     step.previous_failure.store(true, Ordering::Release);
     step.finished.store(true, Ordering::Release);
 
-    let propagated = writeback::mark_terminal_failure(
-        &state.pool,
-        MarkFailed {
-            drv_hash: step.drv_hash(),
-            claim_id: Some(claim.claim_id),
-            category,
-            message: req.error_message.as_deref(),
-            exit_code: req.exit_code,
-            log_tail: req.log_tail.as_deref(),
-        },
-    )
-    .await?;
+    // Best-effort: cache the output path (drv_path with .drv stripped)
+    // so concurrent jobs short-circuit on the next ingest. Not fatal on
+    // error.
+    let output_path = step.drv_path().trim_end_matches(".drv").to_string();
+    if !output_path.is_empty() && output_path != step.drv_path() {
+        if let Err(e) =
+            writeback::insert_failed_outputs(&state.pool, step.drv_hash(), &[output_path]).await
+        {
+            tracing::warn!(error = %e, "failed_outputs insert failed; continuing");
+        }
+    }
+
     state
         .metrics
         .inner
@@ -171,18 +162,34 @@ async fn handle_failure(
             outcome: "failure".into(),
         })
         .inc();
-    if !propagated.is_empty() {
+
+    let subs = collect_submissions(step);
+
+    // Record the originating failure on every submission that owns this
+    // step. The DrvFailure is what the terminal `jobs.result` snapshot
+    // and `GET /jobs/{id}` will return for this drv.
+    let failure = DrvFailure {
+        drv_hash: step.drv_hash().clone(),
+        drv_name: step.drv_name().to_string(),
+        error_category: category,
+        error_message: req.error_message.clone(),
+        log_tail: req.log_tail.clone(),
+        propagated_from: None,
+    };
+    for sub in &subs {
+        sub.record_failure(failure.clone());
+    }
+    publish_drv_failed(&subs, step, category, &req, attempt, false);
+
+    let propagated_count = propagate_failure_inmem(step, step.drv_hash(), &subs);
+    if propagated_count > 0 {
         state
             .metrics
             .inner
             .propagated_failures
-            .inc_by(propagated.len() as u64);
+            .inc_by(propagated_count);
     }
 
-    propagate_failure_inmem(step);
-
-    let subs = collect_submissions(step);
-    publish_drv_failed(&subs, step, category, &req, attempt, false);
     for sub in subs {
         check_and_publish_terminal(state, &sub).await?;
     }
@@ -192,38 +199,22 @@ async fn handle_failure(
 
 async fn handle_flaky_retry(
     state: &AppState,
-    claim: &crate::dispatch::claim::ActiveClaim,
     step: &Arc<crate::dispatch::Step>,
     req: CompleteRequest,
     category: ErrorCategory,
     attempt: i32,
 ) -> Result<()> {
     let backoff_ms = state.cfg.flaky_retry_backoff_step_ms * i64::from(attempt);
-    let updated = writeback::mark_flaky_retry(
-        &state.pool,
-        MarkFailed {
-            drv_hash: step.drv_hash(),
-            claim_id: Some(claim.claim_id),
-            category,
-            message: req.error_message.as_deref(),
-            exit_code: req.exit_code,
-            log_tail: req.log_tail.as_deref(),
-        },
-        backoff_ms,
-    )
-    .await?;
-    if updated {
-        step.next_attempt_at.store(
-            chrono::Utc::now().timestamp_millis() + backoff_ms,
-            Ordering::Release,
-        );
-        if step
-            .runnable
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            crate::dispatch::rdep::enqueue_for_all_submissions(step);
-        }
+    step.next_attempt_at.store(
+        chrono::Utc::now().timestamp_millis() + backoff_ms,
+        Ordering::Release,
+    );
+    if step
+        .runnable
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        crate::dispatch::rdep::enqueue_for_all_submissions(step);
     }
     let subs = collect_submissions(step);
     publish_drv_failed(&subs, step, category, &req, attempt, true);
@@ -265,7 +256,14 @@ fn publish_drv_failed(
     }
 }
 
-fn propagate_failure_inmem(root: &Arc<crate::dispatch::Step>) {
+/// Flip every transitive rdep of `root` to terminal-failed, recording a
+/// propagated `DrvFailure` on every submission that owns it. Returns
+/// the number of drvs newly failed so callers can bump metrics.
+fn propagate_failure_inmem(
+    root: &Arc<crate::dispatch::Step>,
+    origin: &DrvHash,
+    origin_subs: &[Arc<Submission>],
+) -> u64 {
     use std::collections::VecDeque;
     let mut frontier: VecDeque<Arc<crate::dispatch::Step>> = VecDeque::new();
     {
@@ -276,29 +274,41 @@ fn propagate_failure_inmem(root: &Arc<crate::dispatch::Step>) {
             }
         }
     }
+    let mut count = 0u64;
     while let Some(step) = frontier.pop_front() {
         if step.finished.load(Ordering::Acquire) {
             continue;
         }
         step.previous_failure.store(true, Ordering::Release);
         step.finished.store(true, Ordering::Release);
+        count += 1;
+
+        let drv_subs = collect_submissions(&step);
+        // Union of origin-subs and this drv's subs — record the
+        // propagated failure on every submission that can see this drv.
+        for sub in origin_subs.iter().chain(drv_subs.iter()) {
+            sub.record_failure(DrvFailure {
+                drv_hash: step.drv_hash().clone(),
+                drv_name: step.drv_name().to_string(),
+                error_category: ErrorCategory::PropagatedFailure,
+                error_message: Some(format!("dep failed: {origin}")),
+                log_tail: None,
+                propagated_from: Some(origin.clone()),
+            });
+        }
+
         let next: Vec<Arc<crate::dispatch::Step>> = {
             let st = step.state.read();
             st.rdeps.iter().filter_map(|w| w.upgrade()).collect()
         };
         frontier.extend(next);
     }
+    count
 }
 
-/// Transition a submission to a terminal state if it qualifies.
-///
-/// Ordering is load-bearing: we **write to Postgres first**, then do
-/// the in-memory CAS that gates event publication. If the DB write
-/// fails, the in-memory state is not dirtied, so the next completion
-/// or the reaper can retry cleanly. If the DB write succeeds and the
-/// CAS-race loses to another completion, the event publish is skipped
-/// (another thread already did it) — the double-DB-write is idempotent
-/// because `transition_job_terminal` has a `done_at IS NULL` guard.
+/// Transition the submission to terminal if its toplevels are all
+/// finished and it's sealed. Writes the final `JobStatusResponse`
+/// snapshot to `jobs.result` and publishes `JobDone`.
 pub(super) async fn check_and_publish_terminal(
     state: &AppState,
     sub: &Arc<Submission>,
@@ -323,29 +333,29 @@ pub(super) async fn check_and_publish_terminal(
         JobStatus::Done
     };
 
-    // `transition_job_terminal` is idempotent on `done_at IS NULL`;
-    // a zero-rows result means another path already concluded the job
-    // — still safe to proceed, the in-memory CAS below is the
-    // authoritative gate for event publication.
-    let _transitioned =
-        writeback::transition_job_terminal(&state.pool, sub.id, final_status.as_str()).await?;
+    let counts = sub.live_counts();
+    let failures = sub.failures.read().clone();
+    let snapshot = JobStatusResponse {
+        id: sub.id,
+        status: final_status,
+        sealed: true,
+        counts,
+        failures: failures.clone(),
+        eval_error: None,
+    };
+    let snapshot_json = serde_json::to_value(&snapshot)
+        .map_err(|e| Error::Internal(format!("serialize terminal result: {e}")))?;
+    let _ = writeback::transition_job_terminal(
+        &state.pool,
+        sub.id,
+        final_status.as_str(),
+        &snapshot_json,
+    )
+    .await?;
 
     if !sub.mark_terminal() {
         return Ok(());
     }
-
-    let failures: Vec<DrvFailure> = tops
-        .iter()
-        .filter(|t| t.previous_failure.load(Ordering::Acquire))
-        .map(|t| DrvFailure {
-            drv_hash: t.drv_hash().clone(),
-            drv_name: t.drv_name().to_string(),
-            error_category: ErrorCategory::BuildFailure,
-            error_message: None,
-            log_tail: None,
-            propagated_from: None,
-        })
-        .collect();
 
     sub.publish(JobEvent::JobDone {
         status: final_status,
@@ -360,14 +370,10 @@ pub(super) async fn check_and_publish_terminal(
         })
         .inc();
 
-    // Release the submission from the in-memory map. The caller still
-    // holds the `&Arc<Submission>` so outstanding SSE subscribers'
-    // broadcast queues see JobDone, then the stream closes cleanly as
-    // the Sender is dropped (happens when this Arc's last holder does).
-    // New `/events` subscribers and new ingest calls after this point
-    // get a 404 — they should poll `/jobs/{id}` status instead, which
-    // serves from Postgres for terminal jobs. Matches the cleanup
-    // pattern in `jobs::transition_to` and `reaper::reap_stale_jobs`.
+    // Drop the in-memory submission. Existing SSE subscribers keep
+    // their receiver until the broadcast Sender is dropped with the
+    // last Arc<Submission>. New subscribers get 404 and should poll
+    // `/jobs/{id}` for the terminal result instead.
     state.dispatcher.submissions.remove(sub.id);
     Ok(())
 }

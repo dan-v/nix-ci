@@ -5,7 +5,6 @@ pub mod claim;
 pub mod complete;
 pub mod events;
 pub mod heartbeat;
-pub mod ingest;
 pub mod ingest_batch;
 pub(crate) mod ingest_common;
 pub mod jobs;
@@ -35,13 +34,12 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     // dedicated connection so Drop reliably releases the lock.
     let _lock = CoordinatorLock::acquire(&cfg.database_url, cfg.lock_key).await?;
 
-    // Reset in-flight state from prior lifetime.
+    // Cancel any non-terminal jobs from the previous lifetime. There is
+    // no graph to rebuild — the dispatcher is purely in-memory.
     durable::rehydrate::clear_busy(&pool).await?;
 
-    // Build dispatcher and rehydrate graph.
     let metrics = Metrics::new();
     let dispatcher = Dispatcher::new(metrics.clone());
-    durable::rehydrate::rehydrate(&pool, &dispatcher).await?;
 
     let state = AppState {
         pool: pool.clone(),
@@ -89,26 +87,17 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .await
         .map_err(|e| crate::Error::Internal(format!("axum serve: {e}")))?;
 
-    // Bounded drain for background tasks. If reaper or cleanup is in
-    // the middle of a slow query when the shutdown watch flips, we
-    // give them graceful_shutdown_secs to finish; otherwise we abort
-    // so the process can actually exit. Without this, a hung task
-    // holding a pool connection could prevent Postgres from seeing
-    // the disconnect and rolling back cleanly.
+    // Bounded drain. Abort any handle that overruns so the stuck task
+    // drops its pool connection before `pool.close()` — otherwise
+    // close hangs forever waiting for those connections to return.
     let drain_deadline = Duration::from_secs(cfg.graceful_shutdown_secs);
-    let drain = async {
-        let _ = reaper_task.await;
-        let _ = cleanup_task.await;
-    };
-    if tokio::time::timeout(drain_deadline, drain).await.is_err() {
-        tracing::warn!(
-            timeout_secs = drain_deadline.as_secs(),
-            "shutdown: background tasks did not finish in time; forcing exit"
-        );
+    for (name, handle) in [("reaper", reaper_task), ("cleanup", cleanup_task)] {
+        let abort = handle.abort_handle();
+        if tokio::time::timeout(drain_deadline, handle).await.is_err() {
+            tracing::warn!(task = name, "shutdown: task overran drain; aborting");
+            abort.abort();
+        }
     }
-
-    // Explicitly close the pool so in-flight transactions either
-    // finish or roll back cleanly rather than dying with the process.
     pool.close().await;
 
     // Releasing _lock at end of scope drops its connection, which

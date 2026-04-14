@@ -1,4 +1,4 @@
-//! Cleanup loop: bulk deletes and TTL sweeps. Runs every few minutes.
+//! Cleanup loop: TTL eviction and retention pruning.
 
 use std::time::Duration;
 
@@ -16,8 +16,7 @@ pub async fn run(
 ) {
     let mut ticker = interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // skip first tick — we ran cleanup at startup
-    ticker.tick().await;
+    ticker.tick().await; // skip first: we ran cleanup at startup
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -33,7 +32,6 @@ pub async fn run(
 }
 
 async fn sweep(pool: &PgPool, retention_days: u32) -> Result<()> {
-    // Expired failed_outputs
     let r = sqlx::query("DELETE FROM failed_outputs WHERE expires_at < now()")
         .execute(pool)
         .await?;
@@ -41,7 +39,6 @@ async fn sweep(pool: &PgPool, retention_days: u32) -> Result<()> {
         tracing::debug!(n = r.rows_affected(), "expired failed_outputs");
     }
 
-    // Old terminal jobs (and their roots cascade)
     let interval_arg = format!("{} days", retention_days);
     let r = sqlx::query(
         r#"
@@ -56,32 +53,5 @@ async fn sweep(pool: &PgPool, retention_days: u32) -> Result<()> {
     if r.rows_affected() > 0 {
         tracing::info!(n = r.rows_affected(), "pruned old terminal jobs");
     }
-
-    // Old derivations not referenced by any live job. We use a
-    // transitive-closure walk to identify "needed" drvs.
-    let r = sqlx::query(
-        r#"
-        WITH RECURSIVE needed AS (
-            SELECT jr.drv_hash
-            FROM job_roots jr
-            JOIN jobs j ON j.id = jr.job_id
-            WHERE j.status IN ('pending','building')
-            UNION
-            SELECT d.dep_hash FROM deps d
-            JOIN needed n ON n.drv_hash = d.drv_hash
-        )
-        DELETE FROM derivations
-        WHERE state IN ('done','failed')
-          AND completed_at < now() - $1::interval
-          AND drv_hash NOT IN (SELECT drv_hash FROM needed)
-        "#,
-    )
-    .bind(&interval_arg)
-    .execute(pool)
-    .await?;
-    if r.rows_affected() > 0 {
-        tracing::info!(n = r.rows_affected(), "pruned old derivations");
-    }
-
     Ok(())
 }

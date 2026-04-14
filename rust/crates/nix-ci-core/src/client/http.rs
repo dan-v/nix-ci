@@ -38,14 +38,24 @@ impl CoordinatorClient {
         decode(resp).await
     }
 
+    /// Ingest a single drv. Convenience wrapper around `ingest_batch`;
+    /// the server only implements the batch endpoint.
     pub async fn ingest_drv(
         &self,
         job_id: JobId,
         req: &IngestDrvRequest,
     ) -> Result<IngestDrvResponse> {
-        let url = format!("{}/jobs/{}/drvs", self.base, job_id);
-        let resp = self.http.post(&url).json(req).send().await?;
-        decode(resp).await
+        let drv_hash = crate::types::drv_hash_from_path(&req.drv_path)
+            .ok_or_else(|| Error::BadRequest(format!("bad drv_path: {}", req.drv_path)))?;
+        let batch = IngestBatchRequest {
+            drvs: vec![req.clone()],
+        };
+        let resp = self.ingest_batch(job_id, &batch).await?;
+        Ok(IngestDrvResponse {
+            drv_hash,
+            new_drv: resp.new_drvs > 0,
+            dedup_skipped: resp.dedup_skipped > 0,
+        })
     }
 
     pub async fn ingest_batch(

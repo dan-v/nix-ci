@@ -8,7 +8,6 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{drv_path, spawn_server, spawn_server_with_cfg};
@@ -108,37 +107,20 @@ async fn cancel_mid_flight_invalidates_claim(pool: PgPool) {
         "cancelled job must ignore a stale worker completion"
     );
 
-    // DB invariants: status=cancelled, done_at set, no drv left at
-    // state='building' for this job's closure (cancel released them).
-    let (status_str, done_at): (String, Option<chrono::DateTime<chrono::Utc>>) =
-        sqlx::query_as("SELECT status, done_at FROM jobs WHERE id = $1")
-            .bind(job.id.0)
-            .fetch_one(&handle.pool)
-            .await
-            .unwrap();
+    // Durable invariant: the jobs row carries the terminal status +
+    // done_at + the result snapshot.
+    let (status_str, done_at, result): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+    ) = sqlx::query_as("SELECT status, done_at, result FROM jobs WHERE id = $1")
+        .bind(job.id.0)
+        .fetch_one(&handle.pool)
+        .await
+        .unwrap();
     assert_eq!(status_str, "cancelled");
     assert!(done_at.is_some());
-
-    let building_count: (i64,) = sqlx::query_as(
-        r#"
-        WITH RECURSIVE closure AS (
-            SELECT drv_hash FROM job_roots WHERE job_id = $1
-            UNION
-            SELECT d.dep_hash FROM deps d JOIN closure c ON c.drv_hash = d.drv_hash
-        )
-        SELECT COUNT(*) FROM derivations
-        WHERE state = 'building'
-          AND drv_hash IN (SELECT drv_hash FROM closure)
-        "#,
-    )
-    .bind(job.id.0)
-    .fetch_one(&handle.pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        building_count.0, 0,
-        "cancel must release building drvs back to pending"
-    );
+    assert!(result.is_some(), "cancelled job must have a result snapshot");
 }
 
 #[sqlx::test]
@@ -216,7 +198,10 @@ async fn heartbeat_timeout_reaps_job(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn heartbeat_timeout_releases_building_drvs(pool: PgPool) {
+async fn heartbeat_timeout_drops_in_memory_claims(pool: PgPool) {
+    // When a job is reaped for heartbeat timeout, every in-memory claim
+    // tied to that job must be released immediately — not linger until
+    // its deadline (hours). Regression guard for a previous leak.
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
 
@@ -226,29 +211,23 @@ async fn heartbeat_timeout_releases_building_drvs(pool: PgPool) {
         .unwrap();
 
     let leaf = drv_path("hb2", "leaf");
-    let mid = drv_path("hb3", "mid");
-    let root = drv_path("hb4", "root");
     client
-        .ingest_drv(job.id, &ingest(&leaf, "leaf", &[], false))
-        .await
-        .unwrap();
-    client
-        .ingest_drv(job.id, &ingest(&mid, "mid", &[&leaf], false))
-        .await
-        .unwrap();
-    client
-        .ingest_drv(job.id, &ingest(&root, "root", &[&mid], true))
+        .ingest_drv(job.id, &ingest(&leaf, "leaf", &[], true))
         .await
         .unwrap();
 
-    // Claim leaf so it's state='building' in PG.
     let _c = client
         .claim(job.id, "x86_64-linux", &[], 5)
         .await
         .unwrap()
         .expect("leaf claim");
 
-    // Age the heartbeat out.
+    assert_eq!(
+        handle.dispatcher.claims.len(),
+        1,
+        "claim should be in the map"
+    );
+
     sqlx::query("UPDATE jobs SET last_heartbeat = now() - INTERVAL '1 hour' WHERE id = $1")
         .bind(job.id.0)
         .execute(&handle.pool)
@@ -263,40 +242,23 @@ async fn heartbeat_timeout_releases_building_drvs(pool: PgPool) {
     .await
     .unwrap();
 
-    // No drv in this job's closure should remain 'building'. The old
-    // reaper query only released roots; the regression would leave
-    // non-root drvs (mid + leaf) wedged.
-    let building: (i64,) = sqlx::query_as(
-        r#"
-        WITH RECURSIVE closure AS (
-            SELECT drv_hash FROM job_roots WHERE job_id = $1
-            UNION
-            SELECT d.dep_hash FROM deps d JOIN closure c ON c.drv_hash = d.drv_hash
-        )
-        SELECT COUNT(*) FROM derivations
-        WHERE state = 'building'
-          AND drv_hash IN (SELECT drv_hash FROM closure)
-        "#,
-    )
-    .bind(job.id.0)
-    .fetch_one(&handle.pool)
-    .await
-    .unwrap();
     assert_eq!(
-        building.0, 0,
-        "heartbeat reap must release ALL building drvs in the closure, not just roots"
+        handle.dispatcher.claims.len(),
+        0,
+        "reaped job's claims must be evicted from the in-memory map"
     );
 }
 
 // ─── 3. Coordinator restart + stale complete ───────────────────────────
 
 #[sqlx::test]
-async fn restart_with_outstanding_claim_ignores_stale_complete(pool: PgPool) {
+async fn restart_cancels_in_flight_and_stale_complete_is_ignored(pool: PgPool) {
     // Simulate a coordinator crash mid-build: issue a claim, tear the
-    // server down, spin up a fresh server (which runs rehydrate +
-    // clear_busy), then POST /complete with the old claim_id. The
-    // new coordinator must not match the claim and must report the
-    // completion as ignored.
+    // server down, spin up a fresh server. With the ephemeral-
+    // dispatcher design the in-flight job is cancelled at boot
+    // (clear_busy) — not resumed. A late POST /complete with the old
+    // claim_id must be ignored, and the caller (CCI) must re-submit
+    // the job if it wants a fresh attempt.
     let handle = spawn_server(pool.clone()).await;
     let client = CoordinatorClient::new(&handle.base_url);
 
@@ -317,28 +279,24 @@ async fn restart_with_outstanding_claim_ignores_stale_complete(pool: PgPool) {
         .unwrap()
         .expect("must issue claim");
 
-    // "Crash" the coordinator: drop the server handle, which signals
-    // its shutdown channel. Then spin up a new server on the same
-    // pool — this runs clear_busy + rehydrate, matching what happens
-    // on process restart.
     drop(handle);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let handle2 = spawn_server(pool).await;
     let client2 = CoordinatorClient::new(&handle2.base_url);
 
-    // The durable row is back in state='pending' (cleared by
-    // clear_busy on restart).
-    let (state_str,): (String,) =
-        sqlx::query_as("SELECT state FROM derivations WHERE drv_hash = $1")
-            .bind(stale_claim.drv_hash.as_str())
+    // clear_busy cancelled the old job.
+    let (status_str, result): (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT status, result FROM jobs WHERE id = $1")
+            .bind(job.id.0)
             .fetch_one(&handle2.pool)
             .await
             .unwrap();
-    assert_eq!(state_str, "pending", "clear_busy must reset building drvs");
+    assert_eq!(status_str, "cancelled");
+    assert!(result.is_some(), "cancelled job must have a result snapshot");
 
     // The old worker's (belated) completion POST lands on the new
-    // coordinator. The new coordinator's in-memory claim map is empty
-    // for this claim_id, so complete returns ignored=true.
+    // coordinator. The claim map is empty, so complete returns
+    // ignored=true.
     let resp = client2
         .complete(
             job.id,
@@ -359,33 +317,12 @@ async fn restart_with_outstanding_claim_ignores_stale_complete(pool: PgPool) {
         "stale claim from previous lifetime must be ignored"
     );
 
-    // A fresh claim can now pick up the drv again.
-    let fresh = client2
-        .claim(job.id, "x86_64-linux", &[], 5)
-        .await
-        .unwrap()
-        .expect("drv must be claimable post-restart");
-    assert_ne!(
-        fresh.claim_id, stale_claim.claim_id,
-        "new claim gets a new id"
-    );
-    // Complete cleanly; job goes Done.
-    client2
-        .complete(
-            job.id,
-            fresh.claim_id,
-            &CompleteRequest {
-                success: true,
-                duration_ms: 10,
-                exit_code: Some(0),
-                error_category: None,
-                error_message: None,
-                log_tail: None,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(wait_for_terminal(&client2, job.id).await, JobStatus::Done);
+    // /claim on the cancelled job returns 410 — the caller must
+    // re-submit a fresh job to retry.
+    match client2.claim(job.id, "x86_64-linux", &[], 1).await {
+        Err(nix_ci_core::Error::Gone(_)) => {}
+        other => panic!("expected 410 Gone on cancelled job, got {other:?}"),
+    }
 }
 
 // ─── 4. Concurrent cross-job claim race ────────────────────────────────
@@ -483,67 +420,7 @@ async fn concurrent_cross_job_claim_exactly_one_winner(pool: PgPool) {
     assert_eq!(wait_for_terminal(&client, b.id).await, JobStatus::Done);
 }
 
-// ─── 5. mark_building failure unwinds cleanly ──────────────────────────
-
-#[sqlx::test]
-async fn claim_unwinds_when_mark_building_sees_unexpected_state(pool: PgPool) {
-    // Force the writeback path's "zero rows affected" branch: manually
-    // flip the durable row to 'done' between ingest and claim. The
-    // claim handler calls mark_building, which now returns Conflict
-    // on zero rows. The unwind must drop the in-memory claim, re-arm
-    // runnable, and re-enqueue for the submission.
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-
-    let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
-        .await
-        .unwrap();
-    let drv = drv_path("uwd", "solo");
-    client
-        .ingest_drv(job.id, &ingest(&drv, "solo", &[], true))
-        .await
-        .unwrap();
-
-    // Sneak the durable row into state='done' without going through
-    // the normal complete path. The in-memory step still thinks it's
-    // pending+runnable, so the claim will try mark_building.
-    sqlx::query(
-        "UPDATE derivations SET state = 'done', completed_at = now() WHERE drv_hash = $1",
-    )
-    .bind(
-        nix_ci_core::types::drv_hash_from_path(&drv)
-            .unwrap()
-            .as_str(),
-    )
-    .execute(&handle.pool)
-    .await
-    .unwrap();
-
-    // /claim should surface the Conflict as a 409.
-    match client.claim(job.id, "x86_64-linux", &[], 1).await {
-        Err(nix_ci_core::Error::Conflict(_)) => {}
-        other => panic!("expected Conflict, got {other:?}"),
-    }
-
-    // The in-memory claim was unwound: claims_in_flight is 0.
-    let snap = client.admin_snapshot().await.unwrap();
-    assert_eq!(snap.active_claims, 0, "unwind must drop the claim");
-
-    // The step was re-armed: runnable flag set back to true.
-    let drv_hash = nix_ci_core::types::drv_hash_from_path(&drv).unwrap();
-    let step = handle
-        .dispatcher
-        .steps
-        .get(&drv_hash)
-        .expect("step still in registry");
-    assert!(
-        step.runnable.load(Ordering::Acquire),
-        "unwind must re-arm runnable"
-    );
-}
-
-// ─── 6. Heartbeat-timeout uses configured short window ─────────────────
+// ─── 5. Heartbeat-timeout uses configured short window ─────────────────
 
 #[sqlx::test]
 async fn heartbeat_timeout_respects_configured_window(pool: PgPool) {

@@ -282,19 +282,13 @@ async fn retryable_exhaustion_becomes_terminal(pool: PgPool) {
             )
             .await
             .unwrap();
-        // Clear backoff for the next iteration
+        // Clear backoff for the next iteration (in-memory only —
+        // there's no durable derivation row to reset).
         let drv_hash = nix_ci_core::types::drv_hash_from_path(&drv).unwrap();
         if let Some(step) = handle.dispatcher.steps.get(&drv_hash) {
             step.next_attempt_at
                 .store(0, std::sync::atomic::Ordering::Release);
         }
-        sqlx::query(
-            "UPDATE derivations SET next_attempt_at = now() - INTERVAL '1 minute' WHERE drv_hash = $1",
-        )
-        .bind(drv_hash.as_str())
-        .execute(&handle.pool)
-        .await
-        .unwrap();
     }
 
     // Job should now be failed (final attempt exhausted retries).

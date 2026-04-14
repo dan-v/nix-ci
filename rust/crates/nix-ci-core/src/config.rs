@@ -33,6 +33,10 @@ pub struct ServerConfig {
     /// Backoff step for flaky retries. Total backoff is
     /// `step_ms × attempt`.
     pub flaky_retry_backoff_step_ms: i64,
+    /// Maximum build attempts per drv before a retryable failure becomes
+    /// terminal. Applies to fresh Step creations; in-flight Steps keep
+    /// the value captured at ingest.
+    pub max_attempts: i32,
     /// How long to wait for axum to finish draining in-flight requests
     /// and for background tasks (reaper / cleanup) to observe the
     /// shutdown signal before we force the process to exit. Without a
@@ -58,6 +62,7 @@ impl Default for ServerConfig {
             sse_keepalive_secs: 15,
             max_claim_wait_secs: 60,
             flaky_retry_backoff_step_ms: 30_000,
+            max_attempts: 2,
             graceful_shutdown_secs: 30,
         }
     }

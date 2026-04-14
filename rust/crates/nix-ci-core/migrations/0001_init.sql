@@ -1,85 +1,50 @@
--- nix-ci v2 schema. Single migration. Five tables.
+-- nix-ci v3 schema. Hydra-v2-style thin envelope.
 --
--- Durability contract: Postgres is the recovery log, not the hot-path
--- scheduler. The in-memory dispatcher is authoritative at runtime; this
--- schema persists what a standby coordinator needs to rebuild the
--- dispatcher graph on promotion.
+-- Durability model: the in-memory dispatcher is the only authoritative
+-- source for in-flight state. Postgres stores:
+--   1. `jobs` — one row per submission. Terminal rows carry a JSONB
+--      snapshot of the final JobStatusResponse so status polls work
+--      post-hoc without reconstructing an in-flight graph.
+--   2. `failed_outputs` — short-TTL cache of known-broken output paths,
+--      used by ingest to short-circuit rebuilds of drvs that just failed
+--      elsewhere.
+--
+-- On coordinator restart, any non-terminal job is flipped to cancelled
+-- with a sentinel result; its workers' next poll returns 410 and the
+-- caller (CCI) retries with a fresh job. No in-flight graph is
+-- persisted or reconstructed.
 
--- Jobs: one per CCI-step submission. "Job" == "submission" in the code.
 CREATE TABLE jobs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    status          TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','building','done','failed','cancelled')),
-    sealed          BOOLEAN NOT NULL DEFAULT FALSE,
-    eval_error      TEXT,
     external_ref    TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','done','failed','cancelled')),
+    sealed          BOOLEAN NOT NULL DEFAULT FALSE,
+    result          JSONB,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_heartbeat  TIMESTAMPTZ NOT NULL DEFAULT now(),
     done_at         TIMESTAMPTZ,
-    CHECK ((status IN ('done','failed','cancelled')) = (done_at IS NOT NULL))
+    CHECK ((status IN ('done','failed','cancelled')) = (done_at IS NOT NULL)),
+    CHECK (done_at IS NULL OR result IS NOT NULL)
 );
+
+-- Idempotent POST /jobs: a retry with the same external_ref resolves to
+-- the existing id rather than minting a new job.
+CREATE UNIQUE INDEX jobs_external_ref_uniq
+    ON jobs (external_ref)
+    WHERE external_ref IS NOT NULL;
 
 CREATE INDEX jobs_live_idx ON jobs (last_heartbeat)
-    WHERE status IN ('pending','building');
+    WHERE status = 'pending';
 
--- Derivations: one row per unique drv_hash across all submissions.
--- Cross-submission dedup: `Steps::create` in the dispatcher is the
--- primary dedup point; this table is the durable reflection.
-CREATE TABLE derivations (
-    drv_hash           TEXT PRIMARY KEY,
-    drv_path           TEXT NOT NULL,
-    drv_name           TEXT NOT NULL CHECK (length(drv_name) > 0),
-    system             TEXT NOT NULL CHECK (length(system) > 0),
-    state              TEXT NOT NULL DEFAULT 'pending'
-                       CHECK (state IN ('pending','building','done','failed')),
-    assigned_claim_id  UUID,
-    attempt            INT NOT NULL DEFAULT 0 CHECK (attempt >= 0),
-    max_attempts       INT NOT NULL DEFAULT 2 CHECK (max_attempts >= 1),
-    next_attempt_at    TIMESTAMPTZ,
-    error_category     TEXT,
-    error_message      TEXT CHECK (error_message IS NULL OR length(error_message) <= 4096),
-    exit_code          INT,
-    log_tail           TEXT CHECK (log_tail IS NULL OR length(log_tail) <= 131072),
-    propagated_from    TEXT REFERENCES derivations(drv_hash) ON DELETE SET NULL,
-    required_features  TEXT[] NOT NULL DEFAULT '{}',
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at       TIMESTAMPTZ,
-    CHECK (attempt <= max_attempts),
-    CHECK ((state = 'building') = (assigned_claim_id IS NOT NULL)),
-    CHECK ((state IN ('done','failed')) = (completed_at IS NOT NULL))
-);
-
-CREATE INDEX drv_pending_idx   ON derivations (system, created_at) WHERE state = 'pending';
-CREATE INDEX drv_building_idx  ON derivations (assigned_claim_id)  WHERE state = 'building';
-CREATE INDEX drv_failed_idx    ON derivations (completed_at)       WHERE state = 'failed';
-
--- Edges in the derivation DAG. drv_hash depends on dep_hash.
-CREATE TABLE deps (
-    drv_hash  TEXT NOT NULL REFERENCES derivations(drv_hash) ON DELETE CASCADE,
-    dep_hash  TEXT NOT NULL REFERENCES derivations(drv_hash) ON DELETE CASCADE,
-    PRIMARY KEY (drv_hash, dep_hash),
-    CHECK (drv_hash != dep_hash)
-);
-
-CREATE INDEX deps_reverse_idx ON deps (dep_hash);
-
--- Roots of a job's submission: top-level drvs the CCI caller cares
--- about. Used at rehydrate time to reattach submissions to steps.
-CREATE TABLE job_roots (
-    job_id    UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    drv_hash  TEXT NOT NULL REFERENCES derivations(drv_hash) ON DELETE CASCADE,
-    PRIMARY KEY (job_id, drv_hash)
-);
-
--- Cross-job cached-failure cache with a short TTL. Cheap short-circuit
--- for known-broken derivations; expires so transient failures
--- self-heal.
+-- Short-TTL cross-job cache of failed output paths. An ingest whose
+-- drv_path matches an unexpired row is pre-marked failed so we don't
+-- waste a worker rebuilding a known-broken drv.
 CREATE TABLE failed_outputs (
     output_path  TEXT PRIMARY KEY,
-    drv_hash     TEXT NOT NULL REFERENCES derivations(drv_hash) ON DELETE CASCADE,
+    drv_hash     TEXT NOT NULL,
     failed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at   TIMESTAMPTZ NOT NULL DEFAULT (now() + INTERVAL '1 hour')
 );
 
 CREATE INDEX failed_outputs_expiry_idx ON failed_outputs (expires_at);
-CREATE INDEX failed_outputs_drv_idx    ON failed_outputs (drv_hash);

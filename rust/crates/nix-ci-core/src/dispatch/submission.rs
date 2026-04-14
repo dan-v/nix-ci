@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast;
 
-use crate::types::{DrvHash, JobEvent, JobId};
+use crate::types::{DrvFailure, DrvHash, JobEvent, JobId};
 
 use super::step::Step;
 
@@ -28,6 +28,10 @@ pub struct Submission {
     /// weak-only (invariant 8). Dropped when the Submission itself
     /// is removed from the Submissions map.
     pub members: RwLock<HashMap<DrvHash, Arc<Step>>>,
+    /// Failure details for drvs in this submission. Populated by the
+    /// complete handler on terminal failure (originating + propagated).
+    /// Replaces the previous durable `derivations.error_*` columns.
+    pub failures: RwLock<Vec<DrvFailure>>,
     pub events: broadcast::Sender<JobEvent>,
 }
 
@@ -42,8 +46,20 @@ impl Submission {
             toplevels: RwLock::new(Vec::new()),
             ready: RwLock::new(HashMap::new()),
             members: RwLock::new(HashMap::new()),
+            failures: RwLock::new(Vec::new()),
             events: tx,
         })
+    }
+
+    /// Append a failure record for this submission. Idempotent on
+    /// `drv_hash` — the first record wins (originating failure has
+    /// priority over a later propagation for the same drv).
+    pub fn record_failure(&self, failure: DrvFailure) {
+        let mut guard = self.failures.write();
+        if guard.iter().any(|f| f.drv_hash == failure.drv_hash) {
+            return;
+        }
+        guard.push(failure);
     }
 
     /// Add a step to this submission's membership, holding a strong

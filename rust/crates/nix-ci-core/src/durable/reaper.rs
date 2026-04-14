@@ -1,16 +1,12 @@
 //! Reaper: periodically sweep stale state. Runs on the single-writer
 //! coordinator.
 //!
-//! Three sweeps:
-//! 1. Jobs whose `last_heartbeat` is too old — their in-flight drvs
-//!    get released to pending, and the job goes to cancelled.
-//! 2. Claims whose deadline has passed — drv terminal-fails with
-//!    `timeout`.
-//! 3. Submissions that already reached terminal (via any path —
-//!    completion, explicit cancel, heartbeat-reap, rehydrate-with-
-//!    eval_error) but are still in the in-memory map. Belt-and-
-//!    suspenders cleanup so the map can't grow monotonically even
-//!    if some terminal path forgets to remove.
+//! Two sweeps:
+//! 1. Jobs whose `last_heartbeat` is too old — transition to cancelled
+//!    with a sentinel result; their in-memory submission is dropped.
+//! 2. Claims whose deadline has passed — re-arm the in-memory step so
+//!    another worker picks it up. A stale `/complete` from the original
+//!    worker no longer matches any active claim and is ignored.
 
 use std::time::{Duration, Instant};
 
@@ -20,7 +16,7 @@ use tokio::time::interval;
 
 use crate::dispatch::Dispatcher;
 use crate::error::Result;
-use crate::types::JobId;
+use crate::types::{JobId, JobStatus};
 
 pub async fn run(
     pool: PgPool,
@@ -49,12 +45,6 @@ pub async fn run(
     }
 }
 
-/// Drop in-memory submissions that have already reached terminal
-/// state. The primary terminal paths (`jobs::transition_to`,
-/// `complete::check_and_publish_terminal`, `reap_stale_jobs`) all
-/// remove the submission themselves, but this sweep closes any hole
-/// left by a new terminal path that forgets — or by the older
-/// `check_and_publish_terminal` behavior before it learned to remove.
 fn sweep_terminal_submissions(dispatcher: &Dispatcher) {
     let all = dispatcher.submissions.all();
     let mut removed = 0u32;
@@ -68,13 +58,10 @@ fn sweep_terminal_submissions(dispatcher: &Dispatcher) {
     }
 }
 
-/// Find jobs whose heartbeat is older than the timeout. Release their
-/// in-flight drvs back to pending in Postgres; our in-memory state
-/// will sync on next claim attempt (CAS on runnable will fail
-/// otherwise). The job goes to cancelled.
-///
-/// Exposed as `pub` for integration tests that need to exercise the
-/// reap logic deterministically without spinning up the full ticker.
+/// Find jobs whose heartbeat is older than the timeout, flip them to
+/// `cancelled` in Postgres with a sentinel result, drop their
+/// in-memory submissions (so next `/claim` returns 410), and discard
+/// any in-memory claims tied to those jobs.
 pub async fn reap_stale_jobs(
     pool: &PgPool,
     dispatcher: &Dispatcher,
@@ -84,7 +71,7 @@ pub async fn reap_stale_jobs(
     let stale_ids: Vec<(sqlx::types::Uuid,)> = sqlx::query_as(
         r#"
         SELECT id FROM jobs
-        WHERE status IN ('pending','building')
+        WHERE status = 'pending'
           AND last_heartbeat < now() - make_interval(secs => $1::bigint)
         "#,
     )
@@ -102,71 +89,74 @@ pub async fn reap_stale_jobs(
         .jobs_reaped
         .inc_by(stale_ids.len() as u64);
 
-    let mut tx = pool.begin().await?;
-    let uuids: Vec<sqlx::types::Uuid> = stale_ids.iter().map(|(u,)| *u).collect();
-
-    // Release assigned drvs belonging to these jobs — including
-    // transitive, non-root derivations. The previous query only
-    // touched `job_roots`, leaving any building child drv wedged
-    // until its 2h claim deadline expired. For a large DAG with
-    // thousands of build nodes, that was most of the drvs.
-    sqlx::query(
-        r#"
-        WITH RECURSIVE closure AS (
-            SELECT drv_hash FROM job_roots WHERE job_id = ANY($1::uuid[])
-            UNION
-            SELECT d.dep_hash FROM deps d JOIN closure c ON c.drv_hash = d.drv_hash
-        )
-        UPDATE derivations
-        SET state = 'pending', assigned_claim_id = NULL
-        WHERE state = 'building'
-          AND drv_hash IN (SELECT drv_hash FROM closure)
-        "#,
-    )
-    .bind(&uuids)
-    .execute(&mut *tx)
-    .await?;
-
-    // Mark the jobs cancelled
-    sqlx::query(
-        r#"
-        UPDATE jobs SET status = 'cancelled', done_at = now()
-        WHERE id = ANY($1::uuid[])
-        "#,
-    )
-    .bind(&uuids)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-
-    // In-memory: publish a JobDone event so SSE subscribers see the
-    // cancellation, mark terminal (idempotent CAS), then drop. The
-    // worker's next heartbeat returns 410, the worker exits.
     for (uuid,) in &stale_ids {
         let job_id = JobId(*uuid);
+        let sentinel = serde_json::json!({
+            "id": job_id.0.to_string(),
+            "status": "cancelled",
+            "sealed": false,
+            "counts": { "total": 0, "pending": 0, "building": 0, "done": 0, "failed": 0 },
+            "failures": [],
+            "eval_error": "heartbeat timeout; job reaped"
+        });
+        if let Err(e) = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = 'cancelled', done_at = now(), result = $2
+            WHERE id = $1 AND done_at IS NULL
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(&sentinel)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!(error = %e, %job_id, "reap: transition failed");
+            continue;
+        }
+
         if let Some(sub) = dispatcher.submissions.remove(job_id) {
             if sub.mark_terminal() {
                 sub.publish(crate::types::JobEvent::JobDone {
-                    status: crate::types::JobStatus::Cancelled,
+                    status: JobStatus::Cancelled,
                     failures: vec![],
                 });
             }
         }
     }
+
+    // Drop any in-memory claims whose job was just reaped. Without this
+    // they'd linger until the claim_deadline (hours) inflating the
+    // `claims_in_flight` gauge and holding a reference to the drv.
+    let reaped: std::collections::HashSet<JobId> =
+        stale_ids.iter().map(|(u,)| JobId(*u)).collect();
+    let expired: Vec<_> = dispatcher
+        .claims
+        .all()
+        .into_iter()
+        .filter(|c| reaped.contains(&c.job_id))
+        .map(|c| c.claim_id)
+        .collect();
+    for claim_id in expired {
+        if dispatcher.claims.take(claim_id).is_some() {
+            dispatcher.metrics.inner.claims_in_flight.dec();
+        }
+    }
+
     dispatcher.wake();
     Ok(())
 }
 
-pub async fn reap_expired_claims(pool: &PgPool, dispatcher: &Dispatcher) -> Result<()> {
+/// Deadline-reap claims. Unlike `reap_stale_jobs` this does not need to
+/// touch Postgres — claims exist only in memory — it just re-arms the
+/// step so another worker can pick it up.
+pub async fn reap_expired_claims(_pool: &PgPool, dispatcher: &Dispatcher) -> Result<()> {
     let now = Instant::now();
     let expired = dispatcher.claims.expired_ids(now);
     if expired.is_empty() {
         return Ok(());
     }
-    tracing::warn!(
-        n = expired.len(),
-        "reaping expired claims (deadline exceeded)"
-    );
+    tracing::warn!(n = expired.len(), "reaping expired claims");
     dispatcher
         .metrics
         .inner
@@ -176,33 +166,14 @@ pub async fn reap_expired_claims(pool: &PgPool, dispatcher: &Dispatcher) -> Resu
         let Some(claim) = dispatcher.claims.take(claim_id) else {
             continue;
         };
-        // Durable state: flip drv back to pending so another worker
-        // can claim it. A stale `complete` call from the original
-        // worker will no longer match `assigned_claim_id` in PG and
-        // will return `ignored: true` on its way through the HTTP
-        // complete handler.
-        if let Err(e) = sqlx::query(
-            r#"
-            UPDATE derivations
-            SET state = 'pending', assigned_claim_id = NULL
-            WHERE drv_hash = $1 AND assigned_claim_id = $2
-            "#,
-        )
-        .bind(claim.drv_hash.as_str())
-        .bind(claim.claim_id.0)
-        .execute(pool)
-        .await
-        {
-            tracing::warn!(error = %e, drv = %claim.drv_hash, "reap: DB reset failed");
-            continue;
-        }
-        // In-memory: re-arm runnable so the dispatcher can serve it.
-        if let Some(step) = dispatcher.steps.get(&claim.drv_hash) {
-            step.runnable
-                .store(true, std::sync::atomic::Ordering::Release);
-            crate::dispatch::rdep::enqueue_for_all_submissions(&step);
-        }
         dispatcher.metrics.inner.claims_in_flight.dec();
+        if let Some(step) = dispatcher.steps.get(&claim.drv_hash) {
+            if !step.finished.load(std::sync::atomic::Ordering::Acquire) {
+                step.runnable
+                    .store(true, std::sync::atomic::Ordering::Release);
+                crate::dispatch::rdep::enqueue_for_all_submissions(&step);
+            }
+        }
     }
     dispatcher.wake();
     Ok(())

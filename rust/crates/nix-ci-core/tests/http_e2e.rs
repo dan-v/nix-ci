@@ -280,21 +280,13 @@ async fn retryable_failure_retries_then_succeeds(pool: PgPool) {
         .await
         .unwrap();
 
-    // The drv is now in retry backoff. We'd need to bypass it for the
-    // test to not wait 30s. Cheat by directly resetting next_attempt_at
-    // in the in-memory step and Postgres.
+    // The drv is now in retry backoff. Bypass it so the test doesn't
+    // wait 30s — backoff lives in-memory only, no DB row to reset.
     let dispatcher = handle.dispatcher.clone();
     let drv_hash = nix_ci_core::types::drv_hash_from_path(&drv).unwrap();
     let step = dispatcher.steps.get(&drv_hash).unwrap();
     step.next_attempt_at
         .store(0, std::sync::atomic::Ordering::Release);
-    sqlx::query(
-        "UPDATE derivations SET next_attempt_at = now() - INTERVAL '1 minute' WHERE drv_hash = $1",
-    )
-    .bind(drv_hash.as_str())
-    .execute(&handle.pool)
-    .await
-    .unwrap();
 
     // Next claim → succeed
     let c = client

@@ -9,7 +9,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 
 use super::AppState;
-use super::{claim, complete, events, heartbeat, ingest, ingest_batch, jobs, ops};
+use super::{claim, complete, events, heartbeat, ingest_batch, jobs, ops};
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -18,7 +18,6 @@ pub fn build_router(state: AppState) -> Router {
         // Jobs
         .route("/jobs", post(jobs::create))
         .route("/jobs/{id}", get(jobs::status))
-        .route("/jobs/{id}/drvs", post(ingest::submit_drv))
         .route("/jobs/{id}/drvs/batch", post(ingest_batch::submit_batch))
         .route("/jobs/{id}/seal", post(jobs::seal))
         .route("/jobs/{id}/fail", post(jobs::fail))

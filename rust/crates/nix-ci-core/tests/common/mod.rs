@@ -57,16 +57,14 @@ pub async fn spawn_server_with_cfg(
         .await
         .expect("migrations");
 
-    // Reset in-flight state (clean slate per test).
+    // Clean slate per test: cancel anything non-terminal left over
+    // from a prior sqlx::test run on this pool.
     durable::rehydrate::clear_busy(&pool)
         .await
         .expect("clear_busy");
 
     let metrics = Metrics::new();
     let dispatcher = Dispatcher::new(metrics.clone());
-    durable::rehydrate::rehydrate(&pool, &dispatcher)
-        .await
-        .expect("rehydrate");
 
     let mut cfg = ServerConfig {
         database_url: String::new(),

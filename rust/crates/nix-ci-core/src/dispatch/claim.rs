@@ -56,7 +56,7 @@ impl Claims {
     }
 
     /// Return every claim whose deadline has passed. The caller must
-    /// remove them via `take()` or `drain_expired_ids()` before acting.
+    /// remove them via `take()` before acting.
     pub fn expired_ids(&self, now: Instant) -> Vec<ClaimId> {
         self.inner
             .read()
@@ -64,5 +64,12 @@ impl Claims {
             .filter(|c| c.deadline <= now)
             .map(|c| c.claim_id)
             .collect()
+    }
+
+    /// Snapshot every active claim. Used by the reaper to find claims
+    /// tied to a reaped job so they can be evicted immediately instead
+    /// of lingering until their deadline.
+    pub fn all(&self) -> Vec<Arc<ActiveClaim>> {
+        self.inner.read().values().cloned().collect()
     }
 }

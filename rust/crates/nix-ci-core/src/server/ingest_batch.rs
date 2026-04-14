@@ -1,25 +1,27 @@
 //! `POST /jobs/{id}/drvs/batch` — bulk ingest for full-DAG submissions.
 //!
+//! Ingest is pure in-memory: the dispatcher owns the graph, and no
+//! derivations/deps rows are written to Postgres. The only DB touch is
+//! a bulk lookup against the `failed_outputs` TTL cache so we can pre-
+//! mark drvs whose output we just saw fail elsewhere.
+//!
 //! Four phases — the split is load-bearing for the 8 invariants:
 //! 1. `Steps::create` each drv in the batch (dedup on drv_hash).
 //! 2. Wire membership + edges while `created` is still false on new
 //!    Steps — safe because `make_rdeps_runnable` respects the barrier.
-//! 3. Durable UNNEST bulk write-through.
-//! 4. Arm `created=true` → `runnable` on fresh leaves.
+//! 3. Arm `created=true` → `runnable` on fresh leaves.
 
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::Json;
 
-use super::ingest_common::{
-    arm_if_leaf, attach_step_to_submission, failed_output_hits, reject_if_terminal, wire_dep,
-};
+use super::ingest_common::{arm_if_leaf, attach_step_to_submission, reject_if_terminal, wire_dep};
 use super::AppState;
 use crate::dispatch::Step;
-use crate::durable::writeback::{self, BatchDrv};
+use crate::durable::writeback;
 use crate::error::Result;
-use crate::types::{drv_hash_from_path, IngestBatchRequest, IngestBatchResponse, IngestDrvRequest};
+use crate::types::{drv_hash_from_path, IngestBatchRequest, IngestBatchResponse};
 
 pub async fn submit_batch(
     State(state): State<AppState>,
@@ -39,17 +41,11 @@ pub async fn submit_batch(
         .submissions
         .get_or_insert(id, state.cfg.submission_event_capacity);
 
-    // Bulk-lookup failed-output cache hits so we can pre-finish any
-    // drv whose output path recently failed. Matches the per-drv
-    // check in `ingest::submit_drv`; kept in one place so the two
-    // ingest paths don't drift.
     let drv_path_refs: Vec<&str> = req.drvs.iter().map(|d| d.drv_path.as_str()).collect();
-    let known_failed = failed_output_hits(&state, &drv_path_refs).await;
+    let known_failed = writeback::failed_output_hits(&state.pool, &drv_path_refs).await;
 
-    // Phase 1: look up or create every Step. Hold NO per-Step locks
-    // beyond the brief write inside Steps::get_or_create.
-    #[allow(clippy::type_complexity)]
-    let mut primary: Vec<(IngestDrvRequest, Arc<Step>, bool)> = Vec::with_capacity(req.drvs.len());
+    // Phase 1: look up or create every Step.
+    let mut primary: Vec<(_, Arc<Step>, bool)> = Vec::with_capacity(req.drvs.len());
     let mut errored: u32 = 0;
     for d in req.drvs {
         if d.drv_path.is_empty() || d.drv_name.is_empty() || d.system.is_empty() {
@@ -67,14 +63,12 @@ pub async fn submit_batch(
                 d.drv_name.clone(),
                 d.system.clone(),
                 d.required_features.clone(),
-                2,
+                state.cfg.max_attempts,
             )
         });
         let is_new = outcome.is_new();
         let step = outcome.into_step();
         if is_new && known_failed.contains(&d.drv_path) {
-            // Pre-mark as a known failure so the dispatcher short-
-            // circuits the build loop without contacting a worker.
             step.previous_failure
                 .store(true, std::sync::atomic::Ordering::Release);
             step.finished
@@ -104,26 +98,7 @@ pub async fn submit_batch(
         }
     }
 
-    // Phase 3: durable write-through via UNNEST.
-    let batch: Vec<BatchDrv> = primary
-        .iter()
-        .map(|(req_drv, step, _)| BatchDrv {
-            drv_hash: step.drv_hash().as_str().to_string(),
-            drv_path: req_drv.drv_path.clone(),
-            drv_name: req_drv.drv_name.clone(),
-            system: req_drv.system.clone(),
-            required_features: req_drv.required_features.clone(),
-            max_attempts: 2,
-            input_drvs: req_drv.input_drvs.clone(),
-            is_root: req_drv.is_root,
-        })
-        .collect();
-    writeback::upsert_drvs_batch(&state.pool, id, &batch).await?;
-
-    // Phase 4: arm fresh leaves. `arm_if_leaf` enforces invariant 1:
-    // `created=true` before the runnable CAS, deps still empty at the
-    // moment of the CAS (the lock inside make_rdeps_runnable holds
-    // the relationship with concurrent edge changes elsewhere).
+    // Phase 3: arm fresh leaves.
     for (_, step, is_new) in &primary {
         if *is_new {
             arm_if_leaf(step);

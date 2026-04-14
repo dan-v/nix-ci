@@ -1,11 +1,5 @@
-//! Helpers shared by single-drv and batch ingest handlers.
-//!
-//! The ingest endpoints are structurally identical: look up or create
-//! a Step, wire it into the submission's membership set, attach dep
-//! edges (creating placeholders for unknown deps), optionally mark as
-//! root, then — after all edges are stable — arm runnable for fresh
-//! leaves. Keeping this logic in one place prevents drift between
-//! the two handlers (the cross-job dedup bug was caused by drift).
+//! Shared helpers for the batch-ingest handler. Pure in-memory: no DB
+//! writes here beyond the `reject_if_terminal` status check.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,11 +9,10 @@ use crate::dispatch::rdep::{attach_dep, enqueue_for_all_submissions};
 use crate::dispatch::{Step, Submission};
 use crate::types::{drv_hash_from_path, JobId};
 
-/// Attach a step to a submission: adds membership, pushes the
-/// submission Weak ref onto `step.state.submissions` if not already
-/// there, and — if the step is currently runnable for another
-/// submission — enqueues it in our ready queue so our workers race
-/// for the claim.
+/// Attach a step to a submission. Adds the membership strong ref, pushes
+/// a weak submission ref onto the step, and — if the step is already
+/// runnable for some other submission — queues it on ours so our workers
+/// race for the shared claim.
 pub(super) fn attach_step_to_submission(sub: &Arc<Submission>, step: &Arc<Step>) {
     sub.add_member(step);
     let was_new_attach = step.state.write().attach_submission(sub);
@@ -27,17 +20,13 @@ pub(super) fn attach_step_to_submission(sub: &Arc<Submission>, step: &Arc<Step>)
         && step.runnable.load(Ordering::Acquire)
         && !step.finished.load(Ordering::Acquire)
     {
-        // Join an already-armed step — make sure our ready queue has
-        // it so our workers can race for the claim. Whichever worker
-        // wins the CAS builds it once for everyone.
         sub.enqueue_ready(step);
     }
 }
 
-/// Wire an edge from `parent` to `dep` (loading or placeholder-creating
-/// the dep Step from the registry), attach the dep to the submission,
-/// and, if the dep is already runnable, enqueue for this submission.
-/// No-op if the dep is already finished.
+/// Wire an edge from `parent` to `dep`. Loads or placeholder-creates
+/// the dep Step, attaches it to the submission, and enqueues it if it's
+/// already runnable. No-op if the dep is finished.
 pub(super) fn wire_dep(
     state: &AppState,
     sub: &Arc<Submission>,
@@ -57,7 +46,7 @@ pub(super) fn wire_dep(
                 placeholder_name_from(dep_path),
                 inherit_system.to_string(),
                 Vec::new(),
-                2,
+                state.cfg.max_attempts,
             )
         })
         .into_step();
@@ -69,10 +58,8 @@ pub(super) fn wire_dep(
     Ok(())
 }
 
-/// Arm `runnable` on a fresh Step whose deps are all attached. Callers
-/// must ensure `is_new=true` or otherwise confirm the step wasn't
-/// already armed elsewhere. Invariant 1 still holds: `created=true`
-/// before the CAS, and `deps.is_empty()` before the CAS succeeds.
+/// Arm `runnable` on a fresh Step whose deps are all attached. Invariant
+/// 1: `created=true` before the CAS, and `deps.is_empty()` at CAS time.
 pub(super) fn arm_if_leaf(step: &Arc<Step>) {
     if step.finished.load(Ordering::Acquire) {
         return;
@@ -89,9 +76,9 @@ pub(super) fn arm_if_leaf(step: &Arc<Step>) {
     }
 }
 
-/// Turn a drv path like `/nix/store/abc-foo-1.0.drv` into `foo-1.0` for
-/// use in placeholder rows where we haven't yet received the real
-/// metadata. Shared between ingest handlers and `writeback`.
+/// Derive a placeholder drv_name from a drv_path like
+/// `/nix/store/abc-hello-1.0.drv` → `hello-1.0`. Used when we see a dep
+/// edge to a drv we haven't received full metadata for yet.
 pub(crate) fn placeholder_name_from(drv_path: &str) -> String {
     let base = drv_path.rsplit('/').next().unwrap_or(drv_path);
     let stripped = base.trim_end_matches(".drv");
@@ -102,51 +89,9 @@ pub(crate) fn placeholder_name_from(drv_path: &str) -> String {
         .to_string()
 }
 
-/// Look up cached failed-output paths for a set of drv_paths in one
-/// round-trip. Returns the subset of `drv_paths` that appear in the
-/// unexpired `failed_outputs` cache. Callers use this to pre-mark
-/// matching steps as `previous_failure + finished` so the dispatcher
-/// short-circuits retries of paths we recently burned on.
-///
-/// A DB error here is **not** fatal for ingest — we just don't get
-/// the cache benefit. Log and return an empty set so the ingest path
-/// still makes forward progress. Previously the single-drv path had
-/// this fallback but the batch path lacked a failed-output check
-/// entirely, creating policy drift between the two.
-pub(super) async fn failed_output_hits(
-    state: &AppState,
-    drv_paths: &[&str],
-) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    if drv_paths.is_empty() {
-        return HashSet::new();
-    }
-    let paths: Vec<&str> = drv_paths.iter().copied().collect();
-    let rows: Result<Vec<(String,)>, sqlx::Error> = sqlx::query_as(
-        r#"
-        SELECT output_path FROM failed_outputs
-        WHERE output_path = ANY($1::text[])
-          AND expires_at > now()
-        "#,
-    )
-    .bind(&paths)
-    .fetch_all(&state.pool)
-    .await;
-    match rows {
-        Ok(r) => r.into_iter().map(|(p,)| p).collect(),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "failed_outputs lookup failed; ingest continuing without cache"
-            );
-            HashSet::new()
-        }
-    }
-}
-
-/// Reject if a job is terminal in Postgres (independent of in-memory
-/// submission state — it may have been transitioned by another
-/// coordinator instance). Used by all ingest endpoints.
+/// Reject ingest if the job is terminal in Postgres. A sealed-but-not-
+/// terminal job is still accepting ingest (the sealed flag only prevents
+/// *new roots*, not new drvs wired into existing roots).
 pub(super) async fn reject_if_terminal(state: &AppState, id: JobId) -> crate::error::Result<()> {
     let row: Option<(String,)> = sqlx::query_as("SELECT status FROM jobs WHERE id = $1")
         .bind(id.0)
@@ -175,11 +120,8 @@ mod tests {
             placeholder_name_from("/nix/store/hash-stdenv-linux.drv"),
             "stdenv-linux"
         );
-        // No hyphen: whole stripped
         assert_eq!(placeholder_name_from("/nix/store/noprefix.drv"), "noprefix");
-        // No slash: whole stripped
         assert_eq!(placeholder_name_from("bare.drv"), "bare");
-        // No .drv suffix: unchanged
         assert_eq!(placeholder_name_from("/nix/store/hash-foo"), "foo");
     }
 
