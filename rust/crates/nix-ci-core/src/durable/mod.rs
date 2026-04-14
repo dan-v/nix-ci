@@ -1,6 +1,6 @@
 //! Durable layer: sqlx Postgres pool, migrations, advisory-lock
-//! single-writer primitive, write-through, rehydration, reapers,
-//! cleanup.
+//! single-writer primitive, terminal-state writeback, boot-time
+//! clear_busy, heartbeat reaper, TTL cleanup.
 
 pub mod cleanup;
 pub mod reaper;

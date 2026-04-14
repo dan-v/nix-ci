@@ -150,7 +150,6 @@ impl WalkedDrv {
             required_features: self.required_features,
             input_drvs: self.input_drvs,
             is_root: self.is_root,
-            cache_status: None,
         }
     }
 }

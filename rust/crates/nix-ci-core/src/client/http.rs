@@ -167,7 +167,6 @@ async fn decode<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
         Err(match status {
             StatusCode::NOT_FOUND => Error::NotFound(body),
             StatusCode::GONE => Error::Gone(body),
-            StatusCode::CONFLICT => Error::Conflict(body),
             StatusCode::BAD_REQUEST => Error::BadRequest(body),
             s if s.is_client_error() => Error::BadRequest(format!("{status}: {body}")),
             _ => Error::Internal(format!("{status}: {body}")),

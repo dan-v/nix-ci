@@ -1,5 +1,8 @@
-//! In-memory dispatch engine. The eight invariants in the V2 design
-//! document are the correctness contract for everything in this module.
+//! In-memory dispatch engine. The eight invariants documented across
+//! this module (steps dedup, make_rdeps_runnable monotonicity, CAS-
+//! exactly-once on runnable, created-before-runnable, no-await-under-
+//! lock, consistent lock ordering, weak-registry ownership, strong-
+//! Submission-owns-members) are the correctness contract.
 
 pub mod claim;
 pub mod rdep;

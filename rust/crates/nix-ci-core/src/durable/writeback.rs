@@ -2,9 +2,9 @@
 //! flight state; Postgres only carries the job envelope + terminal
 //! results snapshot + failed-output TTL cache.
 //!
-//! Every function here touches at most one row of `jobs` or bulk-inserts
-//! into `failed_outputs`. No cross-table joins, no recursive CTEs, no
-//! write-through of the dispatcher graph.
+//! Every function here touches at most one row of `jobs` or bulk-
+//! inserts into `failed_outputs`. No cross-table joins, no recursive
+//! CTEs.
 
 use sqlx::PgPool;
 

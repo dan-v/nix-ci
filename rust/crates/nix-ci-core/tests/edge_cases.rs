@@ -22,7 +22,6 @@ fn ingest(drv: &str, name: &str, deps: &[&str], is_root: bool) -> IngestDrvReque
         required_features: vec![],
         input_drvs: deps.iter().map(|s| s.to_string()).collect(),
         is_root,
-        cache_status: None,
     }
 }
 
@@ -43,7 +42,6 @@ async fn ingest_rejects_empty_drv_path(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: true,
-        cache_status: None,
     };
     let err = client.ingest_drv(job.id, &bad).await.unwrap_err();
     match err {
@@ -68,7 +66,6 @@ async fn ingest_rejects_malformed_drv_path(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: true,
-        cache_status: None,
     };
     let err = client.ingest_drv(job.id, &bad).await.unwrap_err();
     match err {
@@ -93,7 +90,6 @@ async fn ingest_batch_partial_validation_counts_errors(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: false,
-        cache_status: None,
     };
     let bad_nohyphen = IngestDrvRequest {
         drv_path: "/nix/store/nohyphen.drv".into(),
@@ -102,7 +98,6 @@ async fn ingest_batch_partial_validation_counts_errors(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: false,
-        cache_status: None,
     };
     let batch = IngestBatchRequest {
         drvs: vec![ingest(&good, "pkg", &[], true), bad_empty, bad_nohyphen],
@@ -186,7 +181,6 @@ async fn worker_without_required_feature_never_claims(pool: PgPool) {
         required_features: vec!["kvm".into()],
         input_drvs: vec![],
         is_root: true,
-        cache_status: None,
     };
     client.ingest_drv(job.id, &req).await.unwrap();
     client.seal(job.id).await.unwrap();
@@ -222,7 +216,6 @@ async fn worker_with_wrong_system_never_claims(pool: PgPool) {
                 required_features: vec![],
                 input_drvs: vec![],
                 is_root: true,
-                cache_status: None,
             },
         )
         .await

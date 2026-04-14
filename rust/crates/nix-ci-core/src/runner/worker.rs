@@ -27,8 +27,6 @@ const COMPLETE_MAX_ATTEMPTS: u32 = 5;
 const COMPLETE_RETRY_DELAY_INITIAL: Duration = Duration::from_secs(2);
 /// Cap on the completion retry backoff.
 const COMPLETE_RETRY_DELAY_MAX: Duration = Duration::from_secs(30);
-/// Hard cap on build_and_report recursion (via `next_build`).
-const NEXT_BUILD_CHAIN_CAP: u32 = 64;
 /// Stderr read chunk.
 const STDERR_READ_CHUNK: usize = 4096;
 /// How long we wait for in-flight builds to respond to a shutdown kill
@@ -184,91 +182,75 @@ pub async fn run(
 async fn build_and_report(
     client: Arc<CoordinatorClient>,
     job_id: JobId,
-    mut claim: ClaimResponse,
+    claim: ClaimResponse,
     dry_run: bool,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut chain_depth = 0u32;
+    let start = Instant::now();
+    let outcome = if dry_run {
+        BuildOutcome::success(0)
+    } else {
+        build(&claim.drv_path, &mut shutdown).await
+    };
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    // If the build was cancelled via shutdown, skip the completion
+    // POST. The coordinator's reaper (claim deadline or heartbeat
+    // timeout) will reclaim the drv. Reporting a synthetic failure
+    // would corrupt attempt counts and metrics for a build we never
+    // finished.
+    if outcome.cancelled {
+        tracing::info!(drv = %claim.drv_hash, "build cancelled by shutdown");
+        return Ok(());
+    }
+
+    let req = CompleteRequest {
+        success: outcome.success,
+        duration_ms,
+        exit_code: outcome.exit_code,
+        error_category: outcome.category,
+        error_message: outcome.message.clone(),
+        log_tail: outcome.log_tail.clone(),
+    };
+
+    let mut attempt: u32 = 0;
     loop {
-        let start = Instant::now();
-        let outcome = if dry_run {
-            BuildOutcome::success(0)
-        } else {
-            build(&claim.drv_path, &mut shutdown).await
-        };
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        // If the build was cancelled via shutdown, skip the completion
-        // POST. The coordinator's reaper (claim deadline or heartbeat
-        // timeout) will reclaim the drv. Reporting a synthetic failure
-        // would corrupt attempt counts and metrics for a build we
-        // never finished.
-        if outcome.cancelled {
-            tracing::info!(drv = %claim.drv_hash, "build cancelled by shutdown");
-            return Ok(());
-        }
-
-        let req = CompleteRequest {
-            success: outcome.success,
-            duration_ms,
-            exit_code: outcome.exit_code,
-            error_category: outcome.category,
-            error_message: outcome.message.clone(),
-            log_tail: outcome.log_tail.clone(),
-        };
-
-        let mut attempt: u32 = 0;
-        let response = loop {
-            match client.complete(job_id, claim.claim_id, &req).await {
-                Ok(resp) => break Some(resp),
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= COMPLETE_MAX_ATTEMPTS {
-                        tracing::error!(
-                            error = %e,
-                            drv = %claim.drv_hash,
-                            "worker: exhausted completion retries — build result lost; \
-                             server's heartbeat reaper will reclaim"
-                        );
-                        break None;
-                    }
-                    tracing::warn!(
+        match client.complete(job_id, claim.claim_id, &req).await {
+            Ok(resp) => {
+                if resp.ignored {
+                    tracing::debug!(drv = %claim.drv_hash, "completion ignored (stale claim)");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= COMPLETE_MAX_ATTEMPTS {
+                    tracing::error!(
                         error = %e,
-                        attempts_left = COMPLETE_MAX_ATTEMPTS - attempt,
-                        "complete POST failed; retrying"
+                        drv = %claim.drv_hash,
+                        "worker: exhausted completion retries — build result lost; \
+                         server's heartbeat reaper will reclaim"
                     );
-                    let delay = backoff_with_jitter(
-                        attempt - 1,
-                        COMPLETE_RETRY_DELAY_INITIAL,
-                        COMPLETE_RETRY_DELAY_MAX,
-                    );
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = shutdown.changed() => {
-                            tracing::info!("worker: shutdown during complete retry");
-                            return Ok(());
-                        }
+                    return Ok(());
+                }
+                tracing::warn!(
+                    error = %e,
+                    attempts_left = COMPLETE_MAX_ATTEMPTS - attempt,
+                    "complete POST failed; retrying"
+                );
+                let delay = backoff_with_jitter(
+                    attempt - 1,
+                    COMPLETE_RETRY_DELAY_INITIAL,
+                    COMPLETE_RETRY_DELAY_MAX,
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.changed() => {
+                        tracing::info!("worker: shutdown during complete retry");
+                        return Ok(());
                     }
                 }
             }
-        };
-
-        let Some(response) = response else {
-            return Ok(());
-        };
-        if response.ignored {
-            tracing::debug!(drv = %claim.drv_hash, "completion ignored (stale claim)");
-        }
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-        match response.next_build {
-            Some(next) if !next.drv_path.is_empty() && chain_depth < NEXT_BUILD_CHAIN_CAP => {
-                chain_depth += 1;
-                claim = next;
-                continue;
-            }
-            _ => return Ok(()),
         }
     }
 }

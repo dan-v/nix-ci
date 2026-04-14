@@ -116,7 +116,6 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
             required_features: vec![],
             input_drvs: vec![],
             is_root: false,
-            cache_status: None,
         };
         client.ingest_drv(job.id, &req).await.unwrap();
     }
@@ -137,7 +136,6 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
                 required_features: vec![],
                 input_drvs: deps.into_iter().collect(),
                 is_root,
-                cache_status: None,
             };
             client.ingest_drv(job.id, &req).await.unwrap();
         }
@@ -165,31 +163,24 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
         let seed = 0xf00d_u64.wrapping_add(worker_id as u64);
         worker_tasks.spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed);
-            let mut pending: Option<nix_ci_core::types::ClaimResponse> = None;
             loop {
-                let claim = match pending.take() {
+                let t0 = Instant::now();
+                let c = client
+                    .claim(job_id, "x86_64-linux", &[], 3)
+                    .await
+                    .ok()
+                    .flatten();
+                lat.record_claim(t0.elapsed());
+                let claim = match c {
                     Some(c) => c,
                     None => {
-                        let t0 = Instant::now();
-                        let c = client
-                            .claim(job_id, "x86_64-linux", &[], 3)
-                            .await
-                            .ok()
-                            .flatten();
-                        lat.record_claim(t0.elapsed());
-                        match c {
-                            Some(c) => c,
-                            None => {
-                                // Nothing to do — double-check by polling
-                                // status; if the job is terminal, exit.
-                                if let Ok(s) = client.status(job_id).await {
-                                    if s.status.is_terminal() {
-                                        return;
-                                    }
-                                }
-                                continue;
+                        // Nothing to do — poll status; if terminal, exit.
+                        if let Ok(s) = client.status(job_id).await {
+                            if s.status.is_terminal() {
+                                return;
                             }
                         }
+                        continue;
                     }
                 };
                 // Simulate a build: 5% random failure, otherwise success
@@ -220,13 +211,12 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
                     Ok(r) if r.ignored => {
                         ignored.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(r) => {
+                    Ok(_) => {
                         if will_fail {
                             build_failed.fetch_add(1, Ordering::Relaxed);
                         } else {
                             build_ok.fetch_add(1, Ordering::Relaxed);
                         }
-                        pending = r.next_build;
                     }
                     Err(_) => {
                         // back off briefly

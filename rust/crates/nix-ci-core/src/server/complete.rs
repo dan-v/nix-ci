@@ -32,7 +32,6 @@ pub async fn complete(
     let Some(claim) = state.dispatcher.claims.take(claim_id) else {
         return Ok(Json(CompleteResponse {
             ignored: true,
-            next_build: None,
         }));
     };
     state.metrics.inner.claims_in_flight.dec();
@@ -46,7 +45,6 @@ pub async fn complete(
     let Some(step) = state.dispatcher.steps.get(&claim.drv_hash) else {
         return Ok(Json(CompleteResponse {
             ignored: true,
-            next_build: None,
         }));
     };
 
@@ -56,7 +54,6 @@ pub async fn complete(
     if step.finished.load(Ordering::Acquire) {
         return Ok(Json(CompleteResponse {
             ignored: true,
-            next_build: None,
         }));
     }
 
@@ -75,7 +72,6 @@ pub async fn complete(
     }
     Ok(Json(CompleteResponse {
         ignored: false,
-        next_build: None,
     }))
 }
 

@@ -1,6 +1,6 @@
 //! Active-claim tracking. A claim is the ephemeral lease a worker
-//! holds on a specific drv while it's building. Not durable — the
-//! durable mirror is `derivations.assigned_claim_id`.
+//! holds on a specific drv while it's building. Purely in-memory —
+//! nothing about in-flight claims is persisted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,10 +41,6 @@ impl Claims {
 
     pub fn take(&self, claim_id: ClaimId) -> Option<Arc<ActiveClaim>> {
         self.inner.write().remove(&claim_id)
-    }
-
-    pub fn get(&self, claim_id: ClaimId) -> Option<Arc<ActiveClaim>> {
-        self.inner.read().get(&claim_id).cloned()
     }
 
     pub fn len(&self) -> usize {

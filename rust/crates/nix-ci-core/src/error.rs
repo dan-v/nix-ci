@@ -19,9 +19,6 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
 
-    #[error("conflict: {0}")]
-    Conflict(String),
-
     #[error("gone: {0}")]
     Gone(String),
 
@@ -50,7 +47,6 @@ impl Error {
         match self {
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
-            Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Gone(_) => StatusCode::GONE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }

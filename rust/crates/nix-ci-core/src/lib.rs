@@ -1,7 +1,6 @@
 //! nix-ci core: dispatcher, server, client, runner, durability.
 //!
-//! One crate so the binary can link any combination. The module tree
-//! mirrors v2 DESIGN section 12.
+//! One crate so the binary can link any combination.
 
 pub mod client;
 pub mod config;

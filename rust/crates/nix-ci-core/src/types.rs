@@ -164,19 +164,6 @@ impl ErrorCategory {
     }
 }
 
-// ─── Cache-status hint from nix-eval-jobs ─────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CacheStatus {
-    /// Already available in configured substituter (skip entirely).
-    Cached,
-    /// Already in the local store (don't rebuild).
-    Local,
-    /// Needs to be built.
-    NotBuilt,
-}
-
 // ─── API: create job ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,8 +194,6 @@ pub struct IngestDrvRequest {
     /// True for top-level attrs emitted by nix-eval-jobs.
     #[serde(default)]
     pub is_root: bool,
-    #[serde(default)]
-    pub cache_status: Option<CacheStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,8 +286,6 @@ pub struct CompleteResponse {
     /// True when the claim_id was stale (coordinator restarted, or this
     /// claim was reclaimed). The worker should drop its result.
     pub ignored: bool,
-    /// Opportunistic pipelining: skip the next claim round-trip.
-    pub next_build: Option<ClaimResponse>,
 }
 
 // ─── API: status + events ─────────────────────────────────────────────

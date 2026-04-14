@@ -1,5 +1,6 @@
-//! `Step` — the in-memory node for a single derivation. Corresponds
-//! 1:1 to a `derivations` row.
+//! `Step` — the in-memory node for a single derivation. In-flight
+//! state (runnable / finished / tries / previous_failure / etc.) lives
+//! entirely here; nothing is persisted.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};

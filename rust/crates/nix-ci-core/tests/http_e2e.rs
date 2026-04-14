@@ -19,7 +19,6 @@ fn ingest(drv: &str, name: &str, deps: &[&str], is_root: bool) -> IngestDrvReque
         required_features: vec![],
         input_drvs: deps.iter().map(|s| s.to_string()).collect(),
         is_root,
-        cache_status: None,
     }
 }
 
@@ -67,22 +66,17 @@ async fn linear_chain_of_three_completes(pool: PgPool) {
 
     client.seal(job.id).await.unwrap();
 
-    // Worker loop: claim → pretend to build → complete, chasing
-    // opportunistic next_build suggestions. Bail once 204.
+    // Worker loop: claim → pretend to build → complete. Bail once 204.
     let mut iterations = 0;
-    let mut pending: Option<nix_ci_core::types::ClaimResponse> = None;
     loop {
         iterations += 1;
         assert!(iterations < 20, "too many iterations");
-        let c = match pending.take() {
-            Some(c) => c,
-            None => match client.claim(job.id, "x86_64-linux", &[], 5).await {
-                Ok(Some(c)) => c,
-                Ok(None) | Err(nix_ci_core::Error::Gone(_)) => break,
-                Err(e) => panic!("unexpected claim error: {e}"),
-            },
+        let c = match client.claim(job.id, "x86_64-linux", &[], 5).await {
+            Ok(Some(c)) => c,
+            Ok(None) | Err(nix_ci_core::Error::Gone(_)) => break,
+            Err(e) => panic!("unexpected claim error: {e}"),
         };
-        let resp = client
+        client
             .complete(
                 job.id,
                 c.claim_id,
@@ -97,7 +91,6 @@ async fn linear_chain_of_three_completes(pool: PgPool) {
             )
             .await
             .unwrap();
-        pending = resp.next_build;
     }
 
     // Eventually the job's status becomes done
@@ -413,18 +406,14 @@ async fn batch_ingest_full_dag_sequences_builds(pool: PgPool) {
     // Must see leaf first, then mid, then root — dispatcher enforces
     // dep ordering even when the three were submitted in one batch.
     let mut order: Vec<String> = Vec::new();
-    let mut pending: Option<nix_ci_core::types::ClaimResponse> = None;
     for _ in 0..10 {
-        let c = match pending.take() {
-            Some(c) => c,
-            None => match client.claim(job.id, "x86_64-linux", &[], 5).await {
-                Ok(Some(c)) => c,
-                Ok(None) | Err(nix_ci_core::Error::Gone(_)) => break,
-                Err(e) => panic!("unexpected claim error: {e}"),
-            },
+        let c = match client.claim(job.id, "x86_64-linux", &[], 5).await {
+            Ok(Some(c)) => c,
+            Ok(None) | Err(nix_ci_core::Error::Gone(_)) => break,
+            Err(e) => panic!("unexpected claim error: {e}"),
         };
         order.push(c.drv_path.clone());
-        let r = client
+        client
             .complete(
                 job.id,
                 c.claim_id,
@@ -439,7 +428,6 @@ async fn batch_ingest_full_dag_sequences_builds(pool: PgPool) {
             )
             .await
             .unwrap();
-        pending = r.next_build;
     }
 
     assert_eq!(order, vec![leaf.clone(), mid.clone(), root.clone()]);

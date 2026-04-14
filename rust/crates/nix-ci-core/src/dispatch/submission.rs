@@ -195,9 +195,7 @@ impl Submission {
         self.members.read().values().cloned().collect()
     }
 
-    /// Compute live counts from the submission's member set. Cheaper
-    /// than the db-backed recursive CTE when the submission is live
-    /// in memory.
+    /// Compute live counts from the submission's member set.
     pub fn live_counts(&self) -> crate::types::JobCounts {
         use crate::types::{DrvState, JobCounts};
         let mut c = JobCounts::default();

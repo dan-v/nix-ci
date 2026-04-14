@@ -38,9 +38,7 @@ pub async fn run(
         if let Err(e) = reap_stale_jobs(&pool, &dispatcher, job_heartbeat_timeout).await {
             tracing::warn!(error = %e, "reap_stale_jobs failed");
         }
-        if let Err(e) = reap_expired_claims(&pool, &dispatcher).await {
-            tracing::warn!(error = %e, "reap_expired_claims failed");
-        }
+        reap_expired_claims(&dispatcher);
         sweep_terminal_submissions(&dispatcher);
     }
 }
@@ -147,14 +145,13 @@ pub async fn reap_stale_jobs(
     Ok(())
 }
 
-/// Deadline-reap claims. Unlike `reap_stale_jobs` this does not need to
-/// touch Postgres — claims exist only in memory — it just re-arms the
-/// step so another worker can pick it up.
-pub async fn reap_expired_claims(_pool: &PgPool, dispatcher: &Dispatcher) -> Result<()> {
+/// Deadline-reap claims. Claims live only in memory — no Postgres
+/// write is needed. Re-arms the step so another worker can pick it up.
+pub fn reap_expired_claims(dispatcher: &Dispatcher) {
     let now = Instant::now();
     let expired = dispatcher.claims.expired_ids(now);
     if expired.is_empty() {
-        return Ok(());
+        return;
     }
     tracing::warn!(n = expired.len(), "reaping expired claims");
     dispatcher
@@ -176,5 +173,4 @@ pub async fn reap_expired_claims(_pool: &PgPool, dispatcher: &Dispatcher) -> Res
         }
     }
     dispatcher.wake();
-    Ok(())
 }

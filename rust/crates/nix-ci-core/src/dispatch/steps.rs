@@ -83,8 +83,7 @@ impl StepsRegistry {
     }
 
     /// Iterate live steps. Write-locks to GC dead weak entries in the
-    /// same pass. Used by the snapshot endpoint and rehydration self-
-    /// checks — NOT on the hot path.
+    /// same pass. Used by the snapshot endpoint — NOT on the hot path.
     pub fn live(&self) -> Vec<Arc<Step>> {
         let mut guard = self.inner.write();
         let mut out = Vec::with_capacity(guard.len());
@@ -96,11 +95,5 @@ impl StepsRegistry {
             None => false,
         });
         out
-    }
-
-    /// Force-remove an entry (e.g. after terminal failure propagation
-    /// releases the last strong ref). Idempotent.
-    pub fn remove(&self, drv_hash: &DrvHash) {
-        self.inner.write().remove(drv_hash);
     }
 }
