@@ -809,6 +809,44 @@ async fn terminal_snapshot_caps_failures(pool: PgPool) {
     );
 }
 
+// ─── HTTP/2 cleartext (h2c) prior-knowledge support ────────────────
+
+#[sqlx::test]
+async fn server_accepts_h2c_prior_knowledge_clients(pool: PgPool) {
+    // Real deployment sits behind Envoy doing h2c upstream. The server
+    // must accept HTTP/2 cleartext (prior-knowledge — no TLS, no
+    // Upgrade dance). axum::serve uses hyper-util's auto-builder
+    // which inspects the connection preface — h2c clients should work
+    // without code changes.
+    let handle = spawn_server(pool).await;
+
+    let h2_client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let resp = h2_client
+        .get(format!("{}/healthz", handle.base_url))
+        .send()
+        .await
+        .expect("h2c request must succeed");
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "ok");
+
+    // Also a JSON POST to make sure routes / bodies / headers all
+    // negotiate fine.
+    let job: nix_ci_core::types::CreateJobResponse = h2_client
+        .post(format!("{}/jobs", handle.base_url))
+        .json(&CreateJobRequest { external_ref: None })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(job.id.0.to_string(), "");
+}
+
 // ─── SSE consumer surfaces server failure as Err, not Ok(Pending) ──
 
 #[sqlx::test]

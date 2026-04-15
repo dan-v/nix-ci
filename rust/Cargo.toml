@@ -19,7 +19,7 @@ async-stream = "0.3"
 
 # HTTP server / client
 axum = { version = "0.8", features = ["macros"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2"] }
 eventsource-stream = "0.2"
 parking_lot = "0.12"
 
