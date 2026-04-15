@@ -404,14 +404,21 @@ async fn stderr_ring_tail(stderr: Option<tokio::process::ChildStderr>) -> String
 /// attempt counter bounds the worst case.
 ///
 /// We classify as a terminal [`ErrorCategory::BuildFailure`] only when
-/// we're confident: Nix prints "error: builder for ... failed with
-/// exit code ..." for an actual build-script failure, and similar for
-/// hash/output mismatches. Those are reproducibility-deterministic and
-/// retrying won't change the outcome.
+/// we're confident. Two wire formats to recognize:
+///
+/// * **Upstream Nix**: `error: builder for '<drv>' failed with exit
+///   code N` (also `failed to produce output path`).
+/// * **Determinate Nix**: `Cannot build '<drv>'.\nReason: builder
+///   failed with exit code N.` (also `failed due to signal N (desc)`).
+///
+/// Everything else — including network / substituter / daemon blips —
+/// drops to `Transient`, bounded by `max_attempts` server-side.
 fn classify_stderr(tail: &str) -> ErrorCategory {
     let t = tail.to_ascii_lowercase();
 
     // Resource exhaustion — retryable, likely on a different worker.
+    // Check first so `signal 9` + OOM context beats the BuildFailure
+    // classifier below.
     if t.contains("no space left on device")
         || t.contains("disk full")
         || t.contains("out of memory")
@@ -422,10 +429,14 @@ fn classify_stderr(tail: &str) -> ErrorCategory {
     }
 
     // Deterministic build failure signatures — not retryable.
-    // These are Nix's canonical terminal-failure messages.
-    if t.contains("builder for ")
-        && (t.contains("failed with exit code") || t.contains("failed to produce output path"))
-    {
+    //
+    // The `builder for ` / `cannot build '` anchors guard against
+    // matching spurious substrings in e.g. network error logs.
+    let has_anchor = t.contains("builder for ") || t.contains("cannot build '");
+    let has_terminal_marker = t.contains("failed with exit code")
+        || t.contains("failed to produce output path")
+        || t.contains("failed due to signal");
+    if has_anchor && has_terminal_marker {
         return ErrorCategory::BuildFailure;
     }
     if t.contains("hash mismatch in fixed-output derivation")
@@ -555,6 +566,42 @@ mod classify_tests {
             classify_stderr("output path /nix/store/a is not allowed to refer to /nix/store/b"),
             ErrorCategory::BuildFailure
         );
+    }
+
+    // ─── DetSys nix output format ────────────────────────────────
+    //
+    // DetSys/nix emits `Cannot build '<drv>'.\nReason: builder
+    // failed with exit code N.` for deterministic failures, unlike
+    // upstream's `error: builder for '<drv>' failed with exit code
+    // N`. Without these tests the classifier mis-labels real build
+    // failures as `Transient`, thrashing retries.
+
+    #[test]
+    fn detsys_cannot_build_with_exit_code_is_build_failure() {
+        let tail = "Cannot build '/nix/store/abc-hello.drv'.\n\
+                    Reason: builder failed with exit code 1.\n\
+                    Last log lines:";
+        assert_eq!(classify_stderr(tail), ErrorCategory::BuildFailure);
+    }
+
+    #[test]
+    fn detsys_cannot_build_with_signal_is_build_failure() {
+        // `failed due to signal N (description)` — non-OOM signal
+        // paths should also be classified as a build failure (SIGABRT
+        // from a crashing builder is deterministic).
+        let tail = "Cannot build '/nix/store/abc.drv'.\n\
+                    Reason: builder failed due to signal 6 (Aborted).";
+        assert_eq!(classify_stderr(tail), ErrorCategory::BuildFailure);
+    }
+
+    #[test]
+    fn detsys_cannot_build_signal_9_with_oom_is_diskfull() {
+        // OOM-kill signature alongside "Cannot build" — the OOM check
+        // should still win, because the drv itself isn't at fault.
+        let tail = "Cannot build '/nix/store/abc.drv'.\n\
+                    Reason: builder failed due to signal 9 (Killed).\n\
+                    process killed by OOM reaper";
+        assert_eq!(classify_stderr(tail), ErrorCategory::DiskFull);
     }
 }
 

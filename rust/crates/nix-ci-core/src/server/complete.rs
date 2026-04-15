@@ -134,18 +134,26 @@ async fn handle_failure(
     step.previous_failure.store(true, Ordering::Release);
     step.finished.store(true, Ordering::Release);
 
-    // Best-effort: cache the output path (drv_path with `.drv`
-    // stripped) so concurrent jobs short-circuit on the next ingest.
-    // Not fatal on error. Every drv_path accepted by ingest ends in
-    // `.drv` and has at least one char before the suffix
-    // (drv_hash_from_path validates), so the stripped result is
-    // guaranteed non-empty and distinct from the input — no guards
-    // needed.
-    let output_path = step.drv_path().trim_end_matches(".drv").to_string();
-    if let Err(e) =
-        writeback::insert_failed_outputs(&state.pool, step.drv_hash(), &[output_path]).await
-    {
-        tracing::warn!(error = %e, "failed_outputs insert failed; continuing");
+    // Cache the output path only for deterministic, reproducible
+    // failures — i.e. BuildFailure. Transient / DiskFull exhaustions
+    // are builder-environment problems (network blip, worker's disk
+    // was full, worker OOMed) and the drv is still potentially
+    // buildable on a different worker; caching them would poison the
+    // TTL cache and falsely short-circuit future ingests.
+    // PropagatedFailure is likewise NOT cached: the drv itself never
+    // tried to build, and if its dep is still actually bad it will be
+    // caught by the dep's own failed_outputs entry.
+    if matches!(category, ErrorCategory::BuildFailure) {
+        // Every drv_path accepted by ingest ends in `.drv` and has at
+        // least one char before the suffix (drv_hash_from_path
+        // validates), so the stripped result is guaranteed non-empty
+        // and distinct from the input.
+        let output_path = step.drv_path().trim_end_matches(".drv").to_string();
+        if let Err(e) =
+            writeback::insert_failed_outputs(&state.pool, step.drv_hash(), &[output_path]).await
+        {
+            tracing::warn!(error = %e, "failed_outputs insert failed; continuing");
+        }
     }
 
     state

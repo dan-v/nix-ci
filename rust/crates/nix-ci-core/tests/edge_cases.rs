@@ -2014,6 +2014,131 @@ async fn terminal_failure_caches_output_path(pool: PgPool) {
     );
 }
 
+// ─── Retry-exhausted Transient must NOT poison failed_outputs ──────
+
+#[sqlx::test]
+async fn transient_retry_exhaustion_does_not_cache_output_path(pool: PgPool) {
+    // Transient / DiskFull failures are builder-environment problems,
+    // not drv problems. Even after retries exhaust, the drv is still
+    // potentially buildable on a different worker — caching it in
+    // failed_outputs would falsely short-circuit future ingests.
+    let handle = spawn_server(pool.clone()).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let drv = drv_path("nopoison", "flaky");
+    client
+        .ingest_drv(job.id, &ingest(&drv, "flaky", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    // Fail with Transient until attempts exhaust (max_attempts default = 2).
+    let drv_hash = nix_ci_core::types::drv_hash_from_path(&drv).unwrap();
+    for _ in 0..3 {
+        let c = match client.claim(job.id, "x86_64-linux", &[], 3).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(nix_ci_core::Error::Gone(_)) => break,
+            Err(e) => panic!("unexpected: {e}"),
+        };
+        client
+            .complete(
+                job.id,
+                c.claim_id,
+                &CompleteRequest {
+                    success: false,
+                    duration_ms: 1,
+                    exit_code: Some(137),
+                    error_category: Some(ErrorCategory::Transient),
+                    error_message: Some("network blip".into()),
+                    log_tail: None,
+                },
+            )
+            .await
+            .unwrap();
+        if let Some(step) = handle.dispatcher.steps.get(&drv_hash) {
+            step.next_attempt_at
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    // Job is terminal Failed (retries exhausted). Verify failed_outputs
+    // table is EMPTY for this drv — it's not the drv's fault.
+    let expected_output = drv.trim_end_matches(".drv").to_string();
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT output_path FROM failed_outputs WHERE output_path = $1")
+            .bind(&expected_output)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        rows.is_empty(),
+        "Transient retry-exhaustion must NOT cache output_path; rows={rows:?}"
+    );
+}
+
+#[sqlx::test]
+async fn diskfull_retry_exhaustion_does_not_cache_output_path(pool: PgPool) {
+    // Same contract as the Transient case — DiskFull is an environment
+    // problem, not a drv problem.
+    let handle = spawn_server(pool.clone()).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let drv = drv_path("nopoisondsk", "toobig");
+    client
+        .ingest_drv(job.id, &ingest(&drv, "toobig", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let drv_hash = nix_ci_core::types::drv_hash_from_path(&drv).unwrap();
+    for _ in 0..3 {
+        let c = match client.claim(job.id, "x86_64-linux", &[], 3).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(nix_ci_core::Error::Gone(_)) => break,
+            Err(e) => panic!("unexpected: {e}"),
+        };
+        client
+            .complete(
+                job.id,
+                c.claim_id,
+                &CompleteRequest {
+                    success: false,
+                    duration_ms: 1,
+                    exit_code: Some(137),
+                    error_category: Some(ErrorCategory::DiskFull),
+                    error_message: Some("no space left on device".into()),
+                    log_tail: None,
+                },
+            )
+            .await
+            .unwrap();
+        if let Some(step) = handle.dispatcher.steps.get(&drv_hash) {
+            step.next_attempt_at
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let expected_output = drv.trim_end_matches(".drv").to_string();
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT output_path FROM failed_outputs WHERE output_path = $1")
+            .bind(&expected_output)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        rows.is_empty(),
+        "DiskFull retry-exhaustion must NOT cache output_path; rows={rows:?}"
+    );
+}
+
 // ─── Battleproof: DrvFailed SSE event fires on terminal failure ─────
 
 #[sqlx::test]
