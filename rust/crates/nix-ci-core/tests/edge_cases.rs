@@ -809,6 +809,146 @@ async fn terminal_snapshot_caps_failures(pool: PgPool) {
     );
 }
 
+// ─── SSE consumer surfaces server failure as Err, not Ok(Pending) ──
+
+#[sqlx::test]
+async fn sse_consumer_returns_err_on_404(pool: PgPool) {
+    // GET /jobs/{id}/events on an unknown job_id returns 404. The
+    // print_events function used to silently return Ok(Pending) on a
+    // bad-status response, hiding the failure from the orchestrator.
+    // Should return Err so the caller can react.
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    let handle = spawn_server(pool).await;
+    let client = Arc::new(CoordinatorClient::new(&handle.base_url));
+    let bogus_job_id = nix_ci_core::types::JobId::new();
+
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        nix_ci_core::runner::sse::print_events(client, bogus_job_id, sd_tx, sd_rx),
+    )
+    .await
+    .expect("sse must return promptly on 404");
+
+    assert!(
+        res.is_err(),
+        "non-2xx SSE response must surface as Err, not Ok; got {res:?}"
+    );
+}
+
+#[sqlx::test]
+async fn sse_consumer_returns_pending_on_clean_shutdown(pool: PgPool) {
+    // Caller-initiated shutdown (the typical orchestrator path on
+    // SIGTERM) is the ONLY case Pending is a correct return. Hold the
+    // sender outside the spawn so we can flip it from the test.
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    let handle = spawn_server(pool).await;
+    let client = Arc::new(CoordinatorClient::new(&handle.base_url));
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let sd_tx_inner = sd_tx.clone();
+    let task = tokio::spawn({
+        let client = client.clone();
+        async move { nix_ci_core::runner::sse::print_events(client, job.id, sd_tx_inner, sd_rx).await }
+    });
+
+    // Let the consumer subscribe + sit waiting on events.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Caller signals shutdown — print_events must return Ok(Pending).
+    let _ = sd_tx.send(true);
+
+    let res = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("must exit promptly on shutdown")
+        .expect("joined");
+    assert!(
+        matches!(res, Ok(JobStatus::Pending)),
+        "clean shutdown must return Ok(Pending); got {res:?}"
+    );
+}
+
+// ─── DrvCompleted SSE event must carry actual duration ─────────────
+
+#[sqlx::test]
+async fn sse_drv_completed_event_carries_real_duration(pool: PgPool) {
+    // The complete handler records duration_ms in metrics; the
+    // DrvCompleted SSE event must NOT hardcode 0 — subscribers want
+    // the real duration.
+    use eventsource_stream::Eventsource;
+    use futures::StreamExt;
+
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let drv = drv_path("dur", "timed");
+    client
+        .ingest_drv(job.id, &ingest(&drv, "timed", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let events_url = format!("{}/jobs/{}/events", handle.base_url, job.id);
+    let sse_task = tokio::spawn(async move {
+        let resp = reqwest::Client::new()
+            .get(&events_url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        let mut stream = resp.bytes_stream().eventsource();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.unwrap();
+            if ev.event == "drv_completed" {
+                return ev.data;
+            }
+        }
+        panic!("SSE closed without drv_completed");
+    });
+
+    let c = client
+        .claim(job.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("claim");
+    const REPORTED_MS: u64 = 12_345;
+    client
+        .complete(
+            job.id,
+            c.claim_id,
+            &CompleteRequest {
+                success: true,
+                duration_ms: REPORTED_MS,
+                exit_code: Some(0),
+                error_category: None,
+                error_message: None,
+                log_tail: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let payload = tokio::time::timeout(Duration::from_secs(5), sse_task)
+        .await
+        .expect("SSE task deadline")
+        .expect("SSE task joined");
+    let expected = format!("\"duration_ms\":{REPORTED_MS}");
+    assert!(
+        payload.contains(&expected),
+        "drv_completed must carry duration_ms={REPORTED_MS}, got: {payload}"
+    );
+}
+
 // ─── SSE Lagged event surfaces when subscriber falls behind ─────────
 
 #[sqlx::test]
@@ -1329,6 +1469,78 @@ async fn broadcast_preserves_per_subscriber_publish_order(pool: PgPool) {
     let expected: Vec<u32> = (0..N).collect();
     assert_eq!(seq_a, expected, "subscriber A must see publish-order");
     assert_eq!(seq_b, expected, "subscriber B must see publish-order");
+}
+
+// ─── Reaper does NOT re-arm a finished step ────────────────────────
+
+#[sqlx::test]
+async fn reaper_does_not_re_arm_step_finished_via_propagation(pool: PgPool) {
+    // Race the reaper would otherwise lose: a step's claim has expired,
+    // but before the reaper sets `runnable=true`, propagation marks
+    // the step finished (e.g. an upstream sibling's failure cascaded).
+    // Post-condition: NO step ends up with both `finished=true` AND
+    // `runnable=true` — that would violate the dispatcher invariant
+    // and leave an orphan entry in the ready queue.
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.claim_deadline_secs = 1;
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let drv = drv_path("racefin", "pkg");
+    client
+        .ingest_drv(job.id, &ingest(&drv, "pkg", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let c = client
+        .claim(job.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("claim");
+
+    // Force claim deadline to the past.
+    let claim = handle
+        .dispatcher
+        .claims
+        .take(c.claim_id)
+        .expect("claim present");
+    let mut forced = (*claim).clone();
+    forced.deadline = std::time::Instant::now() - Duration::from_secs(10);
+    handle.dispatcher.claims.insert(Arc::new(forced));
+
+    // Mark the step finished BEFORE the reaper runs — simulates
+    // propagation from a concurrent failure beating the reaper to
+    // the punch.
+    let drv_hash = nix_ci_core::types::drv_hash_from_path(&drv).unwrap();
+    let step = handle
+        .dispatcher
+        .steps
+        .get(&drv_hash)
+        .expect("step present");
+    step.previous_failure.store(true, Ordering::Release);
+    step.finished.store(true, Ordering::Release);
+
+    nix_ci_core::durable::reaper::reap_expired_claims(&handle.dispatcher);
+
+    // Invariant: a finished step must NOT also be runnable. Otherwise
+    // pop_runnable wastes work and the admin snapshot is inconsistent.
+    assert!(
+        step.finished.load(Ordering::Acquire),
+        "test setup: step should still be finished"
+    );
+    assert!(
+        !step.runnable.load(Ordering::Acquire),
+        "reaper must not re-arm a step that became finished concurrently"
+    );
 }
 
 // ─── Reaper handles many claims expiring on the same tick ──────────

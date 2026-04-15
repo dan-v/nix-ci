@@ -60,7 +60,7 @@ pub async fn complete(
         .observe((req.duration_ms as f64) / 1000.0);
 
     if req.success {
-        handle_success(&state, &step).await?;
+        handle_success(&state, &step, req.duration_ms).await?;
     } else {
         handle_failure(&state, &claim, &step, req).await?;
     }
@@ -83,7 +83,11 @@ fn truncate_log(log: &mut Option<String>) {
     *s = s[cut..].to_string();
 }
 
-async fn handle_success(state: &AppState, step: &Arc<crate::dispatch::Step>) -> Result<()> {
+async fn handle_success(
+    state: &AppState,
+    step: &Arc<crate::dispatch::Step>,
+    duration_ms: u64,
+) -> Result<()> {
     step.finished.store(true, Ordering::Release);
 
     state
@@ -100,7 +104,7 @@ async fn handle_success(state: &AppState, step: &Arc<crate::dispatch::Step>) -> 
         sub.publish(JobEvent::DrvCompleted {
             drv_hash: step.drv_hash().clone(),
             drv_name: step.drv_name().to_string(),
-            duration_ms: 0,
+            duration_ms,
         });
     }
 

@@ -157,7 +157,18 @@ pub fn reap_expired_claims(dispatcher: &Dispatcher) {
             if !step.finished.load(std::sync::atomic::Ordering::Acquire) {
                 step.runnable
                     .store(true, std::sync::atomic::Ordering::Release);
-                crate::dispatch::rdep::enqueue_for_all_submissions(&step);
+                // Race: between the load above and the store, a
+                // concurrent failure-propagation could have set
+                // finished=true. Re-check and undo so we never leave
+                // a step with `finished=true && runnable=true` (which
+                // would orphan a queue entry and violate dispatcher
+                // invariant 4).
+                if step.finished.load(std::sync::atomic::Ordering::Acquire) {
+                    step.runnable
+                        .store(false, std::sync::atomic::Ordering::Release);
+                } else {
+                    crate::dispatch::rdep::enqueue_for_all_submissions(&step);
+                }
             }
         }
     }

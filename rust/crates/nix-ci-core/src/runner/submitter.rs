@@ -195,7 +195,14 @@ const PARSED_CACHE_CAP: usize = 50_000;
 /// we rebuild the eviction order from the insertion log afterward.
 struct BoundedCache {
     inner: HashMap<String, ParsedDrv>,
+    /// Insertion order — front is oldest. The walker can insert into
+    /// `inner` without going through `as_hashmap_mut`, so we reconcile
+    /// `order` (and `seen`) lazily on every borrow + every evict.
     order: VecDeque<String>,
+    /// Mirrors the contents of `order` for O(1) "is this key tracked?"
+    /// — without it, the per-borrow reconcile is O(n²) because each
+    /// inner key linearly scans the deque.
+    seen: HashSet<String>,
     cap: usize,
 }
 
@@ -204,37 +211,45 @@ impl BoundedCache {
         Self {
             inner: HashMap::with_capacity(cap.min(1024)),
             order: VecDeque::with_capacity(cap.min(1024)),
+            seen: HashSet::with_capacity(cap.min(1024)),
             cap,
         }
     }
 
-    fn as_hashmap_mut(&mut self) -> &mut HashMap<String, ParsedDrv> {
-        // Before exposing, record any fresh insertions from a previous
-        // call. The order may be out of sync if the walker inserted
-        // entries we haven't seen yet; we reconcile on each borrow.
+    /// Bring `order` + `seen` in sync with whatever the walker pushed
+    /// into `inner` since the last reconcile. O(n) in new entries.
+    fn reconcile(&mut self) {
         for key in self.inner.keys() {
-            if !self.order.iter().any(|k| k == key) {
+            if self.seen.insert(key.clone()) {
                 self.order.push_back(key.clone());
             }
         }
+    }
+
+    fn as_hashmap_mut(&mut self) -> &mut HashMap<String, ParsedDrv> {
+        self.reconcile();
         &mut self.inner
     }
 
     /// Evict oldest entries until under cap. Called after each walk.
     fn evict_to_cap(&mut self) {
-        // Rebuild order from current keys to account for walker insertions.
-        for key in self.inner.keys() {
-            if !self.order.iter().any(|k| k == key) {
-                self.order.push_back(key.clone());
+        self.reconcile();
+        // Drop entries that the caller already removed from `inner`.
+        let still_present = &self.inner;
+        let seen = &mut self.seen;
+        self.order.retain(|k| {
+            let keep = still_present.contains_key(k);
+            if !keep {
+                seen.remove(k);
             }
-        }
-        // Prune order entries that no longer exist in the map.
-        self.order.retain(|k| self.inner.contains_key(k));
+            keep
+        });
         while self.inner.len() > self.cap {
             let Some(key) = self.order.pop_front() else {
                 break;
             };
             self.inner.remove(&key);
+            self.seen.remove(&key);
         }
     }
 }
@@ -345,6 +360,28 @@ mod tests {
         c.as_hashmap_mut().insert("a".into(), mk_parsed("a"));
         c.evict_to_cap();
         assert_eq!(c.inner.len(), 0);
+    }
+
+    #[test]
+    fn bounded_cache_reconcile_is_linear_at_scale() {
+        // The cache is borrowed every walk; with cap=50_000 a quadratic
+        // dedup is fatal. Insert 5_000 entries (well below cap, no
+        // eviction) and reconcile — must complete in well under a
+        // second. An O(n²) scan would be ~25M VecDeque comparisons,
+        // closer to multiple seconds in debug mode.
+        let mut c = BoundedCache::new(50_000);
+        let n = 20_000usize;
+        for i in 0..n {
+            c.inner.insert(format!("k-{i}"), mk_parsed("x"));
+        }
+        let start = std::time::Instant::now();
+        let _ = c.as_hashmap_mut();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "as_hashmap_mut on {n} entries took {elapsed:?} — should be O(n), not O(n²)"
+        );
+        assert_eq!(c.order.len(), n, "every key must end up in order");
     }
 
     // ─── helpers ─────────────────────────────────────────────────
