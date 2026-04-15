@@ -809,6 +809,22 @@ async fn terminal_snapshot_caps_failures(pool: PgPool) {
     );
 }
 
+// ─── /health alias for proxies that expect the unsuffixed path ─────
+
+#[sqlx::test]
+async fn both_health_and_healthz_paths_serve_ok(pool: PgPool) {
+    // Some proxies (Envoy, GCP HTTP LBs) probe `/health`; kube uses
+    // `/healthz`. Both must return the same OK response.
+    let handle = spawn_server(pool).await;
+    for path in ["/health", "/healthz"] {
+        let r = reqwest::get(format!("{}{path}", handle.base_url))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(r.text().await.unwrap(), "ok", "{path}");
+    }
+}
+
 // ─── HTTP/2 cleartext (h2c) prior-knowledge support ────────────────
 
 #[sqlx::test]

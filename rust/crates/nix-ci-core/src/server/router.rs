@@ -30,8 +30,11 @@ pub fn build_router(state: AppState) -> Router {
             post(complete::complete),
         )
         .route("/jobs/{id}/events", get(events::events))
-        // Ops
+        // Ops. `/health` is the same as `/healthz` — kept for proxies
+        // (Envoy, GCP load balancers) that look for the unsuffixed
+        // path; `/healthz` is the kube convention.
         .route("/healthz", get(ops::healthz))
+        .route("/health", get(ops::healthz))
         .route("/readyz", get(ops::readyz))
         .route("/metrics", get(ops::metrics))
         .route("/admin/snapshot", get(ops::admin_snapshot))
