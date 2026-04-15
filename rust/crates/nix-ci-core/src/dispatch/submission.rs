@@ -130,8 +130,11 @@ impl Submission {
             // Retry backoff: not yet eligible. Push to the TAIL of the
             // queue instead of the head so we don't spin re-popping
             // the same still-waiting entry on every claim attempt.
+            // `next_attempt_at == 0` means no backoff; since now_ms is
+            // always wall-clock positive, `0 > now_ms` is false and the
+            // comparison alone suffices.
             let next_at = step.next_attempt_at.load(Ordering::Acquire);
-            if next_at > 0 && next_at > now_ms {
+            if next_at > now_ms {
                 requeue_tail.push(Arc::downgrade(&step));
                 continue;
             }
@@ -267,5 +270,116 @@ impl Submissions {
 
     pub fn remove(&self, id: JobId) -> Option<Arc<Submission>> {
         self.inner.write().remove(&id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DrvState;
+    use std::sync::atomic::Ordering;
+
+    fn mk_step(name: &str) -> Arc<Step> {
+        let hash = crate::types::DrvHash::new(format!("{name}.drv"));
+        Step::new(
+            hash.clone(),
+            format!("/nix/store/{hash}"),
+            name.to_string(),
+            "x86_64-linux".into(),
+            Vec::new(),
+            2,
+        )
+    }
+
+    #[test]
+    fn submissions_is_empty_tracks_inserts() {
+        let subs = Submissions::new();
+        assert!(subs.is_empty());
+        assert_eq!(subs.len(), 0);
+        let id = JobId::new();
+        let _ = subs.get_or_insert(id, 8);
+        assert!(!subs.is_empty());
+        assert_eq!(subs.len(), 1);
+        subs.remove(id);
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn live_counts_totals_match_membership() {
+        // live_counts uses `c.total += 1` per member plus per-state
+        // increments. A mutation that replaces `+=` with `*=` for any
+        // of the four state lanes would silently stick that count at
+        // 0 or 1 — cover ALL four lanes (Pending, Building, Done,
+        // Failed) so every increment site is asserted with a count > 1.
+        let sub = Submission::new(JobId::new(), 8);
+        // Two of each state so *= vs += is visibly different (2 vs 1).
+        let pending = [mk_step("p1"), mk_step("p2")];
+        let building = [mk_step("b1"), mk_step("b2")];
+        let done = [mk_step("d1"), mk_step("d2")];
+        let failed = [mk_step("f1"), mk_step("f2")];
+
+        for step in pending.iter() {
+            sub.add_member(step);
+            step.runnable.store(true, Ordering::Release);
+        }
+        for step in building.iter() {
+            sub.add_member(step);
+            // Building = tries > 0 ∧ !runnable ∧ !finished.
+            step.tries.store(1, Ordering::Release);
+        }
+        for step in done.iter() {
+            sub.add_member(step);
+            step.finished.store(true, Ordering::Release);
+        }
+        for step in failed.iter() {
+            sub.add_member(step);
+            step.finished.store(true, Ordering::Release);
+            step.previous_failure.store(true, Ordering::Release);
+        }
+
+        let counts = sub.live_counts();
+        assert_eq!(counts.total, 8, "total must be linear in membership");
+        assert_eq!(counts.pending, 2);
+        assert_eq!(counts.building, 2);
+        assert_eq!(counts.done, 2);
+        assert_eq!(counts.failed, 2);
+        // Sanity on observable_state mapping.
+        assert!(matches!(pending[0].observable_state(), DrvState::Pending));
+        assert!(matches!(building[0].observable_state(), DrvState::Building));
+        assert!(matches!(done[0].observable_state(), DrvState::Done));
+        assert!(matches!(failed[0].observable_state(), DrvState::Failed));
+    }
+
+    #[test]
+    fn pop_runnable_respects_next_attempt_at_boundary() {
+        // `next_attempt_at > 0 && next_attempt_at > now_ms` gates the
+        // retry-backoff requeue. Off-by-one on either comparison would
+        // either skip the backoff entirely (letting an ineligible step
+        // be claimed early) or hold forever. Exercise the precise
+        // boundary at now_ms == next_attempt_at.
+        let sub = Submission::new(JobId::new(), 8);
+        let step = mk_step("delayed");
+        step.runnable.store(true, Ordering::Release);
+        step.next_attempt_at.store(1_000, Ordering::Release);
+        sub.add_member(&step);
+        sub.enqueue_ready(&step);
+
+        // now_ms < next_attempt_at: not claimable.
+        assert!(sub.pop_runnable("x86_64-linux", &[], 999).is_none());
+        // now_ms == next_attempt_at: eligible (`>` not `>=`).
+        let claimed = sub.pop_runnable("x86_64-linux", &[], 1_000);
+        assert!(
+            claimed.is_some(),
+            "must claim at exact eligibility boundary"
+        );
+
+        // And: next_attempt_at = 0 always means unconditionally eligible.
+        let fresh = mk_step("fresh");
+        fresh.runnable.store(true, Ordering::Release);
+        // next_attempt_at defaults to 0.
+        let sub2 = Submission::new(JobId::new(), 8);
+        sub2.add_member(&fresh);
+        sub2.enqueue_ready(&fresh);
+        assert!(sub2.pop_runnable("x86_64-linux", &[], 0).is_some());
     }
 }

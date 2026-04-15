@@ -31,7 +31,10 @@ pub async fn run(
     }
 }
 
-async fn sweep(pool: &PgPool, retention_days: u32) -> Result<()> {
+/// TTL + retention prune. Public for integration testing; callers in
+/// production use `run` instead.
+#[doc(hidden)]
+pub async fn sweep(pool: &PgPool, retention_days: u32) -> Result<()> {
     let r = sqlx::query("DELETE FROM failed_outputs WHERE expires_at < now()")
         .execute(pool)
         .await?;

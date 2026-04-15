@@ -238,3 +238,135 @@ impl BoundedCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── attr_is_cached: accepts both cacheStatus shapes ─────────
+
+    #[test]
+    fn attr_is_cached_with_string_cached() {
+        let line = EvalLine {
+            cache_status: Some(serde_json::Value::String("cached".into())),
+            ..default_line()
+        };
+        assert!(attr_is_cached(&line));
+    }
+
+    #[test]
+    fn attr_is_cached_with_string_notbuilt_is_false() {
+        let line = EvalLine {
+            cache_status: Some(serde_json::Value::String("notBuilt".into())),
+            ..default_line()
+        };
+        assert!(!attr_is_cached(&line));
+    }
+
+    #[test]
+    fn attr_is_cached_legacy_boolean_true() {
+        let line = EvalLine {
+            is_cached: Some(true),
+            ..default_line()
+        };
+        assert!(attr_is_cached(&line));
+    }
+
+    #[test]
+    fn attr_is_cached_legacy_boolean_false() {
+        let line = EvalLine {
+            is_cached: Some(false),
+            ..default_line()
+        };
+        assert!(!attr_is_cached(&line));
+    }
+
+    #[test]
+    fn attr_is_cached_absent_fields_is_false() {
+        let line = default_line();
+        assert!(!attr_is_cached(&line));
+    }
+
+    // ─── build_needed_set: always includes the root ──────────────
+
+    #[test]
+    fn build_needed_set_includes_root_even_when_empty() {
+        let mut line = default_line();
+        line.needed_builds = vec![];
+        let set = build_needed_set(&line, "/nix/store/r-root.drv");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("/nix/store/r-root.drv"));
+    }
+
+    #[test]
+    fn build_needed_set_unions_needed_builds_with_root() {
+        let mut line = default_line();
+        line.needed_builds = vec!["/nix/store/a-a.drv".into(), "/nix/store/b-b.drv".into()];
+        let set = build_needed_set(&line, "/nix/store/r-root.drv");
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("/nix/store/r-root.drv"));
+        assert!(set.contains("/nix/store/a-a.drv"));
+        assert!(set.contains("/nix/store/b-b.drv"));
+    }
+
+    #[test]
+    fn build_needed_set_root_in_needed_no_duplicate() {
+        let mut line = default_line();
+        line.needed_builds = vec!["/nix/store/r-root.drv".into()];
+        let set = build_needed_set(&line, "/nix/store/r-root.drv");
+        assert_eq!(set.len(), 1);
+    }
+
+    // ─── BoundedCache FIFO eviction ──────────────────────────────
+
+    #[test]
+    fn bounded_cache_keeps_only_cap_entries() {
+        let mut c = BoundedCache::new(3);
+        c.as_hashmap_mut().insert("a".into(), mk_parsed("a"));
+        c.evict_to_cap();
+        c.as_hashmap_mut().insert("b".into(), mk_parsed("b"));
+        c.evict_to_cap();
+        c.as_hashmap_mut().insert("c".into(), mk_parsed("c"));
+        c.evict_to_cap();
+        assert_eq!(c.inner.len(), 3);
+        // Overflow: d pushes the oldest ("a") out.
+        c.as_hashmap_mut().insert("d".into(), mk_parsed("d"));
+        c.evict_to_cap();
+        assert_eq!(c.inner.len(), 3);
+        assert!(!c.inner.contains_key("a"));
+        assert!(c.inner.contains_key("b"));
+        assert!(c.inner.contains_key("c"));
+        assert!(c.inner.contains_key("d"));
+    }
+
+    #[test]
+    fn bounded_cache_zero_cap_evicts_everything() {
+        let mut c = BoundedCache::new(0);
+        c.as_hashmap_mut().insert("a".into(), mk_parsed("a"));
+        c.evict_to_cap();
+        assert_eq!(c.inner.len(), 0);
+    }
+
+    // ─── helpers ─────────────────────────────────────────────────
+
+    fn default_line() -> EvalLine {
+        EvalLine {
+            drv_path: None,
+            attr: None,
+            name: None,
+            error: None,
+            cache_status: None,
+            is_cached: None,
+            needed_builds: Vec::new(),
+        }
+    }
+
+    fn mk_parsed(name: &str) -> ParsedDrv {
+        ParsedDrv {
+            name: name.to_string(),
+            system: "x86_64-linux".into(),
+            input_drvs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+}

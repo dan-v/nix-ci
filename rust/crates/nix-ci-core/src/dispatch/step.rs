@@ -162,3 +162,68 @@ impl Step {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(name: &str) -> Arc<Step> {
+        let hash = DrvHash::new(format!("{name}.drv"));
+        Step::new(
+            hash.clone(),
+            format!("/nix/store/{hash}"),
+            name.to_string(),
+            "x86_64-linux".into(),
+            Vec::new(),
+            2,
+        )
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)] // StepHandle contains Arc<Step> with atomics, but is only keyed on drv_hash
+    fn step_handle_hashset_dedupes_by_drv_hash() {
+        // StepHandle lives inside StepState::deps as a HashSet. If
+        // PartialEq or Hash misbehaves, two attach_dep calls with the
+        // same dep would leave stale duplicates in the set, OR two
+        // distinct deps would collide and one would be dropped.
+        let a = mk("alpha");
+        let b = mk("beta");
+        let mut set = HashSet::<StepHandle>::new();
+        assert!(set.insert(StepHandle(a.clone())));
+        assert!(
+            !set.insert(StepHandle(a.clone())),
+            "duplicate alpha must not insert"
+        );
+        assert!(
+            set.insert(StepHandle(b.clone())),
+            "distinct beta must insert"
+        );
+        assert_eq!(set.len(), 2, "set must retain two distinct handles");
+        // Explicit hash-equality check: two distinct drv_hashes must
+        // produce distinct hashes (a constant-0 hash would still allow
+        // HashSet to dedup by eq, so the lens-len check above isn't
+        // enough — probe the hasher directly).
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut ha = DefaultHasher::new();
+        StepHandle(a).hash(&mut ha);
+        let mut hb = DefaultHasher::new();
+        StepHandle(b).hash(&mut hb);
+        assert_ne!(
+            ha.finish(),
+            hb.finish(),
+            "distinct drv_hashes must produce distinct hashes"
+        );
+    }
+
+    #[test]
+    fn step_handle_equality_matches_drv_hash_only() {
+        // Two Arc<Step> with the same drv_hash must compare equal even
+        // though their memory addresses differ. The registry never
+        // actually does this (it returns the existing Arc), but the
+        // StepHandle contract is "equal iff drv_hash equal".
+        let a = mk("same");
+        let b = mk("same");
+        assert!(StepHandle(a) == StepHandle(b));
+    }
+}

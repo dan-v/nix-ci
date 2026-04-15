@@ -30,9 +30,7 @@ pub async fn complete(
     Json(mut req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>> {
     let Some(claim) = state.dispatcher.claims.take(claim_id) else {
-        return Ok(Json(CompleteResponse {
-            ignored: true,
-        }));
+        return Ok(Json(CompleteResponse { ignored: true }));
     };
     state.metrics.inner.claims_in_flight.dec();
 
@@ -43,18 +41,14 @@ pub async fn complete(
     }
 
     let Some(step) = state.dispatcher.steps.get(&claim.drv_hash) else {
-        return Ok(Json(CompleteResponse {
-            ignored: true,
-        }));
+        return Ok(Json(CompleteResponse { ignored: true }));
     };
 
     // Guard against the failure-propagation race: if propagation already
     // marked this step finished, skip processing so we don't double-
     // count metrics or re-fire events.
     if step.finished.load(Ordering::Acquire) {
-        return Ok(Json(CompleteResponse {
-            ignored: true,
-        }));
+        return Ok(Json(CompleteResponse { ignored: true }));
     }
 
     truncate_log(&mut req.log_tail);
@@ -70,9 +64,7 @@ pub async fn complete(
     } else {
         handle_failure(&state, &claim, &step, req).await?;
     }
-    Ok(Json(CompleteResponse {
-        ignored: false,
-    }))
+    Ok(Json(CompleteResponse { ignored: false }))
 }
 
 fn truncate_log(log: &mut Option<String>) {
@@ -80,18 +72,18 @@ fn truncate_log(log: &mut Option<String>) {
     if s.len() <= MAX_LOG_TAIL_BYTES {
         return;
     }
+    // Cap is a strict upper bound, so when the target byte sits inside
+    // a multi-byte UTF-8 char we scan *forward* to the next boundary —
+    // keeping slightly fewer bytes (≤3) rather than overshooting MAX.
+    // `s.len()` is always a char boundary so the range always yields.
     let target = s.len() - MAX_LOG_TAIL_BYTES;
-    let mut cut = target;
-    while cut < s.len() && !s.is_char_boundary(cut) {
-        cut += 1;
-    }
+    let cut = (target..=s.len())
+        .find(|&c| s.is_char_boundary(c))
+        .expect("s.len() is always a char boundary");
     *s = s[cut..].to_string();
 }
 
-async fn handle_success(
-    state: &AppState,
-    step: &Arc<crate::dispatch::Step>,
-) -> Result<()> {
+async fn handle_success(state: &AppState, step: &Arc<crate::dispatch::Step>) -> Result<()> {
     step.finished.store(true, Ordering::Release);
 
     state
@@ -138,16 +130,18 @@ async fn handle_failure(
     step.previous_failure.store(true, Ordering::Release);
     step.finished.store(true, Ordering::Release);
 
-    // Best-effort: cache the output path (drv_path with .drv stripped)
-    // so concurrent jobs short-circuit on the next ingest. Not fatal on
-    // error.
+    // Best-effort: cache the output path (drv_path with `.drv`
+    // stripped) so concurrent jobs short-circuit on the next ingest.
+    // Not fatal on error. Every drv_path accepted by ingest ends in
+    // `.drv` and has at least one char before the suffix
+    // (drv_hash_from_path validates), so the stripped result is
+    // guaranteed non-empty and distinct from the input — no guards
+    // needed.
     let output_path = step.drv_path().trim_end_matches(".drv").to_string();
-    if !output_path.is_empty() && output_path != step.drv_path() {
-        if let Err(e) =
-            writeback::insert_failed_outputs(&state.pool, step.drv_hash(), &[output_path]).await
-        {
-            tracing::warn!(error = %e, "failed_outputs insert failed; continuing");
-        }
+    if let Err(e) =
+        writeback::insert_failed_outputs(&state.pool, step.drv_hash(), &[output_path]).await
+    {
+        tracing::warn!(error = %e, "failed_outputs insert failed; continuing");
     }
 
     state
@@ -178,13 +172,12 @@ async fn handle_failure(
     publish_drv_failed(&subs, step, category, &req, attempt, false);
 
     let propagated_count = propagate_failure_inmem(step, step.drv_hash());
-    if propagated_count > 0 {
-        state
-            .metrics
-            .inner
-            .propagated_failures
-            .inc_by(propagated_count);
-    }
+    // `inc_by(0)` is a no-op, so no threshold guard needed.
+    state
+        .metrics
+        .inner
+        .propagated_failures
+        .inc_by(propagated_count);
 
     for sub in subs {
         check_and_publish_terminal(state, &sub).await?;
@@ -267,7 +260,9 @@ pub(crate) fn cap_failures(mut all: Vec<DrvFailure>, cap: usize) -> Vec<DrvFailu
         drv_hash: crate::types::DrvHash::new("<truncated>".to_string()),
         drv_name: "<truncated>".to_string(),
         error_category: ErrorCategory::PropagatedFailure,
-        error_message: Some(format!("{overflow} additional failures truncated from snapshot")),
+        error_message: Some(format!(
+            "{overflow} additional failures truncated from snapshot"
+        )),
         log_tail: None,
         propagated_from: None,
     });
@@ -394,4 +389,115 @@ pub(super) async fn check_and_publish_terminal(
     // `/jobs/{id}` for the terminal result instead.
     state.dispatcher.submissions.remove(sub.id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_log_none_unchanged() {
+        let mut log = None;
+        truncate_log(&mut log);
+        assert!(log.is_none());
+    }
+
+    #[test]
+    fn truncate_log_under_cap_unchanged() {
+        let mut log = Some("small payload".to_string());
+        truncate_log(&mut log);
+        assert_eq!(log.as_deref(), Some("small payload"));
+    }
+
+    #[test]
+    fn truncate_log_exactly_cap_unchanged() {
+        let s = "a".repeat(MAX_LOG_TAIL_BYTES);
+        let mut log = Some(s.clone());
+        truncate_log(&mut log);
+        assert_eq!(log.as_deref(), Some(s.as_str()));
+    }
+
+    #[test]
+    fn truncate_log_ascii_keeps_exact_tail() {
+        // Pure ASCII: cut lands on a char boundary, keep exactly MAX bytes.
+        let mut s = "head".to_string();
+        s.push_str(&"x".repeat(MAX_LOG_TAIL_BYTES));
+        let mut log = Some(s);
+        truncate_log(&mut log);
+        let out = log.unwrap();
+        assert_eq!(out.len(), MAX_LOG_TAIL_BYTES);
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn truncate_log_never_exceeds_cap_on_multibyte_boundary() {
+        // Construct a string where `target = s.len() - MAX` lands
+        // INSIDE a multi-byte char (not on a boundary). This requires
+        // care — with pure 4-byte chars and MAX=65536 the target
+        // position happens to always hit a boundary and the forward-
+        // scan loop never runs, so a bad mutation (cut -=, cut *=)
+        // would go undetected.
+        //
+        // Recipe: one 3-byte char (€) at the very front, then padding
+        // of 1-byte chars. With `s.len() = MAX + 2`, `target = 2` lands
+        // in the middle of '€' (bytes 1..=3) — guaranteed non-boundary.
+        let mut s = String::from("€");
+        assert_eq!(s.len(), 3);
+        while s.len() < MAX_LOG_TAIL_BYTES + 2 {
+            s.push('x');
+        }
+        // Sanity: target really is non-boundary.
+        let target = s.len() - MAX_LOG_TAIL_BYTES;
+        assert_eq!(target, 2);
+        assert!(!s.is_char_boundary(target));
+        let original_len = s.len();
+
+        let mut log = Some(s);
+        truncate_log(&mut log);
+        let out = log.unwrap();
+        assert!(
+            out.len() <= MAX_LOG_TAIL_BYTES,
+            "truncated len {} exceeds MAX {}",
+            out.len(),
+            MAX_LOG_TAIL_BYTES
+        );
+        // At most 3 bytes lost vs. strict tail (UTF-8 char width ≤ 4).
+        let strict_tail = MAX_LOG_TAIL_BYTES.min(original_len);
+        assert!(strict_tail - out.len() < 4);
+        // The '€' prefix must be gone entirely; the tail is pure x's.
+        assert!(
+            out.chars().all(|c| c == 'x'),
+            "tail should be all 'x', got {out:?}"
+        );
+    }
+
+    #[test]
+    fn truncate_log_is_tail_preserving() {
+        // Tail content (the last bytes of the original) is preserved.
+        let mut s = "HEAD_MARK".to_string();
+        s.push_str(&"a".repeat(MAX_LOG_TAIL_BYTES));
+        s.push_str("TAIL_MARK");
+        let mut log = Some(s);
+        truncate_log(&mut log);
+        let out = log.unwrap();
+        assert!(
+            out.ends_with("TAIL_MARK"),
+            "tail marker lost; got suffix {:?}",
+            &out[out.len().saturating_sub(20)..]
+        );
+        assert!(!out.contains("HEAD_MARK"));
+    }
+
+    #[test]
+    fn truncate_log_one_byte_over_cap() {
+        // Edge case: MAX+1 ASCII bytes — cut at byte 1, keep MAX bytes.
+        let mut s = String::with_capacity(MAX_LOG_TAIL_BYTES + 1);
+        s.push('H');
+        s.push_str(&"z".repeat(MAX_LOG_TAIL_BYTES));
+        let mut log = Some(s);
+        truncate_log(&mut log);
+        let out = log.unwrap();
+        assert_eq!(out.len(), MAX_LOG_TAIL_BYTES);
+        assert!(out.chars().all(|c| c == 'z'));
+    }
 }

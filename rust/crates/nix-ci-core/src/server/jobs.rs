@@ -68,12 +68,17 @@ pub async fn fail(
     Path(id): Path<JobId>,
     Json(req): Json<FailJobRequest>,
 ) -> Result<Json<SealJobResponse>> {
-    let snapshot = build_terminal_snapshot(&state, id, JobStatus::Failed, Some(req.message.clone()));
+    let snapshot =
+        build_terminal_snapshot(&state, id, JobStatus::Failed, Some(req.message.clone()));
     let snapshot_json = serde_json::to_value(&snapshot)
         .map_err(|e| Error::Internal(format!("serialize fail result: {e}")))?;
-    let _ =
-        writeback::transition_job_terminal(&state.pool, id, JobStatus::Failed.as_str(), &snapshot_json)
-            .await?;
+    let _ = writeback::transition_job_terminal(
+        &state.pool,
+        id,
+        JobStatus::Failed.as_str(),
+        &snapshot_json,
+    )
+    .await?;
     finish_in_memory(&state, id, JobStatus::Failed, Vec::new());
     Ok(Json(SealJobResponse {
         status: JobStatus::Failed,
@@ -165,11 +170,10 @@ pub async fn status(
         return Ok(Json(response_from_live(&sub)));
     }
     // Terminal job: read the JSONB snapshot persisted at terminal time.
-    let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT result FROM jobs WHERE id = $1")
-            .bind(id.0)
-            .fetch_optional(&state.pool)
-            .await?;
+    let row: Option<(serde_json::Value,)> = sqlx::query_as("SELECT result FROM jobs WHERE id = $1")
+        .bind(id.0)
+        .fetch_optional(&state.pool)
+        .await?;
     match row {
         Some((result,)) => {
             let snap: JobStatusResponse = serde_json::from_value(result)

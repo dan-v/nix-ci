@@ -42,6 +42,12 @@ pub struct MetricsInner {
     /// Lagged event and should re-sync; a high rate indicates a slow
     /// consumer (often a hung client).
     pub events_dropped: Counter,
+
+    // Dispatcher snapshot gauges — refreshed on every `/metrics`
+    // scrape. Useful to graph memory pressure and detect leaks (both
+    // should stay bounded relative to active job count).
+    pub submissions_active: Gauge,
+    pub steps_registry_size: Gauge,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -157,6 +163,20 @@ impl Metrics {
             events_dropped.clone(),
         );
 
+        let submissions_active = Gauge::default();
+        registry.register(
+            "nix_ci_submissions_active",
+            "In-memory submissions (un-terminated jobs)",
+            submissions_active.clone(),
+        );
+
+        let steps_registry_size = Gauge::default();
+        registry.register(
+            "nix_ci_steps_registry_size",
+            "Entries in the Steps registry (live + stale-weak)",
+            steps_registry_size.clone(),
+        );
+
         Self {
             inner: Arc::new(MetricsInner {
                 registry: parking_lot::Mutex::new(registry),
@@ -173,6 +193,8 @@ impl Metrics {
                 claims_expired,
                 jobs_reaped,
                 events_dropped,
+                submissions_active,
+                steps_registry_size,
             }),
         }
     }

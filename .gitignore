@@ -2,6 +2,10 @@
 target/
 **/*.rs.bk
 
+# cargo-mutants output
+mutants.out/
+mutants.out.old/
+
 # Nix (flake.lock is committed — this is an application)
 result
 result-*

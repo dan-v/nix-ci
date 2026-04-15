@@ -161,9 +161,7 @@ pub async fn run(
     // that doesn't see the shutdown — we abort it so the process can
     // actually exit. Without this, SIGTERM plus a hung build would
     // leave `nix-ci run` wedged indefinitely.
-    let drain = async {
-        while join_set.join_next().await.is_some() {}
-    };
+    let drain = async { while join_set.join_next().await.is_some() {} };
     if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain)
         .await
         .is_err()
@@ -418,8 +416,7 @@ fn classify_stderr(tail: &str) -> ErrorCategory {
         || t.contains("disk full")
         || t.contains("out of memory")
         || t.contains("cannot allocate memory")
-        || t.contains("killed")
-            && (t.contains("oom") || t.contains("out of memory"))
+        || t.contains("killed") && (t.contains("oom") || t.contains("out of memory"))
     {
         return ErrorCategory::DiskFull;
     }
@@ -427,8 +424,7 @@ fn classify_stderr(tail: &str) -> ErrorCategory {
     // Deterministic build failure signatures — not retryable.
     // These are Nix's canonical terminal-failure messages.
     if t.contains("builder for ")
-        && (t.contains("failed with exit code")
-            || t.contains("failed to produce output path"))
+        && (t.contains("failed with exit code") || t.contains("failed to produce output path"))
     {
         return ErrorCategory::BuildFailure;
     }
@@ -497,5 +493,126 @@ mod classify_tests {
             classify_stderr("curl: (7) could not connect to host"),
             ErrorCategory::Transient
         );
+    }
+
+    // ─── Negative cases that lock in the && / || structure ──────
+
+    #[test]
+    fn killed_without_oom_is_transient_not_diskfull() {
+        // `killed` alone (no oom / OOM / out of memory nearby) is not
+        // resource exhaustion — could be SIGKILL from the orchestrator.
+        // Guards the outer `&&` in the DiskFull branch.
+        assert_eq!(
+            classify_stderr("process killed with signal 9"),
+            ErrorCategory::Transient
+        );
+    }
+
+    #[test]
+    fn killed_with_oom_is_diskfull() {
+        // Positive case of the same structure.
+        assert_eq!(
+            classify_stderr("process killed by OOM reaper"),
+            ErrorCategory::DiskFull
+        );
+    }
+
+    #[test]
+    fn failed_exit_without_builder_is_transient() {
+        // "failed with exit code" without "builder for " must NOT be
+        // classified as a terminal build failure — other tools use
+        // that phrase too. Guards the `&&` that requires BOTH.
+        assert_eq!(
+            classify_stderr("nix-daemon failed with exit code 3"),
+            ErrorCategory::Transient
+        );
+    }
+
+    #[test]
+    fn builder_for_alone_is_transient() {
+        // "builder for" without an exit-code or missing-output phrase
+        // is ambiguous; default transient. Guards the paired `&&`.
+        assert_eq!(
+            classify_stderr("note: builder for /nix/store/x.drv is running"),
+            ErrorCategory::Transient
+        );
+    }
+
+    #[test]
+    fn output_path_without_refer_to_is_transient() {
+        // "output path" alone (no "is not allowed to refer to") is not
+        // the reference-restriction build-failure message.
+        assert_eq!(
+            classify_stderr("output path /nix/store/foo has been uploaded"),
+            ErrorCategory::Transient
+        );
+    }
+
+    #[test]
+    fn output_path_reference_violation_is_build_failure() {
+        // Positive case for the paired `&&`.
+        assert_eq!(
+            classify_stderr("output path /nix/store/a is not allowed to refer to /nix/store/b"),
+            ErrorCategory::BuildFailure
+        );
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_respects_max_cap() {
+        // Any step ≥ log2(max/initial) must be clamped to `max`.
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_secs(10);
+        let mut any_nonzero = false;
+        for step in 0..20 {
+            let d = backoff_with_jitter(step, initial, max);
+            assert!(d <= max, "step={step} produced {d:?} > max {max:?}");
+            if !d.is_zero() {
+                any_nonzero = true;
+            }
+        }
+        // A mutant that replaces the whole fn with `Default::default()`
+        // (Duration::ZERO) would still satisfy <= max — pin it down by
+        // requiring at least one high-step result to actually be
+        // non-zero.
+        assert!(
+            any_nonzero,
+            "backoff with non-zero initial must produce non-zero durations"
+        );
+    }
+
+    #[test]
+    fn backoff_jitter_is_bounded_by_raw() {
+        // Full-jitter semantics: jittered ∈ [0, raw). Verify for a
+        // handful of steps that the returned duration never exceeds
+        // the pre-jitter cap.
+        let initial = Duration::from_millis(50);
+        let max = Duration::from_secs(2);
+        for step in 0..10 {
+            for _ in 0..20 {
+                let d = backoff_with_jitter(step, initial, max);
+                assert!(d <= max);
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_zero_initial_is_zero() {
+        // Guards against arithmetic that would blow up with a zero
+        // initial (e.g. division by zero in the jitter modulo).
+        let d = backoff_with_jitter(3, Duration::ZERO, Duration::from_secs(1));
+        assert_eq!(d, Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_shift_saturates_rather_than_overflowing() {
+        // Steps ≥ 17 are clamped internally so the u32::checked_shl
+        // doesn't overflow; the result should still respect `max`.
+        let d = backoff_with_jitter(100, Duration::from_millis(10), Duration::from_secs(5));
+        assert!(d <= Duration::from_secs(5));
     }
 }

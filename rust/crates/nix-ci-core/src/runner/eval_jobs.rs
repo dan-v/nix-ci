@@ -155,3 +155,76 @@ pub fn spawn(mode: EvalMode, workers: u32) -> Result<Spawned> {
 
     Ok(Spawned { rx, handle, kill })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_full_eval_line() {
+        // nix-eval-jobs 2.x shape with all fields.
+        let json = r#"{"drvPath":"/nix/store/abc-hello.drv","attr":"hello","name":"hello-2.12","cacheStatus":"notBuilt","neededBuilds":["/nix/store/abc-hello.drv","/nix/store/def-dep.drv"]}"#;
+        let line: EvalLine = serde_json::from_str(json).unwrap();
+        assert_eq!(line.drv_path.as_deref(), Some("/nix/store/abc-hello.drv"));
+        assert_eq!(line.attr.as_deref(), Some("hello"));
+        assert_eq!(line.name.as_deref(), Some("hello-2.12"));
+        assert_eq!(line.needed_builds.len(), 2);
+        assert!(line.error.is_none());
+    }
+
+    #[test]
+    fn parse_eval_line_with_error_attr() {
+        // Per-attr eval error: no drv_path, just attr + error.
+        let json = r#"{"attr":"broken","error":"undefined variable"}"#;
+        let line: EvalLine = serde_json::from_str(json).unwrap();
+        assert_eq!(line.attr.as_deref(), Some("broken"));
+        assert_eq!(line.error.as_deref(), Some("undefined variable"));
+        assert!(line.drv_path.is_none());
+    }
+
+    #[test]
+    fn parse_eval_line_with_legacy_is_cached_boolean() {
+        // Older nix-eval-jobs populates `isCached` instead of cacheStatus.
+        let json = r#"{"drvPath":"/nix/store/x-legacy.drv","attr":"x","isCached":true}"#;
+        let line: EvalLine = serde_json::from_str(json).unwrap();
+        assert_eq!(line.is_cached, Some(true));
+        assert!(line.cache_status.is_none());
+    }
+
+    #[test]
+    fn parse_eval_line_with_missing_neededbuilds_defaults_empty() {
+        // `neededBuilds` is absent in older releases — must default
+        // to empty rather than fail to parse.
+        let json = r#"{"drvPath":"/nix/store/y.drv","attr":"y"}"#;
+        let line: EvalLine = serde_json::from_str(json).unwrap();
+        assert!(line.needed_builds.is_empty());
+    }
+
+    #[test]
+    fn parse_eval_line_cachestatus_as_string_cached() {
+        let json = r#"{"drvPath":"/nix/store/z.drv","attr":"z","cacheStatus":"cached"}"#;
+        let line: EvalLine = serde_json::from_str(json).unwrap();
+        match line.cache_status {
+            Some(serde_json::Value::String(s)) => assert_eq!(s, "cached"),
+            other => panic!("expected cached string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_eval_line_rejects_malformed_json() {
+        let bad = "not json";
+        assert!(serde_json::from_str::<EvalLine>(bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn kill_handle_is_idempotent_when_child_missing() {
+        // Simulate post-exit state: inner slot holds None.
+        let k = KillHandle {
+            inner: Arc::new(Mutex::new(None)),
+        };
+        // First call is a no-op (no child).
+        k.kill().await;
+        // Second call must also not panic / deadlock.
+        k.kill().await;
+    }
+}

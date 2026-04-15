@@ -31,6 +31,7 @@ impl Drop for ServerHandle {
     }
 }
 
+#[allow(dead_code)]
 pub async fn spawn_server(pool: PgPool) -> ServerHandle {
     spawn_server_with_cfg(pool, |_| {}).await
 }

@@ -35,3 +35,7 @@ rand = "0.8"
 [features]
 default = []
 load-test = []
+# Enable the expensive randomized chaos harness (tests/chaos.rs).
+# Disabled by default so normal `cargo test` and tools like
+# cargo-mutants don't re-run it for every mutation.
+chaos-test = []

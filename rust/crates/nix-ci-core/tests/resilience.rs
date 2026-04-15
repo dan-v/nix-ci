@@ -12,9 +12,7 @@ use std::time::Duration;
 
 use common::{drv_path, spawn_server, spawn_server_with_cfg};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, IngestDrvRequest, JobStatus,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, IngestDrvRequest, JobStatus};
 use sqlx::PgPool;
 
 fn ingest(drv: &str, name: &str, deps: &[&str], is_root: bool) -> IngestDrvRequest {
@@ -119,7 +117,10 @@ async fn cancel_mid_flight_invalidates_claim(pool: PgPool) {
         .unwrap();
     assert_eq!(status_str, "cancelled");
     assert!(done_at.is_some());
-    assert!(result.is_some(), "cancelled job must have a result snapshot");
+    assert!(
+        result.is_some(),
+        "cancelled job must have a result snapshot"
+    );
 }
 
 #[sqlx::test]
@@ -291,7 +292,10 @@ async fn restart_cancels_in_flight_and_stale_complete_is_ignored(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(status_str, "cancelled");
-    assert!(result.is_some(), "cancelled job must have a result snapshot");
+    assert!(
+        result.is_some(),
+        "cancelled job must have a result snapshot"
+    );
 
     // The old worker's (belated) completion POST lands on the new
     // coordinator. The claim map is empty, so complete returns
@@ -364,21 +368,25 @@ async fn concurrent_cross_job_claim_exactly_one_winner(pool: PgPool) {
     // drv as either in-flight (None/204) or already-completed via
     // their job transitioning terminal (None/410).
     let mut joinset = tokio::task::JoinSet::new();
-    for (n, jid) in [(0u32, a.id), (1, a.id), (2, a.id), (3, a.id),
-                     (4, b.id), (5, b.id), (6, b.id), (7, b.id)]
-    {
+    for (n, jid) in [
+        (0u32, a.id),
+        (1, a.id),
+        (2, a.id),
+        (3, a.id),
+        (4, b.id),
+        (5, b.id),
+        (6, b.id),
+        (7, b.id),
+    ] {
         let client = CoordinatorClient::new(&handle.base_url);
-        joinset.spawn(async move {
-            (
-                n,
-                jid,
-                client.claim(jid, "x86_64-linux", &[], 3).await,
-            )
-        });
+        joinset.spawn(async move { (n, jid, client.claim(jid, "x86_64-linux", &[], 3).await) });
     }
 
-    let mut winners: Vec<(u32, nix_ci_core::types::JobId, nix_ci_core::types::ClaimResponse)> =
-        Vec::new();
+    let mut winners: Vec<(
+        u32,
+        nix_ci_core::types::JobId,
+        nix_ci_core::types::ClaimResponse,
+    )> = Vec::new();
     let mut non_winners = 0;
     while let Some(r) = joinset.join_next().await {
         let (n, jid, res) = r.unwrap();
@@ -532,8 +540,16 @@ async fn propagated_failures_stay_in_owning_submission(pool: PgPool) {
     let a_status = client.status(a.id).await.unwrap();
     let b_status = client.status(b.id).await.unwrap();
 
-    let a_hashes: Vec<_> = a_status.failures.iter().map(|f| f.drv_hash.clone()).collect();
-    let b_hashes: Vec<_> = b_status.failures.iter().map(|f| f.drv_hash.clone()).collect();
+    let a_hashes: Vec<_> = a_status
+        .failures
+        .iter()
+        .map(|f| f.drv_hash.clone())
+        .collect();
+    let b_hashes: Vec<_> = b_status
+        .failures
+        .iter()
+        .map(|f| f.drv_hash.clone())
+        .collect();
 
     let shared_hash = nix_ci_core::types::drv_hash_from_path(&shared).unwrap();
     let gcc_hash = nix_ci_core::types::drv_hash_from_path(&gcc).unwrap();
@@ -670,7 +686,10 @@ async fn concurrent_complete_same_claim_exactly_one_wins(pool: PgPool) {
     let winners = ignored.iter().filter(|i| !**i).count();
     let losers = ignored.iter().filter(|i| **i).count();
     assert_eq!(winners, 1, "exactly one complete must win, got {ignored:?}");
-    assert_eq!(losers, 1, "exactly one complete must see ignored=true, got {ignored:?}");
+    assert_eq!(
+        losers, 1,
+        "exactly one complete must see ignored=true, got {ignored:?}"
+    );
 
     assert_eq!(wait_for_terminal(&client, job.id).await, JobStatus::Done);
 }

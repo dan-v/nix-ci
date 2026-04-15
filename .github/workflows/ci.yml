@@ -3,6 +3,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # 03:17 UTC daily — runs the scale-chaos job that's too heavy per-PR.
+    - cron: '17 3 * * *'
 
 jobs:
   # Fast checks: no Postgres needed.
@@ -65,6 +68,165 @@ jobs:
       - name: integration tests
         working-directory: rust
         run: cargo test -p nix-ci-core --tests
+
+  miri:
+    name: miri (UB + data-race detection on unit tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: miri
+      - name: miri setup
+        working-directory: rust
+        run: cargo miri setup
+      - name: miri test
+        working-directory: rust
+        env:
+          # Disable isolation so miri can allocate / use the real clock
+          # where necessary. Our lib-level unit tests are pure so this
+          # is conservative.
+          MIRIFLAGS: -Zmiri-disable-isolation
+        # Skip drain_tests — they build a tokio runtime which calls
+        # kqueue/epoll, neither of which miri implements.
+        run: cargo miri test -p nix-ci-core --lib -- --skip drain_tests
+
+  chaos-scale:
+    name: chaos (production-scale nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Only run on schedule and pushes to main — too heavy per-PR.
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nix_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/nix_ci_test
+      CHAOS_ITERS: "3"
+      CHAOS_JOBS: "200"
+      CHAOS_WORKERS: "64"
+      CHAOS_DAG_MAX: "40"
+      CHAOS_BUDGET_SECS: "600"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: scale chaos
+        working-directory: rust
+        run: cargo test -p nix-ci-core --features chaos-test --test chaos --release -- --nocapture
+
+  chaos:
+    name: chaos (randomized end-to-end stress)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nix_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/nix_ci_test
+      CHAOS_ITERS: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: chaos
+        working-directory: rust
+        run: cargo test -p nix-ci-core --features chaos-test --test chaos --release -- --nocapture
+
+  tsan:
+    name: ThreadSanitizer (dispatcher property tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: tsan
+      - name: tsan (dispatcher property tests)
+        working-directory: rust
+        # Limit to property.rs — it doesn't touch tokio/sqlx/reqwest,
+        # which produce copious false-positives under TSan (the
+        # parking_lot + tokio combination is known-noisy). Catches real
+        # data races in our dispatcher primitives specifically.
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          RUSTDOCFLAGS: "-Zsanitizer=thread"
+        run: |
+          cargo +nightly test \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -p nix-ci-core \
+            --test property \
+            --release
+
+  coverage:
+    name: coverage (cargo llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nix_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/nix_ci_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: coverage
+        working-directory: rust
+        run: cargo llvm-cov --package nix-ci-core --tests --lcov --output-path lcov.info --ignore-filename-regex 'tests/|chaos'
+      - name: summary
+        working-directory: rust
+        run: cargo llvm-cov report --package nix-ci-core
 
   nix-flake-check:
     name: nix flake check

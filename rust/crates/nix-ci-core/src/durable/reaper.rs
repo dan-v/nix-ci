@@ -116,8 +116,7 @@ pub async fn reap_stale_jobs(
     // Drop any in-memory claims whose job was just reaped. Without this
     // they'd linger until the claim_deadline (hours) inflating the
     // `claims_in_flight` gauge and holding a reference to the drv.
-    let reaped: std::collections::HashSet<JobId> =
-        stale_ids.iter().map(|(u,)| JobId(*u)).collect();
+    let reaped: std::collections::HashSet<JobId> = stale_ids.iter().map(|(u,)| JobId(*u)).collect();
     let expired: Vec<_> = dispatcher
         .claims
         .all()

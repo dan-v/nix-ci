@@ -83,3 +83,53 @@ impl StepsRegistry {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_step(name: &str) -> Arc<Step> {
+        let hash = DrvHash::new(format!("{name}.drv"));
+        Step::new(
+            hash.clone(),
+            format!("/nix/store/{hash}"),
+            name.to_string(),
+            "x86_64-linux".into(),
+            Vec::new(),
+            2,
+        )
+    }
+
+    #[test]
+    fn len_and_is_empty_track_inserts_linearly() {
+        let reg = StepsRegistry::new();
+        assert_eq!(reg.len(), 0);
+        assert!(reg.is_empty());
+        let (_s1, _) = reg.get_or_create(&DrvHash::new("a.drv"), || mk_step("a"));
+        assert_eq!(reg.len(), 1);
+        let (_s2, _) = reg.get_or_create(&DrvHash::new("b.drv"), || mk_step("b"));
+        assert_eq!(reg.len(), 2);
+        let (_s3, _) = reg.get_or_create(&DrvHash::new("c.drv"), || mk_step("c"));
+        assert_eq!(reg.len(), 3);
+        // Dedup insert does not grow len.
+        let (_dup, is_new) = reg.get_or_create(&DrvHash::new("a.drv"), || mk_step("a"));
+        assert!(!is_new);
+        assert_eq!(reg.len(), 3);
+        assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn is_empty_after_weak_refs_drop() {
+        let reg = StepsRegistry::new();
+        {
+            let (_step, _) = reg.get_or_create(&DrvHash::new("b.drv"), || mk_step("b"));
+            // `_step` dropped at end of scope — registry holds only a
+            // Weak, so the Arc is gone.
+        }
+        // `len()` still counts the weak entry; `live()` GCs it.
+        assert_eq!(reg.len(), 1);
+        let live = reg.live();
+        assert!(live.is_empty());
+        assert!(reg.is_empty());
+    }
+}

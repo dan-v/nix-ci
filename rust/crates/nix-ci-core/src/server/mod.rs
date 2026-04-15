@@ -110,7 +110,10 @@ where
 {
     for (name, handle) in handles {
         let abort = handle.abort_handle();
-        if tokio::time::timeout(per_task_timeout, handle).await.is_err() {
+        if tokio::time::timeout(per_task_timeout, handle)
+            .await
+            .is_err()
+        {
             tracing::warn!(task = %name, "shutdown: task overran drain; aborting");
             abort.abort();
         }
@@ -171,6 +174,9 @@ mod drain_tests {
             "drain must return promptly after timeout, took {elapsed:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(abort_flag.is_finished(), "stuck task must have been aborted");
+        assert!(
+            abort_flag.is_finished(),
+            "stuck task must have been aborted"
+        );
     }
 }

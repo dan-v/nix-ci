@@ -41,6 +41,19 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 }
 
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    // Refresh snapshot gauges on every scrape so Prometheus sees
+    // current dispatcher size rather than zero.
+    state
+        .metrics
+        .inner
+        .submissions_active
+        .set(state.dispatcher.submissions.len() as i64);
+    state
+        .metrics
+        .inner
+        .steps_registry_size
+        .set(state.dispatcher.steps.len() as i64);
+
     let body = state.metrics.render();
     let mut headers = HeaderMap::new();
     headers.insert(

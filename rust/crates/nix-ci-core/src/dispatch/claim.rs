@@ -10,6 +10,7 @@ use parking_lot::RwLock;
 
 use crate::types::{ClaimId, DrvHash, JobId};
 
+#[derive(Clone)]
 pub struct ActiveClaim {
     pub claim_id: ClaimId,
     pub job_id: JobId,
@@ -67,5 +68,67 @@ impl Claims {
     /// of lingering until their deadline.
     pub fn all(&self) -> Vec<Arc<ActiveClaim>> {
         self.inner.read().values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn mk_claim(deadline: Instant) -> Arc<ActiveClaim> {
+        Arc::new(ActiveClaim {
+            claim_id: ClaimId::new(),
+            job_id: JobId::new(),
+            drv_hash: DrvHash::new("drv-test.drv"),
+            attempt: 1,
+            deadline,
+        })
+    }
+
+    #[test]
+    fn is_empty_and_len_track_inserts_and_takes() {
+        let c = Claims::new();
+        assert!(c.is_empty());
+        assert_eq!(c.len(), 0);
+        let claim = mk_claim(Instant::now() + Duration::from_secs(60));
+        let cid = claim.claim_id;
+        c.insert(claim);
+        assert!(!c.is_empty());
+        assert_eq!(c.len(), 1);
+        let _ = c.take(cid).expect("present");
+        assert!(c.is_empty());
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn expired_ids_returns_only_past_deadlines() {
+        let c = Claims::new();
+        let now = Instant::now();
+        let past = mk_claim(now - Duration::from_secs(5));
+        let exactly_now = mk_claim(now);
+        let future = mk_claim(now + Duration::from_secs(60));
+        let past_id = past.claim_id;
+        let now_id = exactly_now.claim_id;
+        let future_id = future.claim_id;
+        c.insert(past);
+        c.insert(exactly_now);
+        c.insert(future);
+
+        // `<= now` semantics: both past and exactly-now expire; future
+        // does not.
+        let expired: std::collections::HashSet<ClaimId> = c.expired_ids(now).into_iter().collect();
+        let want: std::collections::HashSet<ClaimId> = [past_id, now_id].into_iter().collect();
+        assert_eq!(expired, want);
+        assert!(!expired.contains(&future_id));
+    }
+
+    #[test]
+    fn expired_ids_empty_when_no_claims_past_deadline() {
+        let c = Claims::new();
+        let now = Instant::now();
+        c.insert(mk_claim(now + Duration::from_secs(60)));
+        c.insert(mk_claim(now + Duration::from_secs(120)));
+        assert!(c.expired_ids(now).is_empty());
     }
 }

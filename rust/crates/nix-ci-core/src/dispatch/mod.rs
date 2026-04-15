@@ -1,8 +1,48 @@
-//! In-memory dispatch engine. The eight invariants documented across
-//! this module (steps dedup, make_rdeps_runnable monotonicity, CAS-
-//! exactly-once on runnable, created-before-runnable, no-await-under-
-//! lock, consistent lock ordering, weak-registry ownership, strong-
-//! Submission-owns-members) are the correctness contract.
+//! In-memory dispatch engine.
+//!
+//! # The 8 invariants (correctness contract)
+//!
+//! References elsewhere in this module say "Invariant N"; the canonical
+//! numbering lives here.
+//!
+//! 1. **Steps dedup**. A given `drv_hash` resolves to at most one live
+//!    `Arc<Step>` across the whole process. `StepsRegistry::get_or_create`
+//!    is the only way a Step is minted.
+//!
+//! 2. **`make_rdeps_runnable` monotonicity**. Each call to
+//!    `make_rdeps_runnable(step)` removes `step` from every rdep's deps
+//!    set. An rdep flips to `runnable=true` only when its deps set
+//!    becomes empty AND `created=true`. Never unflips.
+//!
+//! 3. **CAS-exactly-once on `runnable`**. `pop_runnable` uses a
+//!    `compare_exchange(true, false, AcqRel, Acquire)` on `Step::runnable`
+//!    so across all submissions sharing the step, exactly one worker
+//!    wins the claim.
+//!
+//! 4. **Created-before-runnable**. A fresh Step must have every dep
+//!    edge attached and `created=true` stored with `Release` *before*
+//!    it is ever armed `runnable=true`. Rdep-walk depends on this to
+//!    avoid arming a still-being-built Step.
+//!
+//! 5. **No `await` under a lock**. No code path holds a `parking_lot`
+//!    guard across an `.await`. All async handlers take snapshots under
+//!    the lock, drop it, then await outside.
+//!
+//! 6. **Consistent `Step::state` lock order**. Callers that need to
+//!    mutate two `Step::state`s mutate the "child" (new step) first,
+//!    then the "dep". Acyclic DAG + narrow critical sections prevent
+//!    deadlock.
+//!
+//! 7. **Weak-registry ownership**. The `StepsRegistry` holds `Weak<Step>`
+//!    only. Strong references live in `Submission::members` and
+//!    `Submission::toplevels`. When the last submission referencing a
+//!    Step drops, the Step is GC'd; the registry lazily reaps dead
+//!    weaks in `live()`.
+//!
+//! 8. **Strong-Submission-owns-members**. Each `Submission` keeps a
+//!    `HashMap<DrvHash, Arc<Step>>` of every step it references (root
+//!    or transitive dep), ensuring lifetime spans the submission. Rdep
+//!    lists and submission back-edges are `Weak` to avoid cycles.
 
 pub mod claim;
 pub mod rdep;

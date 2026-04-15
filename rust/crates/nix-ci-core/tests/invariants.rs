@@ -58,8 +58,7 @@ fn invariant_3_dedup_returns_same_arc() {
     });
     assert!(a_new);
 
-    let (b_step, b_new) =
-        registry.get_or_create(&hash, || panic!("factory must not run on dup"));
+    let (b_step, b_new) = registry.get_or_create(&hash, || panic!("factory must not run on dup"));
     assert!(!b_new);
 
     assert!(Arc::ptr_eq(&a_step, &b_step));
