@@ -399,7 +399,14 @@ pub(super) async fn check_and_publish_terminal(
     // their receiver until the broadcast Sender is dropped with the
     // last Arc<Submission>. New subscribers get 404 and should poll
     // `/jobs/{id}` for the terminal result instead.
+    //
+    // Also evict any in-flight claims tied to this job. In the common
+    // graceful path no claims should be outstanding (all toplevels
+    // were finished, which means their claims already completed),
+    // but in production we have observed orphan claims survive past
+    // termination — defensively cleanup so the gauge stays honest.
     state.dispatcher.submissions.remove(sub.id);
+    state.dispatcher.evict_claims_for(sub.id);
     Ok(())
 }
 

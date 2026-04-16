@@ -92,4 +92,29 @@ impl Dispatcher {
     pub fn wake(&self) {
         self.notify.notify_waiters();
     }
+
+    /// Evict every in-flight claim tied to `job_id` and decrement the
+    /// `claims_in_flight` gauge accordingly. Must be called whenever a
+    /// submission is removed for ANY reason (cancel, fail, graceful
+    /// Done, heartbeat-reaped) — otherwise the orphan claims linger
+    /// in the map until their deadline expires (potentially many
+    /// minutes later), inflating the gauge and pinning the step's
+    /// drv_hash. Returns the count evicted (for tests / metrics).
+    pub fn evict_claims_for(&self, job_id: crate::types::JobId) -> u64 {
+        let evicted: Vec<_> = self
+            .claims
+            .all()
+            .into_iter()
+            .filter(|c| c.job_id == job_id)
+            .map(|c| c.claim_id)
+            .collect();
+        let mut n: u64 = 0;
+        for cid in evicted {
+            if self.claims.take(cid).is_some() {
+                self.metrics.inner.claims_in_flight.dec();
+                n += 1;
+            }
+        }
+        n
+    }
 }

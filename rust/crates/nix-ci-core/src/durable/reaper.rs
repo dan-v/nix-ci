@@ -104,29 +104,16 @@ pub async fn reap_stale_jobs(
         }
 
         if let Some(sub) = dispatcher.submissions.remove(job_id) {
+            // Evict in-flight claims for the reaped job in the same
+            // step so the gauge balances and we don't pin the step's
+            // drv_hash until the claim's deadline.
+            dispatcher.evict_claims_for(job_id);
             if sub.mark_terminal() {
                 sub.publish(crate::types::JobEvent::JobDone {
                     status: JobStatus::Cancelled,
                     failures: vec![],
                 });
             }
-        }
-    }
-
-    // Drop any in-memory claims whose job was just reaped. Without this
-    // they'd linger until the claim_deadline (hours) inflating the
-    // `claims_in_flight` gauge and holding a reference to the drv.
-    let reaped: std::collections::HashSet<JobId> = stale_ids.iter().map(|(u,)| JobId(*u)).collect();
-    let expired: Vec<_> = dispatcher
-        .claims
-        .all()
-        .into_iter()
-        .filter(|c| reaped.contains(&c.job_id))
-        .map(|c| c.claim_id)
-        .collect();
-    for claim_id in expired {
-        if dispatcher.claims.take(claim_id).is_some() {
-            dispatcher.metrics.inner.claims_in_flight.dec();
         }
     }
 

@@ -146,6 +146,10 @@ fn finish_in_memory(state: &AppState, id: JobId, status: JobStatus, failures: Ve
     let Some(sub) = state.dispatcher.submissions.remove(id) else {
         return;
     };
+    // Cancel/fail can race with in-flight workers — drop their claims
+    // synchronously so the gauge balances and we don't pin the step's
+    // drv_hash until the claim's deadline expires.
+    state.dispatcher.evict_claims_for(id);
     if sub.mark_terminal() {
         sub.publish(JobEvent::JobDone { status, failures });
     }
