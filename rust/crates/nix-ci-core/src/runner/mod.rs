@@ -3,6 +3,7 @@
 //! coordinator outage fails the run loudly rather than silently
 //! degrading to local-only builds (which would hide outages from ops).
 
+pub mod artifacts;
 pub mod drv_parser;
 pub mod drv_walk;
 pub mod eval_jobs;

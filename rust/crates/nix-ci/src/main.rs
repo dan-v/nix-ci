@@ -151,6 +151,12 @@ struct RunCmd {
     /// debugging a specific build, noisy at scale.
     #[arg(short, long)]
     verbose: bool,
+    /// Write failure logs and eval stderr to this directory for CI
+    /// artifact collection. CCI picks them up automatically.
+    /// Creates `build_logs/<drv_name>.log` for each failed drv and
+    /// `eval.stderr` with nix-eval-jobs diagnostic output.
+    #[arg(long)]
+    artifacts_dir: Option<std::path::PathBuf>,
     /// Attributes to evaluate (positional). Required with --flake.
     attrs: Vec<String>,
 }
@@ -599,6 +605,7 @@ async fn run_cmd(cmd: RunCmd) -> anyhow::Result<()> {
         mode,
         cfg,
         external_ref: cmd.external_ref,
+        artifacts_dir: cmd.artifacts_dir,
     })
     .await?;
 

@@ -72,7 +72,15 @@ pub struct Spawned {
     pub kill: KillHandle,
 }
 
-pub fn spawn(mode: EvalMode, workers: u32) -> Result<Spawned> {
+/// `eval_stderr_file`: when `Some`, nix-eval-jobs stderr is redirected
+/// to this file instead of inheriting the process stderr. Keeps the
+/// runner's OutputRenderer output clean; noisy eval diagnostics land
+/// in a file CCI can pick up as a build artifact.
+pub fn spawn(
+    mode: EvalMode,
+    workers: u32,
+    eval_stderr_file: Option<&std::path::Path>,
+) -> Result<Spawned> {
     let mut cmd = Command::new("nix-eval-jobs");
     cmd.arg("--workers")
         .arg(workers.to_string())
@@ -90,9 +98,17 @@ pub fn spawn(mode: EvalMode, workers: u32) -> Result<Spawned> {
             cmd.arg("--expr").arg(e);
         }
     }
+    let stderr = match eval_stderr_file {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .map_err(|e| Error::Internal(format!("create eval stderr file: {e}")))?;
+            std::process::Stdio::from(file)
+        }
+        None => std::process::Stdio::inherit(),
+    };
     cmd.kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(stderr);
 
     let mut child = cmd
         .spawn()

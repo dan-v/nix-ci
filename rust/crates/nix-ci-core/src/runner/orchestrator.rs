@@ -11,7 +11,7 @@ use crate::config::RunnerConfig;
 use crate::error::{Error, Result};
 use crate::runner::eval_jobs::EvalMode;
 use crate::runner::worker::{ClaimMode, WorkerConfig};
-use crate::runner::{sse, submitter, worker};
+use crate::runner::{artifacts, sse, submitter, worker};
 use crate::types::{CreateJobRequest, JobId, JobStatus};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -20,6 +20,9 @@ pub struct RunArgs {
     pub mode: EvalMode,
     pub cfg: RunnerConfig,
     pub external_ref: Option<String>,
+    /// When set, failure logs and eval stderr are written to this
+    /// directory for CI artifact collection.
+    pub artifacts_dir: Option<std::path::PathBuf>,
 }
 
 pub struct RunOutcome {
@@ -96,12 +99,28 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
         tokio::spawn(async move { run_heartbeat(client, job_id, rx).await })
     };
 
+    // Artifacts directory (optional). When set, eval stderr goes to a
+    // file and failure logs are collected after the run.
+    let eval_stderr_path = args.artifacts_dir.as_ref().and_then(|dir| {
+        match artifacts::prepare_artifacts_dir(dir) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %dir.display(), "artifacts: dir setup failed; eval stderr will go to console");
+                None
+            }
+        }
+    });
+
     // Drive the submitter in-line
     let crate::runner::eval_jobs::Spawned {
         rx: eval_rx,
         handle: eval_handle,
         kill: eval_kill,
-    } = crate::runner::eval_jobs::spawn(args.mode, args.cfg.eval_workers)?;
+    } = crate::runner::eval_jobs::spawn(
+        args.mode,
+        args.cfg.eval_workers,
+        eval_stderr_path.as_deref(),
+    )?;
 
     // On shutdown mid-eval, kill the child so `nix-ci run` doesn't
     // hang waiting for nix-eval-jobs to finish.
@@ -141,6 +160,21 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
     let _ = shutdown_tx.send(true);
     let _ = worker_handle.await;
     let _ = heartbeat_handle.await;
+
+    // Collect failure logs to disk for CCI artifact pickup. Best-effort:
+    // a failure here is logged but doesn't change the run's exit status.
+    if let Some(dir) = &args.artifacts_dir {
+        if status == JobStatus::Failed {
+            match client.status(job_id).await {
+                Ok(snap) => {
+                    artifacts::collect_failure_logs(&client, job_id, &snap, dir).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "artifacts: couldn't fetch terminal snapshot");
+                }
+            }
+        }
+    }
 
     Ok(RunOutcome { status })
 }
