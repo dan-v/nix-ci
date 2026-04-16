@@ -169,12 +169,14 @@ fn issue_claim(
     let wall_deadline =
         Utc::now() + chrono::Duration::from_std(deadline_duration).unwrap_or_default();
 
+    let now = Instant::now();
     state.dispatcher.claims.insert(Arc::new(ActiveClaim {
         claim_id,
         job_id,
         drv_hash: step.drv_hash().clone(),
         attempt,
-        deadline: Instant::now() + deadline_duration,
+        deadline: now + deadline_duration,
+        started_at: now,
     }));
 
     sub.publish(JobEvent::DrvStarted {

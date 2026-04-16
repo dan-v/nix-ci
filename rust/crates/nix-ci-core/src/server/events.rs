@@ -35,17 +35,49 @@ pub async fn events(State(state): State<AppState>, Path(id): Path<JobId>) -> Res
     let tick = Duration::from_secs(state.cfg.progress_tick_secs);
     let keepalive = Duration::from_secs(state.cfg.sse_keepalive_secs);
     let progress = async_stream::stream! {
+        use std::sync::atomic::Ordering;
         let mut ticker = tokio::time::interval(tick);
         ticker.tick().await; // skip immediate fire
         loop {
             ticker.tick().await;
-            if let Some(sub) = progress_state.dispatcher.submissions.get(progress_id) {
-                yield Ok::<Event, Infallible>(event_from(&JobEvent::Progress {
-                    counts: sub.live_counts(),
-                }));
-            } else {
+            let Some(sub) = progress_state.dispatcher.submissions.get(progress_id) else {
                 break;
-            }
+            };
+            // Build the in-flight list from this job's claims. Each
+            // claim has a started_at; we report wall-clock millis so
+            // the runner can compute "elapsed = now_ms - started_at_ms".
+            let now_wall = chrono::Utc::now().timestamp_millis();
+            let now_mono = std::time::Instant::now();
+            let mut in_flight: Vec<crate::types::DrvInFlight> = progress_state
+                .dispatcher
+                .claims
+                .all()
+                .into_iter()
+                .filter(|c| c.job_id == progress_id)
+                .map(|c| {
+                    let elapsed_ms = now_mono.saturating_duration_since(c.started_at).as_millis() as i64;
+                    let drv_name = progress_state
+                        .dispatcher
+                        .steps
+                        .get(&c.drv_hash)
+                        .map(|s| s.drv_name().to_string())
+                        .unwrap_or_else(|| c.drv_hash.as_str().to_string());
+                    crate::types::DrvInFlight {
+                        drv_name,
+                        started_at_ms: now_wall - elapsed_ms,
+                    }
+                })
+                .collect();
+            // Stable sort: longest-running first — those are the
+            // interesting ones for "what's blocking the run".
+            in_flight.sort_by_key(|d| d.started_at_ms);
+            yield Ok::<Event, Infallible>(event_from(&JobEvent::Progress {
+                counts: sub.live_counts(),
+                in_flight,
+                propagated_failed: sub.propagated_failed.load(Ordering::Acquire),
+                transient_retries: sub.transient_retries.load(Ordering::Acquire),
+                sealed: sub.is_sealed(),
+            }));
         }
     };
 

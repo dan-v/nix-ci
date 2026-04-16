@@ -218,6 +218,11 @@ async fn handle_flaky_retry(
         crate::dispatch::rdep::enqueue_for_all_submissions(step);
     }
     let subs = collect_submissions(step);
+    // Track per-submission flakiness counts so the runner can surface
+    // "X transient retries" in progress + summary.
+    for sub in &subs {
+        sub.transient_retries.fetch_add(1, Ordering::Relaxed);
+    }
     publish_drv_failed(&subs, step, category, &req, attempt, true);
     state
         .metrics
@@ -244,7 +249,13 @@ fn publish_drv_failed(
     attempt: i32,
     will_retry: bool,
 ) {
+    // Per-submission attribution: walk this step's rdep closure (within
+    // each submission's own membership) to find the toplevels affected,
+    // then resolve their attr names from `Submission::root_attrs`. This
+    // lets the runner say "FAILED gcc-13.2.0, used by:
+    // packages.x86_64-linux.hello".
     for sub in subs {
+        let used_by_attrs = compute_used_by_attrs(sub, step);
         sub.publish(JobEvent::DrvFailed {
             drv_hash: step.drv_hash().clone(),
             drv_name: step.drv_name().to_string(),
@@ -253,8 +264,59 @@ fn publish_drv_failed(
             log_tail: req.log_tail.clone(),
             attempt,
             will_retry,
+            used_by_attrs,
         });
     }
+}
+
+/// For a failed step `s` in submission `sub`, find every toplevel of
+/// `sub` that transitively depends on `s`, and look up its attr name
+/// in `sub.root_attrs`. BFS over rdep weak refs scoped to this
+/// submission's members so we don't bleed across jobs.
+fn compute_used_by_attrs(sub: &Arc<Submission>, s: &Arc<crate::dispatch::Step>) -> Vec<String> {
+    use std::collections::{HashSet, VecDeque};
+    let toplevel_hashes: HashSet<crate::types::DrvHash> = sub
+        .toplevels
+        .read()
+        .iter()
+        .map(|t| t.drv_hash().clone())
+        .collect();
+    let members: std::collections::HashSet<crate::types::DrvHash> =
+        sub.members.read().keys().cloned().collect();
+    let root_attrs = sub.root_attrs.read();
+
+    let mut visited: HashSet<crate::types::DrvHash> = HashSet::new();
+    let mut frontier: VecDeque<Arc<crate::dispatch::Step>> = VecDeque::new();
+    frontier.push_back(s.clone());
+    let mut hits: Vec<String> = Vec::new();
+    while let Some(curr) = frontier.pop_front() {
+        if !visited.insert(curr.drv_hash().clone()) {
+            continue;
+        }
+        // Drop rdeps that aren't members of THIS submission — they
+        // belong to a different job's closure.
+        if !members.contains(curr.drv_hash()) {
+            continue;
+        }
+        if toplevel_hashes.contains(curr.drv_hash()) {
+            // Prefer the explicit attr name; fall back to drv_name so
+            // the message is still useful for older clients.
+            let label = root_attrs
+                .get(curr.drv_hash())
+                .cloned()
+                .unwrap_or_else(|| curr.drv_name().to_string());
+            if !hits.contains(&label) {
+                hits.push(label);
+            }
+        }
+        for w in &curr.state.read().rdeps {
+            if let Some(r) = w.upgrade() {
+                frontier.push_back(r);
+            }
+        }
+    }
+    hits.sort();
+    hits
 }
 
 /// Cap the terminal `failures` snapshot to keep the `jobs.result`
@@ -319,6 +381,8 @@ fn propagate_failure_inmem(root: &Arc<crate::dispatch::Step>, origin: &DrvHash) 
                 log_tail: None,
                 propagated_from: Some(origin.clone()),
             });
+            // Per-submission count for the runner's progress display.
+            sub.propagated_failed.fetch_add(1, Ordering::Relaxed);
         }
 
         let next: Vec<Arc<crate::dispatch::Step>> = {

@@ -102,6 +102,15 @@ pub async fn submit_batch(
         }
         if req_drv.is_root {
             sub.add_root(step.clone());
+            // Attribution: store the attr name (if the client supplied
+            // one) keyed on the toplevel's drv_hash. The failure path
+            // walks rdeps → toplevels to look up which attrs are
+            // affected when a drv fails.
+            if let Some(attr) = req_drv.attr.as_deref() {
+                sub.root_attrs
+                    .write()
+                    .insert(step.drv_hash().clone(), attr.to_string());
+            }
         }
         if *is_new {
             new_drvs += 1;

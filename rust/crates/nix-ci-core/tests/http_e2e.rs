@@ -19,6 +19,7 @@ fn ingest(drv: &str, name: &str, deps: &[&str], is_root: bool) -> IngestDrvReque
         required_features: vec![],
         input_drvs: deps.iter().map(|s| s.to_string()).collect(),
         is_root,
+        attr: None,
     }
 }
 

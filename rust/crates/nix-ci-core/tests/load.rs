@@ -116,6 +116,7 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
             required_features: vec![],
             input_drvs: vec![],
             is_root: false,
+            attr: None,
         };
         client.ingest_drv(job.id, &req).await.unwrap();
     }
@@ -136,6 +137,7 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
                 required_features: vec![],
                 input_drvs: deps.into_iter().collect(),
                 is_root,
+                attr: None,
             };
             client.ingest_drv(job.id, &req).await.unwrap();
         }

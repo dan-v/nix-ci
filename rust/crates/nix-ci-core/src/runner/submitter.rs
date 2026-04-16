@@ -112,11 +112,23 @@ pub async fn run(
             }
         };
 
-        let drvs: Vec<_> = walked
+        let mut drvs: Vec<_> = walked
             .into_iter()
             .filter(|w| submitted.insert(w.drv_path.clone()))
             .map(drv_walk::WalkedDrv::into_request)
             .collect();
+        // Attach the human-readable attr name to the root drv so the
+        // server can later say "FAILED gcc-13.2.0, used by:
+        // packages.x86_64-linux.hello" instead of just the drv_name.
+        // Only the root from THIS eval line gets it — transitive deps
+        // don't have a direct attr identity.
+        if let Some(attr_name) = line.attr.as_deref() {
+            for d in drvs.iter_mut() {
+                if d.is_root && d.drv_path == root_drv {
+                    d.attr = Some(attr_name.to_string());
+                }
+            }
+        }
         if drvs.is_empty() {
             continue;
         }

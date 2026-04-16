@@ -22,6 +22,7 @@ fn ingest(drv: &str, name: &str, deps: &[&str], is_root: bool) -> IngestDrvReque
         required_features: vec![],
         input_drvs: deps.iter().map(|s| s.to_string()).collect(),
         is_root,
+        attr: None,
     }
 }
 
@@ -42,6 +43,7 @@ async fn ingest_rejects_empty_drv_path(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: true,
+        attr: None,
     };
     let err = client.ingest_drv(job.id, &bad).await.unwrap_err();
     match err {
@@ -66,6 +68,7 @@ async fn ingest_rejects_malformed_drv_path(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: true,
+        attr: None,
     };
     let err = client.ingest_drv(job.id, &bad).await.unwrap_err();
     match err {
@@ -90,6 +93,7 @@ async fn ingest_batch_partial_validation_counts_errors(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: false,
+        attr: None,
     };
     let bad_nohyphen = IngestDrvRequest {
         drv_path: "/nix/store/nohyphen.drv".into(),
@@ -98,6 +102,7 @@ async fn ingest_batch_partial_validation_counts_errors(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: false,
+        attr: None,
     };
     let batch = IngestBatchRequest {
         drvs: vec![ingest(&good, "pkg", &[], true), bad_empty, bad_nohyphen],
@@ -181,6 +186,7 @@ async fn worker_without_required_feature_never_claims(pool: PgPool) {
         required_features: vec!["kvm".into()],
         input_drvs: vec![],
         is_root: true,
+        attr: None,
     };
     client.ingest_drv(job.id, &req).await.unwrap();
     client.seal(job.id).await.unwrap();
@@ -216,6 +222,7 @@ async fn worker_with_wrong_system_never_claims(pool: PgPool) {
                 required_features: vec![],
                 input_drvs: vec![],
                 is_root: true,
+                attr: None,
             },
         )
         .await
@@ -1047,6 +1054,10 @@ async fn sse_lagged_event_fires_when_subscriber_falls_behind(pool: PgPool) {
                 pending: i,
                 ..Default::default()
             },
+            in_flight: vec![],
+            propagated_failed: 0,
+            transient_retries: 0,
+            sealed: false,
         });
     }
 
@@ -1158,6 +1169,7 @@ async fn ingest_length_boundaries_accept_at_max_reject_above(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: true,
+        attr: None,
     };
     let resp = client
         .ingest_batch(job.id, &IngestBatchRequest { drvs: vec![at_cap] })
@@ -1174,6 +1186,7 @@ async fn ingest_length_boundaries_accept_at_max_reject_above(pool: PgPool) {
         required_features: vec![],
         input_drvs: vec![],
         is_root: true,
+        attr: None,
     };
     let resp = client
         .ingest_batch(
@@ -1497,6 +1510,10 @@ async fn broadcast_preserves_per_subscriber_publish_order(pool: PgPool) {
                 total: i,
                 ..Default::default()
             },
+            in_flight: vec![],
+            propagated_failed: 0,
+            transient_retries: 0,
+            sealed: false,
         });
     }
 
@@ -1509,7 +1526,7 @@ async fn broadcast_preserves_per_subscriber_publish_order(pool: PgPool) {
                 .expect("stream yields within timeout")
                 .expect("stream open")
                 .expect("not lagged");
-            if let JobEvent::Progress { counts } = ev {
+            if let JobEvent::Progress { counts, .. } = ev {
                 totals.push(counts.total);
             } else {
                 panic!("unexpected event type");

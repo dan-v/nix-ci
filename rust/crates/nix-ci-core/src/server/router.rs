@@ -18,6 +18,14 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Jobs
         .route("/jobs", post(jobs::create))
+        .route("/jobs", get(jobs::list))
+        // Operator lookup by caller-supplied external_ref (e.g. CCI
+        // build ID, PR number). Slug-style path so refs with `/` or
+        // `:` still route correctly.
+        .route(
+            "/jobs/by-external-ref/{external_ref}",
+            get(jobs::by_external_ref),
+        )
         .route("/jobs/{id}", get(jobs::status))
         .route("/jobs/{id}/drvs/batch", post(ingest_batch::submit_batch))
         .route("/jobs/{id}/seal", post(jobs::seal))

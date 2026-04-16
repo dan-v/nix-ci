@@ -7,6 +7,7 @@ pub mod drv_parser;
 pub mod drv_walk;
 pub mod eval_jobs;
 pub mod orchestrator;
+pub mod output;
 pub mod sse;
 pub mod submitter;
 pub mod worker;

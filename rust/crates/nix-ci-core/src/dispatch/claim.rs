@@ -17,6 +17,11 @@ pub struct ActiveClaim {
     pub drv_hash: DrvHash,
     pub attempt: i32,
     pub deadline: Instant,
+    /// When the claim was issued. Used by the `Progress` event to
+    /// report "currently building X (3m 12s)" — derive elapsed via
+    /// `Instant::now() - started_at`. Wall-clock millis are computed
+    /// on demand at event-emission time.
+    pub started_at: Instant,
 }
 
 pub struct Claims {
@@ -83,6 +88,7 @@ mod tests {
             drv_hash: DrvHash::new("drv-test.drv"),
             attempt: 1,
             deadline,
+            started_at: Instant::now(),
         })
     }
 

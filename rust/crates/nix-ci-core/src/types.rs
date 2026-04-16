@@ -194,6 +194,13 @@ pub struct IngestDrvRequest {
     /// True for top-level attrs emitted by nix-eval-jobs.
     #[serde(default)]
     pub is_root: bool,
+    /// Optional human-readable attr name from nix-eval-jobs (e.g.
+    /// `packages.x86_64-linux.hello`). Only meaningful when
+    /// `is_root=true` — used for failure attribution
+    /// ("FAILED: hello-2.12.1, used by: packages.x86_64-linux.hello").
+    /// Older clients omit it; coordinator falls back to `drv_name`.
+    #[serde(default)]
+    pub attr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +326,15 @@ pub struct JobStatusResponse {
     pub eval_error: Option<String>,
 }
 
+/// One in-flight build, included in `Progress` events so clients can
+/// render "currently building: gcc-13.2.0 (5m 12s)".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrvInFlight {
+    pub drv_name: String,
+    /// When the claim was issued. Wall-clock unix milliseconds.
+    pub started_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobEvent {
@@ -341,9 +357,33 @@ pub enum JobEvent {
         log_tail: Option<String>,
         attempt: i32,
         will_retry: bool,
+        /// Top-level attr names this drv contributes to (transitively).
+        /// Lets the runner say "used by: packages.x86_64-linux.hello"
+        /// rather than just the drv_name. Empty for clients that
+        /// didn't supply `IngestDrvRequest.attr`.
+        #[serde(default)]
+        used_by_attrs: Vec<String>,
     },
     Progress {
         counts: JobCounts,
+        /// Snapshot of currently-building drvs (claimed but not yet
+        /// completed) for THIS job. Useful for "X in flight" displays.
+        #[serde(default)]
+        in_flight: Vec<DrvInFlight>,
+        /// Cumulative count of drvs marked propagated_failure for
+        /// this job. Differentiates "X originating + Y propagated"
+        /// in failure summaries.
+        #[serde(default)]
+        propagated_failed: u32,
+        /// Cumulative count of transient (retryable) failures
+        /// observed on this job's drvs. Surfaces flakiness.
+        #[serde(default)]
+        transient_retries: u32,
+        /// Whether the submission has been sealed yet. Lets the
+        /// runner switch its progress display from "ingested X /
+        /// eval running" to "X / total" once eval+submit is done.
+        #[serde(default)]
+        sealed: bool,
     },
     JobDone {
         status: JobStatus,
@@ -351,12 +391,34 @@ pub enum JobEvent {
     },
     /// A slow SSE consumer fell behind and missed events. Clients
     /// should re-sync by polling `/jobs/{id}` and resubscribing.
-    Lagged {
-        missed: u64,
-    },
+    Lagged { missed: u64 },
 }
 
 // ─── Admin snapshot ───────────────────────────────────────────────────
+
+/// One-line summary of a job. Used by `/admin/snapshot.recent_failures`,
+/// `GET /jobs?status=...`, and `nix-ci list`.
+///
+/// `originating_failures` lists the drv_names that actually failed
+/// (BuildFailure category) — capped at 3 entries with `+N originating`
+/// folded into a count if exceeded. `propagated_failures` is the count
+/// of downstream drvs that failed only because their dep failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSummary {
+    pub id: JobId,
+    #[serde(default)]
+    pub external_ref: Option<String>,
+    pub status: JobStatus,
+    pub done_at: Option<DateTime<Utc>>,
+    /// Up to 3 originating failure drv_names; `+N more` is implied
+    /// by `originating_failures_total`.
+    #[serde(default)]
+    pub originating_failures: Vec<String>,
+    #[serde(default)]
+    pub originating_failures_total: u32,
+    #[serde(default)]
+    pub propagated_failures: u32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminSnapshot {
@@ -367,4 +429,20 @@ pub struct AdminSnapshot {
     pub steps_done: u32,
     pub steps_failed: u32,
     pub active_claims: u32,
+    /// Up to 5 most recent failed jobs (DB-backed query). Zero-cost
+    /// observability: ops sees recent failures without a separate call.
+    #[serde(default)]
+    pub recent_failures: Vec<JobSummary>,
+}
+
+/// Response shape for `GET /jobs?status=...&since=...&cursor=...&limit=N`.
+/// Cursor pagination on `done_at DESC`: pass `next_cursor` from the
+/// previous response as `cursor` to fetch the next page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsListResponse {
+    pub jobs: Vec<JobSummary>,
+    /// If present, more rows exist after the last `done_at` returned.
+    /// Pass back as `?cursor=<value>`.
+    #[serde(default)]
+    pub next_cursor: Option<DateTime<Utc>>,
 }

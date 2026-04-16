@@ -11,8 +11,8 @@ use crate::durable::writeback;
 use crate::error::{Error, Result};
 use crate::observability::metrics::TerminalLabels;
 use crate::types::{
-    CreateJobRequest, CreateJobResponse, DrvFailure, FailJobRequest, JobCounts, JobEvent, JobId,
-    JobStatus, JobStatusResponse, SealJobResponse,
+    CreateJobRequest, CreateJobResponse, DrvFailure, ErrorCategory, FailJobRequest, JobCounts,
+    JobEvent, JobId, JobStatus, JobStatusResponse, JobSummary, JobsListResponse, SealJobResponse,
 };
 
 pub async fn create(
@@ -196,5 +196,151 @@ fn response_from_live(sub: &Arc<Submission>) -> JobStatusResponse {
         counts: sub.live_counts(),
         failures: sub.failures.read().clone(),
         eval_error: None,
+    }
+}
+
+/// Default `?limit=` for `GET /jobs`. Capped server-side regardless.
+const DEFAULT_LIST_LIMIT: i64 = 50;
+/// Hard server-side cap on `?limit=`. Prevents accidentally pulling
+/// thousands of rows.
+const MAX_LIST_LIMIT: i64 = 200;
+
+#[derive(Debug, serde::Deserialize)]
+pub struct JobsListQuery {
+    /// Required. Today only `failed`/`done`/`cancelled`/`pending`/`building`
+    /// are meaningful — anything else returns an empty list.
+    pub status: String,
+    /// Cursor: return rows with `done_at` strictly before this. Pass
+    /// the previous response's `next_cursor` for the following page.
+    #[serde(default)]
+    pub cursor: Option<chrono::DateTime<chrono::Utc>>,
+    /// Earliest `done_at` to consider. Mutually compatible with
+    /// `cursor` (both narrow the upper bound; `since` narrows the
+    /// lower).
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `GET /jobs?status=...&since=...&cursor=...&limit=N` — operator-
+/// facing list of recent jobs in a status. Cursor pagination on
+/// `done_at DESC`. Each row is a `JobSummary` populated from the
+/// terminal-snapshot JSONB stored in `jobs.result`.
+pub async fn list(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<JobsListQuery>,
+) -> Result<Json<JobsListResponse>> {
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let mut rows = writeback::list_jobs_by_status(&state.pool, &q.status, q.cursor, limit).await?;
+    // Apply `since` filter in-memory — the SQL only does upper-bound
+    // pagination because we need cursor + since combined.
+    if let Some(since) = q.since {
+        rows.retain(|r| r.done_at.map(|d| d >= since).unwrap_or(false));
+    }
+    // We over-fetched by 1 to detect "more available". If we did,
+    // drop the extra row AND set the cursor to the LAST RETURNED
+    // row's done_at — the next page must use `done_at < cursor` so
+    // the row that was the cursor isn't returned again. Setting the
+    // cursor to the dropped row's done_at would silently SKIP that
+    // row on the next page.
+    let next_cursor = if rows.len() > limit as usize {
+        rows.truncate(limit as usize);
+        rows.last().and_then(|r| r.done_at)
+    } else {
+        None
+    };
+    let jobs: Vec<JobSummary> = rows
+        .into_iter()
+        .map(|r| {
+            job_summary_from_row(
+                r.id,
+                r.external_ref,
+                &r.status,
+                r.done_at,
+                r.result.as_ref(),
+            )
+        })
+        .collect();
+    Ok(Json(JobsListResponse { jobs, next_cursor }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ByExternalRefPath {
+    pub external_ref: String,
+}
+
+/// `GET /jobs/by-external-ref/{ref}` — gateway from "I have a CCI
+/// build ID / PR number / opaque ref" to the job's status snapshot.
+/// 404 if no job has that ref. Used by `nix-ci show <ref>`.
+pub async fn by_external_ref(
+    State(state): State<AppState>,
+    Path(ByExternalRefPath { external_ref }): Path<ByExternalRefPath>,
+) -> Result<Json<JobStatusResponse>> {
+    let lookup = writeback::lookup_job_by_external_ref(&state.pool, &external_ref)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("job ext_ref={external_ref}")))?;
+    // Live-job path: prefer the in-memory snapshot for freshness.
+    if let Some(sub) = state.dispatcher.submissions.get(lookup.id) {
+        return Ok(Json(response_from_live(&sub)));
+    }
+    // Terminal job: use the stored result JSONB.
+    let snap = lookup
+        .result
+        .ok_or_else(|| Error::NotFound(format!("job {} has no terminal snapshot", lookup.id)))?;
+    let snap: JobStatusResponse = serde_json::from_value(snap)
+        .map_err(|e| Error::Internal(format!("parse jobs.result: {e}")))?;
+    Ok(Json(snap))
+}
+
+/// Build a `JobSummary` from a stored row + its (possibly absent)
+/// terminal snapshot. Picks out originating failures (capped at 3) +
+/// propagated count for the operator overview.
+pub(crate) fn job_summary_from_row(
+    id: JobId,
+    external_ref: Option<String>,
+    status: &str,
+    done_at: Option<chrono::DateTime<chrono::Utc>>,
+    result: Option<&serde_json::Value>,
+) -> JobSummary {
+    let mut originating: Vec<String> = Vec::new();
+    let mut originating_total: u32 = 0;
+    let mut propagated: u32 = 0;
+    if let Some(snap) = result {
+        if let Ok(snap) = serde_json::from_value::<JobStatusResponse>(snap.clone()) {
+            for f in &snap.failures {
+                if matches!(f.error_category, ErrorCategory::PropagatedFailure) {
+                    propagated += 1;
+                } else {
+                    originating_total += 1;
+                    if originating.len() < 3 {
+                        originating.push(f.drv_name.clone());
+                    }
+                }
+            }
+        }
+    }
+    JobSummary {
+        id,
+        external_ref,
+        status: parse_status(status).unwrap_or(JobStatus::Pending),
+        done_at,
+        originating_failures: originating,
+        originating_failures_total: originating_total,
+        propagated_failures: propagated,
+    }
+}
+
+fn parse_status(s: &str) -> Option<JobStatus> {
+    match s {
+        "pending" => Some(JobStatus::Pending),
+        "building" => Some(JobStatus::Building),
+        "done" => Some(JobStatus::Done),
+        "failed" => Some(JobStatus::Failed),
+        "cancelled" => Some(JobStatus::Cancelled),
+        _ => None,
     }
 }

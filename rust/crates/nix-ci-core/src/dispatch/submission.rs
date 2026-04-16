@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::broadcast;
 
 use crate::types::{DrvFailure, DrvHash, JobEvent, JobId};
@@ -25,6 +25,13 @@ pub struct Submission {
     /// Set when the submission status transitions to terminal.
     pub terminal: AtomicBool,
     pub toplevels: RwLock<Vec<Arc<Step>>>,
+    /// Per-submission attribution: maps a toplevel's drv_hash to the
+    /// human-readable attr name from nix-eval-jobs (e.g.
+    /// `packages.x86_64-linux.hello`). Populated at ingest when the
+    /// caller supplies `IngestDrvRequest.attr` for an `is_root=true`
+    /// drv. Used by the failure path to compute `used_by_attrs` —
+    /// "FAILED gcc-13.2.0, used by: packages.x86_64-linux.hello".
+    pub root_attrs: RwLock<HashMap<DrvHash, String>>,
     pub ready: RwLock<HashMap<String, VecDeque<Weak<Step>>>>,
     /// Strong references to every step this submission owns — root
     /// or transitive dep. Keeps steps alive across handler returns
@@ -37,6 +44,12 @@ pub struct Submission {
     /// Replaces the previous durable `derivations.error_*` columns.
     pub failures: RwLock<Vec<DrvFailure>>,
     pub events: broadcast::Sender<JobEvent>,
+    /// Cumulative count of drvs marked propagated_failure in this
+    /// submission. Surfaced in `Progress` events for the runner UI.
+    pub propagated_failed: AtomicU32,
+    /// Cumulative count of transient retries observed on this
+    /// submission's drvs. Surfaced in `Progress` events.
+    pub transient_retries: AtomicU32,
 }
 
 impl Submission {
@@ -48,10 +61,13 @@ impl Submission {
             sealed: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             toplevels: RwLock::new(Vec::new()),
+            root_attrs: RwLock::new(HashMap::new()),
             ready: RwLock::new(HashMap::new()),
             members: RwLock::new(HashMap::new()),
             failures: RwLock::new(Vec::new()),
             events: tx,
+            propagated_failed: AtomicU32::new(0),
+            transient_retries: AtomicU32::new(0),
         })
     }
 

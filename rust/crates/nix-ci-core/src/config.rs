@@ -99,6 +99,10 @@ pub struct RunnerConfig {
     pub supported_features: Vec<String>,
     pub eval_workers: u32,
     pub dry_run: bool,
+    /// Verbose output: emit per-drv started/completed lines (the
+    /// pre-redesign behavior). Default false; default mode shows
+    /// periodic progress + immediate failure blocks + summary.
+    pub verbose: bool,
 }
 
 impl Default for RunnerConfig {
@@ -110,6 +114,7 @@ impl Default for RunnerConfig {
             supported_features: Vec::new(),
             eval_workers: 4,
             dry_run: false,
+            verbose: false,
         }
     }
 }

@@ -22,6 +22,7 @@ fn ingest(drv: &str, name: &str, is_root: bool) -> IngestDrvRequest {
         required_features: vec![],
         input_drvs: vec![],
         is_root,
+        attr: None,
     }
 }
 

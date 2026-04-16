@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::types::{
     ClaimId, ClaimResponse, CompleteRequest, CompleteResponse, CreateJobRequest, CreateJobResponse,
     IngestBatchRequest, IngestBatchResponse, IngestDrvRequest, IngestDrvResponse, JobId,
-    JobStatusResponse, SealJobResponse,
+    JobStatusResponse, JobsListResponse, SealJobResponse,
 };
 
 #[derive(Clone)]
@@ -172,6 +172,44 @@ impl CoordinatorClient {
 
     pub fn events_url(&self, job_id: JobId) -> String {
         format!("{}/jobs/{}/events", self.base, job_id)
+    }
+
+    /// Resolve "id-or-external-ref" → terminal status snapshot. Tries
+    /// the UUID path first; if the input doesn't parse as a UUID,
+    /// falls back to the by-external-ref endpoint. Used by
+    /// `nix-ci show <arg>`.
+    pub async fn show_job(&self, id_or_ref: &str) -> Result<JobStatusResponse> {
+        if let Ok(uuid) = uuid::Uuid::parse_str(id_or_ref) {
+            return self.status(JobId(uuid)).await;
+        }
+        let url = format!("{}/jobs/by-external-ref/{}", self.base, id_or_ref);
+        let resp = self.http.get(&url).send().await?;
+        decode(resp).await
+    }
+
+    /// List jobs filtered by status, ordered newest-first. Cursor-
+    /// paginate by passing back `JobsListResponse.next_cursor` as
+    /// `cursor`. Used by `nix-ci list --failed`.
+    pub async fn list_jobs(
+        &self,
+        status: &str,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        cursor: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<JobsListResponse> {
+        let url = format!("{}/jobs", self.base);
+        let mut req = self
+            .http
+            .get(&url)
+            .query(&[("status", status), ("limit", &limit.to_string())]);
+        if let Some(s) = since {
+            req = req.query(&[("since", s.to_rfc3339().as_str())]);
+        }
+        if let Some(c) = cursor {
+            req = req.query(&[("cursor", c.to_rfc3339().as_str())]);
+        }
+        let resp = req.send().await?;
+        decode(resp).await
     }
 
     pub async fn admin_snapshot(&self) -> Result<crate::types::AdminSnapshot> {

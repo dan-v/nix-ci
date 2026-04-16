@@ -124,6 +124,142 @@ pub async fn insert_failed_outputs(
     Ok(())
 }
 
+/// Look up a job by its caller-supplied `external_ref`. Returns the
+/// terminal-snapshot result JSONB (if the job has reached terminal)
+/// alongside identity fields. Used by `GET /jobs/by-external-ref/{ref}`
+/// and by `nix-ci show <ref>`.
+pub async fn lookup_job_by_external_ref(
+    pool: &PgPool,
+    external_ref: &str,
+) -> Result<Option<JobLookup>> {
+    type LookupRow = (
+        sqlx::types::Uuid,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+    );
+    let row: Option<LookupRow> = sqlx::query_as(
+        r#"
+        SELECT id, status, done_at, result
+        FROM jobs
+        WHERE external_ref = $1
+        ORDER BY done_at DESC NULLS FIRST
+        LIMIT 1
+        "#,
+    )
+    .bind(external_ref)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, status, done_at, result)| JobLookup {
+        id: JobId(id),
+        status,
+        done_at,
+        result,
+    }))
+}
+
+/// Look up a job by its UUID. Mirrors `lookup_job_by_external_ref` for
+/// the `nix-ci show <uuid>` path.
+pub async fn lookup_job_by_id(pool: &PgPool, id: JobId) -> Result<Option<JobLookup>> {
+    let row: Option<(
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+    )> = sqlx::query_as("SELECT status, done_at, result FROM jobs WHERE id = $1")
+        .bind(id.0)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(status, done_at, result)| JobLookup {
+        id,
+        status,
+        done_at,
+        result,
+    }))
+}
+
+/// Filter rows for `GET /jobs`. Status is required (we don't have a
+/// real use case for unfiltered listing yet). `since` is exclusive
+/// upper-bound on `done_at` for cursor pagination. `limit` is capped
+/// server-side; the response includes a `next_cursor` if more rows
+/// exist past the last returned `done_at`.
+pub async fn list_jobs_by_status(
+    pool: &PgPool,
+    status: &str,
+    cursor_before: Option<chrono::DateTime<chrono::Utc>>,
+    limit: i64,
+) -> Result<Vec<JobRow>> {
+    // We deliberately query one row past `limit` so the caller can
+    // tell whether there's a next page without a separate count.
+    type ListRow = (
+        sqlx::types::Uuid,
+        Option<String>,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+    );
+    let rows: Vec<ListRow> = match cursor_before {
+        Some(before) => {
+            sqlx::query_as(
+                r#"
+            SELECT id, external_ref, status, done_at, result
+            FROM jobs
+            WHERE status = $1 AND done_at IS NOT NULL AND done_at < $2
+            ORDER BY done_at DESC
+            LIMIT $3
+            "#,
+            )
+            .bind(status)
+            .bind(before)
+            .bind(limit + 1)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                r#"
+            SELECT id, external_ref, status, done_at, result
+            FROM jobs
+            WHERE status = $1 AND done_at IS NOT NULL
+            ORDER BY done_at DESC
+            LIMIT $2
+            "#,
+            )
+            .bind(status)
+            .bind(limit + 1)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|(id, external_ref, status, done_at, result)| JobRow {
+            id: JobId(id),
+            external_ref,
+            status,
+            done_at,
+            result,
+        })
+        .collect())
+}
+
+/// Returned from per-job lookups (`by-external-ref`, `by-id`).
+pub struct JobLookup {
+    pub id: JobId,
+    pub status: String,
+    pub done_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Terminal snapshot JSONB; absent for non-terminal jobs.
+    pub result: Option<serde_json::Value>,
+}
+
+/// One row from `list_jobs_by_status`.
+pub struct JobRow {
+    pub id: JobId,
+    pub external_ref: Option<String>,
+    pub status: String,
+    pub done_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub result: Option<serde_json::Value>,
+}
+
 /// Bulk lookup of failed output paths. Returns the subset of input paths
 /// whose cache entry is still valid. A DB error here is *not* fatal:
 /// ingest proceeds without the optimization. Callers log + continue.

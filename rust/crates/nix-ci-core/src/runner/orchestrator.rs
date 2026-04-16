@@ -40,6 +40,21 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
     let job_id = job.id;
     tracing::info!(%job_id, "job created");
 
+    // Header line — gives the human-readable run identity up front so
+    // the rest of the output makes sense without reading code.
+    let source_label = match &args.mode {
+        crate::runner::eval_jobs::EvalMode::Flake { path, attrs } => {
+            if attrs.is_empty() {
+                format!("flake {path}")
+            } else {
+                format!("flake {path} ({})", attrs.join(", "))
+            }
+        }
+        crate::runner::eval_jobs::EvalMode::Expr(_) => "nix expression".to_string(),
+    };
+    crate::runner::output::OutputRenderer::new(job_id, args.external_ref.clone(), args.cfg.verbose)
+        .print_start(&source_label);
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // SSE listener. Passes `shutdown_tx` in as well so that a terminal
@@ -52,7 +67,11 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
         let client = client.clone();
         let tx = shutdown_tx.clone();
         let rx = shutdown_rx.clone();
-        tokio::spawn(async move { sse::print_events(client, job_id, tx, rx).await })
+        let external_ref = args.external_ref.clone();
+        let verbose = args.cfg.verbose;
+        tokio::spawn(async move {
+            sse::print_events_with(client, job_id, external_ref, verbose, tx, rx).await
+        })
     };
 
     // Worker loop

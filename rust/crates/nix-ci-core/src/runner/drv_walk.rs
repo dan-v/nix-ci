@@ -140,7 +140,9 @@ pub fn walk_filtered(
 }
 
 /// Convenience: turn a [`WalkedDrv`] into the wire form the server
-/// accepts on the batch-ingest endpoint.
+/// accepts on the batch-ingest endpoint. The submitter sets `attr`
+/// after the fact for the root drv; everything else leaves it as
+/// `None`.
 impl WalkedDrv {
     pub fn into_request(self) -> IngestDrvRequest {
         IngestDrvRequest {
@@ -150,6 +152,7 @@ impl WalkedDrv {
             required_features: self.required_features,
             input_drvs: self.input_drvs,
             is_root: self.is_root,
+            attr: None,
         }
     }
 }

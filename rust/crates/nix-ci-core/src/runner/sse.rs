@@ -34,8 +34,23 @@ pub async fn print_events(
     client: Arc<CoordinatorClient>,
     job_id: JobId,
     shutdown_tx: watch::Sender<bool>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<JobStatus> {
+    print_events_with(client, job_id, None, false, shutdown_tx, shutdown).await
+}
+
+/// Variant of [`print_events`] that takes the human-readable run
+/// metadata (external_ref, verbosity) so the renderer can produce the
+/// new structured output.
+pub async fn print_events_with(
+    client: Arc<CoordinatorClient>,
+    job_id: JobId,
+    external_ref: Option<String>,
+    verbose: bool,
+    shutdown_tx: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<JobStatus> {
+    let mut renderer = crate::runner::output::OutputRenderer::new(job_id, external_ref, verbose);
     let mut reconnect_attempt: u32 = 0;
 
     loop {
@@ -99,7 +114,7 @@ pub async fn print_events(
                     match evt {
                         Ok(e) => {
                             if let Ok(parsed) = serde_json::from_str::<JobEvent>(&e.data) {
-                                print_event(&parsed);
+                                renderer.observe(&parsed);
                                 if let JobEvent::JobDone { status, .. } = parsed {
                                     let _ = shutdown_tx.send(true);
                                     return Ok(status);
@@ -114,52 +129,6 @@ pub async fn print_events(
                 }
                 _ = shutdown.changed() => return Ok(JobStatus::Pending),
             }
-        }
-    }
-}
-
-fn print_event(ev: &JobEvent) {
-    match ev {
-        JobEvent::DrvStarted {
-            drv_name, attempt, ..
-        } => tracing::info!(drv = %drv_name, attempt, "started"),
-        JobEvent::DrvCompleted { drv_name, .. } => {
-            tracing::info!(drv = %drv_name, "completed");
-        }
-        JobEvent::DrvFailed {
-            drv_name,
-            error_category,
-            error_message,
-            attempt,
-            will_retry,
-            ..
-        } => {
-            tracing::warn!(
-                drv = %drv_name,
-                cat = ?error_category,
-                msg = ?error_message,
-                attempt, will_retry,
-                "failed"
-            );
-        }
-        JobEvent::Progress { counts } => {
-            tracing::info!(
-                total = counts.total,
-                pending = counts.pending,
-                building = counts.building,
-                done = counts.done,
-                failed = counts.failed,
-                "progress"
-            );
-        }
-        JobEvent::JobDone { status, failures } => {
-            tracing::info!(status = ?status, failed_drvs = failures.len(), "job done");
-        }
-        JobEvent::Lagged { missed } => {
-            tracing::warn!(
-                missed,
-                "SSE consumer fell behind — some events were dropped; poll /jobs/{{id}} to re-sync"
-            );
         }
     }
 }

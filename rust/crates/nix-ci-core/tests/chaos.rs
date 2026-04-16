@@ -91,6 +91,7 @@ fn random_dag(rng: &mut StdRng, job_ix: usize) -> Vec<IngestDrvRequest> {
             required_features: vec![],
             input_drvs: dep_paths,
             is_root,
+            attr: None,
         });
     }
     drvs

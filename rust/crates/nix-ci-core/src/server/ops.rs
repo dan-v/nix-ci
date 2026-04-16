@@ -78,6 +78,35 @@ pub async fn admin_snapshot(State(state): State<AppState>) -> Json<AdminSnapshot
             DrvState::Failed => counts.failed += 1,
         }
     }
+    // Top-5 most recent failed jobs. One DB query, indexed. Lets
+    // operators see "X failures in metrics — which jobs?" in a single
+    // snapshot call without going to /jobs?status=failed separately.
+    let recent_failures = match crate::durable::writeback::list_jobs_by_status(
+        &state.pool,
+        "failed",
+        None,
+        5,
+    )
+    .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .take(5)
+            .map(|r| {
+                crate::server::jobs::job_summary_from_row(
+                    r.id,
+                    r.external_ref,
+                    &r.status,
+                    r.done_at,
+                    r.result.as_ref(),
+                )
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "snapshot: recent_failures query failed; returning empty");
+            Vec::new()
+        }
+    };
     Json(AdminSnapshot {
         submissions,
         steps_total,
@@ -86,6 +115,7 @@ pub async fn admin_snapshot(State(state): State<AppState>) -> Json<AdminSnapshot
         steps_done: counts.done,
         steps_failed: counts.failed,
         active_claims: state.dispatcher.claims.len() as u32,
+        recent_failures,
     })
 }
 
