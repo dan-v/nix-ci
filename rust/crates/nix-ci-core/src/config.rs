@@ -58,6 +58,16 @@ pub struct ServerConfig {
     /// would eventually SIGKILL, leaving Postgres transactions to
     /// roll back uncleanly.
     pub graceful_shutdown_secs: u64,
+    /// Per-attempt build log retention (days). Logs are pruned by the
+    /// cleanup loop independently of `retention_days` because they're
+    /// the fattest bytes per row — typically you want shorter log
+    /// retention than job-metadata retention.
+    pub build_log_retention_days: u32,
+    /// Soft warning threshold for per-submission member count. When a
+    /// live submission's member count crosses this, the dispatcher
+    /// emits a `WARN` log line so an operator can spot a runaway job
+    /// before it OOMs the coordinator. Not a hard cap.
+    pub submission_warn_threshold: u32,
 }
 
 impl Default for ServerConfig {
@@ -82,6 +92,8 @@ impl Default for ServerConfig {
             max_drv_name_bytes: 1024,
             max_failures_in_result: 500,
             graceful_shutdown_secs: 30,
+            build_log_retention_days: 14,
+            submission_warn_threshold: 200_000,
         }
     }
 }

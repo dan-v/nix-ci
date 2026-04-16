@@ -29,7 +29,9 @@ use chrono::Utc;
 use super::AppState;
 use crate::dispatch::claim::ActiveClaim;
 use crate::error::{Error, Result};
-use crate::types::{ClaimId, ClaimQuery, ClaimResponse, JobEvent, JobId};
+use crate::types::{
+    ActiveClaimSummary, ClaimId, ClaimQuery, ClaimResponse, ClaimsListResponse, JobEvent, JobId,
+};
 
 pub async fn claim(
     State(state): State<AppState>,
@@ -60,7 +62,7 @@ pub async fn claim(
 
         let now_ms = Utc::now().timestamp_millis();
         if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
-            return issue_claim(&state, &sub, id, step, start);
+            return issue_claim(&state, &sub, id, step, start, q.worker.clone());
         }
 
         if Instant::now() >= deadline {
@@ -80,7 +82,7 @@ pub async fn claim(
                 // immediate 30s-round-trip re-poll from the worker.
                 let now_ms = Utc::now().timestamp_millis();
                 if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
-                    return issue_claim(&state, &sub, id, step, start);
+                    return issue_claim(&state, &sub, id, step, start, q.worker.clone());
                 }
                 return Ok(StatusCode::NO_CONTENT.into_response());
             }
@@ -122,7 +124,7 @@ pub async fn claim_any(
             }
             if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
                 let job_id = sub.id;
-                return issue_claim(&state, sub, job_id, step, start);
+                return issue_claim(&state, sub, job_id, step, start, q.worker.clone());
             }
         }
         drop(subs);
@@ -147,7 +149,7 @@ pub async fn claim_any(
                     }
                     if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
                         let job_id = sub.id;
-                        return issue_claim(&state, sub, job_id, step, start);
+                        return issue_claim(&state, sub, job_id, step, start, q.worker.clone());
                     }
                 }
                 return Ok(StatusCode::NO_CONTENT.into_response());
@@ -156,12 +158,51 @@ pub async fn claim_any(
     }
 }
 
+/// `GET /claims` — point-in-time list of every active claim, sorted
+/// longest-running first. Operator's main "what's stuck?" lever.
+/// Cheap: snapshots the in-memory `Claims` map and returns. No DB.
+pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<ClaimsListResponse>> {
+    let now = Instant::now();
+    let mut summaries: Vec<ActiveClaimSummary> = state
+        .dispatcher
+        .claims
+        .all()
+        .into_iter()
+        .map(|c| {
+            let elapsed = now
+                .saturating_duration_since(c.started_at)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            // Wall-clock deadline: if the deadline already passed,
+            // the reaper hasn't run yet — Utc::now() + 0 is honest.
+            let remaining = c.deadline.saturating_duration_since(now);
+            let wall_deadline = Utc::now()
+                + chrono::Duration::from_std(remaining).unwrap_or(chrono::Duration::zero());
+            ActiveClaimSummary {
+                claim_id: c.claim_id,
+                job_id: c.job_id,
+                drv_hash: c.drv_hash.clone(),
+                attempt: c.attempt,
+                worker_id: c.worker_id.clone(),
+                claimed_at: c.started_at_wall,
+                elapsed_ms: elapsed,
+                deadline: wall_deadline,
+            }
+        })
+        .collect();
+    // Longest-running first — what an operator actually wants when
+    // the question is "what's hung?"
+    summaries.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
+    Ok(axum::Json(ClaimsListResponse { claims: summaries }))
+}
+
 fn issue_claim(
     state: &AppState,
     sub: &Arc<crate::dispatch::Submission>,
     job_id: JobId,
     step: Arc<crate::dispatch::Step>,
     started_at: Instant,
+    worker_id: Option<String>,
 ) -> Result<Response> {
     let attempt = step.tries.fetch_add(1, Ordering::AcqRel) + 1;
     let claim_id = ClaimId::new();
@@ -170,6 +211,7 @@ fn issue_claim(
         Utc::now() + chrono::Duration::from_std(deadline_duration).unwrap_or_default();
 
     let now = Instant::now();
+    let now_wall = Utc::now();
     state.dispatcher.claims.insert(Arc::new(ActiveClaim {
         claim_id,
         job_id,
@@ -177,6 +219,8 @@ fn issue_claim(
         attempt,
         deadline: now + deadline_duration,
         started_at: now,
+        started_at_wall: now_wall,
+        worker_id,
     }));
 
     sub.publish(JobEvent::DrvStarted {

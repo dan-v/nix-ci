@@ -485,6 +485,7 @@ async fn regression_fleet_worker_still_drains_jobs(pool: PgPool) {
                     supported_features: vec![],
                     max_parallel: 2,
                     dry_run: true,
+                    worker_id: None,
                 },
                 sd_rx,
             )

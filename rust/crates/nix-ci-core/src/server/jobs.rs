@@ -161,6 +161,14 @@ fn finish_in_memory(state: &AppState, id: JobId, status: JobStatus, failures: Ve
             status: status.as_str().into(),
         })
         .inc();
+    // Per-job size at terminal (mirror of the path in
+    // `complete::check_and_publish_terminal`). Captured here too so
+    // cancel/fail-driven terminations show up in `drvs_per_job`.
+    state
+        .metrics
+        .inner
+        .drvs_per_job
+        .observe(sub.members.read().len() as f64);
     state.dispatcher.wake();
 }
 

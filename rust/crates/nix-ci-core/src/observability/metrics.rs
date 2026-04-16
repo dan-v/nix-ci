@@ -48,6 +48,30 @@ pub struct MetricsInner {
     // should stay bounded relative to active job count).
     pub submissions_active: Gauge,
     pub steps_registry_size: Gauge,
+
+    // Per-endpoint HTTP latency. Wraps every handler via a Tower-style
+    // axum middleware. Long-poll endpoints (`/claim`, `/jobs/{}/claim`,
+    // `/jobs/{}/events`) are excluded from the histogram — their
+    // latency is dominated by wait-time, not work-time, and would
+    // pollute SLO buckets.
+    pub http_request_duration_seconds: Family<HttpLabels, Histogram>,
+
+    // Build log archive capacity. `bytes_total` includes TOAST + indexes
+    // (i.e. true on-disk cost). `rows_total` is a planner estimate, not
+    // an exact count.
+    pub build_logs_bytes_total: Gauge,
+    pub build_logs_rows_total: Gauge,
+    /// Worker-uploaded logs that hit the per-attempt raw-size cap and
+    /// were truncated. A spike here indicates pathological build
+    /// output (e.g. a test that prints every line).
+    pub build_logs_truncated_total: Counter,
+
+    // Per-job ingest size. Recorded at terminal time. Buckets span 1
+    // → 5M drvs to catch both trivial flakes and pathological mega-DAGs.
+    pub drvs_per_job: Histogram,
+    /// Soft warnings emitted when a single submission's member count
+    /// crossed `submission_warn_threshold`. Counts events, not drvs.
+    pub submission_warn_total: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -58,6 +82,16 @@ pub struct TerminalLabels {
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
 pub struct OutcomeLabels {
     pub outcome: String,
+}
+
+/// Labels for the per-endpoint HTTP latency histogram. Cardinality is
+/// bounded by the route table — we always use the matched route
+/// pattern (e.g. `/jobs/{id}`), never the rendered URL.
+#[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
+pub struct HttpLabels {
+    pub method: String,
+    pub route: String,
+    pub status: String,
 }
 
 impl Default for Metrics {
@@ -177,6 +211,69 @@ impl Metrics {
             steps_registry_size.clone(),
         );
 
+        // Per-endpoint latency. Buckets cover the realistic range:
+        // sub-ms (dedup-cached ingest, in-mem complete) through ~10s
+        // (cold ingest with DB contention or terminal writeback).
+        let http_request_duration_seconds: Family<HttpLabels, Histogram> =
+            Family::new_with_constructor(|| {
+                Histogram::new([
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                ])
+            });
+        registry.register(
+            "nix_ci_http_request_duration_seconds",
+            "HTTP request duration by route + status (long-poll endpoints excluded)",
+            http_request_duration_seconds.clone(),
+        );
+
+        let build_logs_bytes_total = Gauge::default();
+        registry.register(
+            "nix_ci_build_logs_bytes_total",
+            "Total on-disk bytes used by build_logs (heap + TOAST + indexes)",
+            build_logs_bytes_total.clone(),
+        );
+        let build_logs_rows_total = Gauge::default();
+        registry.register(
+            "nix_ci_build_logs_rows_total",
+            "Estimated row count in build_logs (planner stats)",
+            build_logs_rows_total.clone(),
+        );
+        let build_logs_truncated_total = Counter::default();
+        // Library appends `_total` per OpenMetrics — don't include it in
+        // the registered name. Wire becomes `nix_ci_build_logs_truncated_total`.
+        registry.register(
+            "nix_ci_build_logs_truncated",
+            "Worker-uploaded logs that were truncated to the per-attempt cap",
+            build_logs_truncated_total.clone(),
+        );
+
+        // 1 → 5M drvs. Captures trivial single-attr jobs through
+        // pathological mega-DAGs.
+        let drvs_per_job = Histogram::new([
+            1.0,
+            10.0,
+            100.0,
+            1_000.0,
+            10_000.0,
+            100_000.0,
+            500_000.0,
+            1_000_000.0,
+            5_000_000.0,
+        ]);
+        registry.register(
+            "nix_ci_drvs_per_job",
+            "Per-submission member count, recorded at terminal time",
+            drvs_per_job.clone(),
+        );
+        let submission_warn_total = Counter::default();
+        // Library appends `_total` per OpenMetrics — don't include it in
+        // the registered name. Wire becomes `nix_ci_submission_warn_total`.
+        registry.register(
+            "nix_ci_submission_warn",
+            "Submissions whose live member count exceeded the warning threshold",
+            submission_warn_total.clone(),
+        );
+
         Self {
             inner: Arc::new(MetricsInner {
                 registry: parking_lot::Mutex::new(registry),
@@ -195,6 +292,12 @@ impl Metrics {
                 events_dropped,
                 submissions_active,
                 steps_registry_size,
+                http_request_duration_seconds,
+                build_logs_bytes_total,
+                build_logs_rows_total,
+                build_logs_truncated_total,
+                drvs_per_job,
+                submission_warn_total,
             }),
         }
     }

@@ -458,6 +458,16 @@ pub(super) async fn check_and_publish_terminal(
             status: final_status.as_str().into(),
         })
         .inc();
+    // Per-job size for capacity planning. Recorded at terminal time
+    // (rather than on every ingest) so we get one observation per job
+    // — the histogram answers "what's the p99 job size?", not "what's
+    // the average ingest velocity?". A hard cap can be added later if
+    // and only if the data shows it's needed.
+    state
+        .metrics
+        .inner
+        .drvs_per_job
+        .observe(sub.members.read().len() as f64);
 
     // Drop the in-memory submission. Existing SSE subscribers keep
     // their receiver until the broadcast Sender is dropped with the

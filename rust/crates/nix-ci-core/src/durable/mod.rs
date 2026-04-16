@@ -3,6 +3,7 @@
 //! clear_busy, heartbeat reaper, TTL cleanup.
 
 pub mod cleanup;
+pub mod logs;
 pub mod reaper;
 pub mod writeback;
 

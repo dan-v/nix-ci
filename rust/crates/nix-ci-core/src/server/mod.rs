@@ -1,6 +1,7 @@
 //! HTTP server: axum router, handlers, SSE. One AppState shared.
 
 pub mod app;
+pub mod build_logs;
 pub mod claim;
 pub mod complete;
 pub mod events;
@@ -22,6 +23,7 @@ use tokio::sync::watch;
 
 use crate::config::ServerConfig;
 use crate::dispatch::Dispatcher;
+use crate::durable::logs::PgLogStore;
 use crate::durable::{self, CoordinatorLock};
 use crate::error::Result;
 use crate::observability::metrics::Metrics;
@@ -40,12 +42,15 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     let metrics = Metrics::new();
     let dispatcher = Dispatcher::new(metrics.clone());
+    let log_store: Arc<dyn crate::durable::logs::LogStore> =
+        Arc::new(PgLogStore::new(pool.clone()));
 
     let state = AppState {
         pool: pool.clone(),
         dispatcher: dispatcher.clone(),
         metrics: metrics.clone(),
         cfg: Arc::new(cfg.clone()),
+        log_store: log_store.clone(),
     };
 
     // Shared shutdown signal for background loops. axum has its own
@@ -65,6 +70,9 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         pool.clone(),
         Duration::from_secs(cfg.cleanup_interval_secs),
         cfg.retention_days,
+        cfg.build_log_retention_days,
+        log_store.clone(),
+        metrics.clone(),
         shutdown_rx.clone(),
     ));
 

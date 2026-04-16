@@ -48,6 +48,46 @@ enum Cmd {
     /// List recent jobs in a given status (default: failed). Cursor-
     /// paginates newest-first.
     List(ListCmd),
+    /// Fetch the build log for a specific drv on a specific job. By
+    /// default returns the most recent attempt; --all-attempts dumps
+    /// every stored attempt with separators. Logs only exist for
+    /// failed (or transient-retried) builds — successful builds do
+    /// not upload.
+    Logs(LogsCmd),
+    /// List in-flight claims (worker observability). Sorted longest-
+    /// running first — what's actually stuck shows at the top.
+    Claims {
+        #[arg(
+            long,
+            env = "NIX_CI_COORDINATOR",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        coordinator: String,
+    },
+}
+
+#[derive(Debug, Parser)]
+struct LogsCmd {
+    #[arg(
+        long,
+        env = "NIX_CI_COORDINATOR",
+        default_value = "http://127.0.0.1:8080"
+    )]
+    coordinator: String,
+    /// Job UUID or external_ref. Resolved via the same path as
+    /// `nix-ci show`.
+    job: String,
+    /// drv_hash (basename of the .drv path). Required for the default
+    /// "show me the log" mode; omit to list every drv with stored
+    /// logs (uses the job's failure list as the source of truth).
+    #[arg(long)]
+    drv: Option<String>,
+    /// Specific claim_id to fetch (overrides drv-based resolution).
+    #[arg(long)]
+    claim: Option<String>,
+    /// Print every stored attempt instead of just the most recent.
+    #[arg(long)]
+    all_attempts: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -165,6 +205,124 @@ async fn main() -> anyhow::Result<()> {
             id_or_ref,
         } => show_cmd(&coordinator, &id_or_ref).await,
         Cmd::List(cmd) => list_cmd(cmd).await,
+        Cmd::Logs(cmd) => logs_cmd(cmd).await,
+        Cmd::Claims { coordinator } => claims_cmd(&coordinator).await,
+    }
+}
+
+async fn logs_cmd(cmd: LogsCmd) -> anyhow::Result<()> {
+    let client = nix_ci_core::client::CoordinatorClient::new(&cmd.coordinator);
+    // claim_id wins over drv: caller is asking for one specific
+    // attempt and we already know the (job, claim) tuple.
+    if let Some(claim_str) = cmd.claim.as_deref() {
+        let claim_id = parse_claim_id(claim_str)?;
+        let job_id = resolve_job_id(&client, &cmd.job).await?;
+        let log = client.fetch_log(job_id, claim_id).await?;
+        print!("{log}");
+        return Ok(());
+    }
+
+    // No claim_id given: list attempts for the (job, drv) tuple, then
+    // dump either the most recent or all of them.
+    let drv = cmd
+        .drv
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--drv or --claim is required"))?;
+    let job_id = resolve_job_id(&client, &cmd.job).await?;
+    let drv_hash = nix_ci_core::types::DrvHash::new(drv.to_string());
+    let listing = client.list_drv_logs(job_id, &drv_hash).await?;
+    if listing.attempts.is_empty() {
+        eprintln!("(no stored logs for drv {drv} on job {})", job_id);
+        return Ok(());
+    }
+    let attempts = if cmd.all_attempts {
+        listing.attempts.iter().collect::<Vec<_>>()
+    } else {
+        // attempts[] is already newest-first.
+        vec![&listing.attempts[0]]
+    };
+    for (i, a) in attempts.iter().enumerate() {
+        if cmd.all_attempts {
+            println!(
+                "==== attempt {} (claim {}, exit {:?}, {}{}) ====",
+                a.attempt,
+                a.claim_id,
+                a.exit_code,
+                if a.success { "success" } else { "failed" },
+                if a.truncated { ", truncated" } else { "" }
+            );
+        }
+        let log = client.fetch_log(job_id, a.claim_id).await?;
+        print!("{log}");
+        if !log.ends_with('\n') {
+            println!();
+        }
+        if cmd.all_attempts && i + 1 < attempts.len() {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_job_id(
+    client: &nix_ci_core::client::CoordinatorClient,
+    s: &str,
+) -> anyhow::Result<nix_ci_core::types::JobId> {
+    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+        return Ok(nix_ci_core::types::JobId(uuid));
+    }
+    // Fall back to external_ref → status snapshot → id field.
+    let snap = client.show_job(s).await?;
+    Ok(snap.id)
+}
+
+fn parse_claim_id(s: &str) -> anyhow::Result<nix_ci_core::types::ClaimId> {
+    let uuid = uuid::Uuid::parse_str(s).map_err(|e| anyhow::anyhow!("bad --claim {s:?}: {e}"))?;
+    Ok(nix_ci_core::types::ClaimId(uuid))
+}
+
+async fn claims_cmd(coordinator: &str) -> anyhow::Result<()> {
+    let client = nix_ci_core::client::CoordinatorClient::new(coordinator);
+    let resp = client.list_claims().await?;
+    if resp.claims.is_empty() {
+        println!("(no in-flight claims)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<10} {:<40} {:<10} deadline",
+        "worker", "job", "drv", "elapsed"
+    );
+    for c in &resp.claims {
+        let worker = c.worker_id.as_deref().unwrap_or("-");
+        let job_short: String = c.job_id.0.to_string().chars().take(8).collect();
+        let drv = c.drv_hash.as_str();
+        let drv_short = if drv.len() > 40 {
+            format!("{}…", &drv[..39])
+        } else {
+            drv.to_string()
+        };
+        let elapsed = format_elapsed(c.elapsed_ms);
+        let deadline = c.deadline.to_rfc3339();
+        println!(
+            "{:<20} {:<10} {:<40} {:<10} {}",
+            truncate(worker, 20),
+            job_short,
+            drv_short,
+            elapsed,
+            deadline
+        );
+    }
+    Ok(())
+}
+
+fn format_elapsed(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{}s", s / 60, s % 60)
+    } else {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
     }
 }
 
@@ -340,6 +498,7 @@ async fn worker_cmd(cmd: WorkerCmd) -> anyhow::Result<()> {
         supported_features,
         max_parallel: cmd.max_parallel,
         dry_run: cmd.dry_run,
+        worker_id: Some(worker::default_worker_id()),
     };
 
     // Wire SIGTERM / Ctrl-C to the worker's shutdown watch.

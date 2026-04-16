@@ -211,6 +211,7 @@ async fn fleet_worker_drains_multiple_jobs_concurrently(pool: PgPool) {
             supported_features: vec![],
             max_parallel: 4,
             dry_run: true,
+            worker_id: None,
         };
         tokio::spawn(async move { worker::run(client, cfg, sd_rx).await })
     };
@@ -251,6 +252,7 @@ async fn fleet_worker_outlives_individual_jobs(pool: PgPool) {
             supported_features: vec![],
             max_parallel: 1,
             dry_run: true,
+            worker_id: None,
         };
         tokio::spawn(async move { worker::run(client, cfg, sd_rx).await })
     };

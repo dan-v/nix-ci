@@ -8,6 +8,7 @@ use std::sync::Arc;
 use nix_ci_core::config::ServerConfig;
 use nix_ci_core::dispatch::Dispatcher;
 use nix_ci_core::durable;
+use nix_ci_core::durable::logs::PgLogStore;
 use nix_ci_core::observability::metrics::Metrics;
 use nix_ci_core::server::{build_router, AppState};
 use sqlx::PgPool;
@@ -70,11 +71,14 @@ pub async fn spawn_server_with_cfg(
         ..ServerConfig::default()
     };
     mutate_cfg(&mut cfg);
+    let log_store: Arc<dyn nix_ci_core::durable::logs::LogStore> =
+        Arc::new(PgLogStore::new(pool.clone()));
     let state = AppState {
         pool: pool.clone(),
         dispatcher: dispatcher.clone(),
         metrics,
         cfg: Arc::new(cfg),
+        log_store,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

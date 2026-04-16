@@ -2,4 +2,4 @@
 
 pub mod http;
 
-pub use http::CoordinatorClient;
+pub use http::{BuildLogUploadMeta, CoordinatorClient};

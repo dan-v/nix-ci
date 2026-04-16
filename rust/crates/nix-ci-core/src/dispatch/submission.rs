@@ -50,6 +50,11 @@ pub struct Submission {
     /// Cumulative count of transient retries observed on this
     /// submission's drvs. Surfaced in `Progress` events.
     pub transient_retries: AtomicU32,
+    /// Set to true the first time the submission's `members.len()`
+    /// crosses `submission_warn_threshold`. Lets the ingest path emit
+    /// a single `WARN` log line (and metrics counter) per oversized
+    /// submission rather than one per ingest batch.
+    pub warned_oversized: AtomicBool,
 }
 
 impl Submission {
@@ -68,6 +73,7 @@ impl Submission {
             events: tx,
             propagated_failed: AtomicU32::new(0),
             transient_retries: AtomicU32::new(0),
+            warned_oversized: AtomicBool::new(false),
         })
     }
 

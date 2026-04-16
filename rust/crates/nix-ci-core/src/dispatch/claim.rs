@@ -22,6 +22,13 @@ pub struct ActiveClaim {
     /// `Instant::now() - started_at`. Wall-clock millis are computed
     /// on demand at event-emission time.
     pub started_at: Instant,
+    /// Wall-clock when the claim was issued. Persistent for
+    /// `GET /claims` callers (which can't read `Instant`).
+    pub started_at_wall: chrono::DateTime<chrono::Utc>,
+    /// Optional worker identity (e.g. `host42-pid12345-a3b91c`)
+    /// supplied by the worker on the `?worker=` query param. Empty
+    /// for older clients.
+    pub worker_id: Option<String>,
 }
 
 pub struct Claims {
@@ -89,6 +96,8 @@ mod tests {
             attempt: 1,
             deadline,
             started_at: Instant::now(),
+            started_at_wall: chrono::Utc::now(),
+            worker_id: None,
         })
     }
 

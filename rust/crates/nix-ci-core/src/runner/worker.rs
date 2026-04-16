@@ -11,9 +11,12 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::watch;
 
-use crate::client::CoordinatorClient;
+use crate::client::{BuildLogUploadMeta, CoordinatorClient};
 use crate::error::Result;
-use crate::types::{ClaimResponse, CompleteRequest, ErrorCategory, JobId, MAX_LOG_TAIL_BYTES};
+use crate::types::{
+    ClaimResponse, CompleteRequest, DrvHash, ErrorCategory, JobId, MAX_BUILD_LOG_RAW_BYTES,
+    MAX_LOG_TAIL_BYTES,
+};
 
 /// Seconds the server-side claim long-poll holds open.
 const CLAIM_LONG_POLL_SECS: u64 = 30;
@@ -77,6 +80,23 @@ pub struct WorkerConfig {
     pub supported_features: Vec<String>,
     pub max_parallel: u32,
     pub dry_run: bool,
+    /// Free-form worker identifier. Sent on every `/claim` so an
+    /// operator can map a stuck claim back to a specific host. Empty
+    /// is allowed (older workers).
+    pub worker_id: Option<String>,
+}
+
+/// Default `worker_id` when the caller doesn't override. Format:
+/// `<hostname>-<pid>-<rand8>`. Random suffix disambiguates two
+/// processes on the same host (e.g. two slots on a runner).
+pub fn default_worker_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "host".to_string());
+    let pid = std::process::id();
+    let rand = uuid::Uuid::new_v4().simple().to_string();
+    format!("{host}-{pid}-{}", &rand[..8.min(rand.len())])
 }
 
 pub async fn run(
@@ -109,11 +129,12 @@ pub async fn run(
         // identical (ClaimResponse carries job_id either way).
         let claim_result = match &cfg.mode {
             ClaimMode::Job(job_id) => {
-                let fut = client.claim(
+                let fut = client.claim_as_worker(
                     *job_id,
                     &cfg.system,
                     &cfg.supported_features,
                     CLAIM_LONG_POLL_SECS,
+                    cfg.worker_id.as_deref(),
                 );
                 tokio::select! {
                     r = fut => r,
@@ -124,8 +145,12 @@ pub async fn run(
                 }
             }
             ClaimMode::Fleet => {
-                let fut =
-                    client.claim_any(&cfg.system, &cfg.supported_features, CLAIM_LONG_POLL_SECS);
+                let fut = client.claim_any_as_worker(
+                    &cfg.system,
+                    &cfg.supported_features,
+                    CLAIM_LONG_POLL_SECS,
+                    cfg.worker_id.as_deref(),
+                );
                 tokio::select! {
                     r = fut => r,
                     _ = shutdown.changed() => {
@@ -219,6 +244,7 @@ async fn build_and_report(
     dry_run: bool,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let started_at_wall = chrono::Utc::now();
     let start = Instant::now();
     let outcome = if dry_run {
         BuildOutcome::success(0)
@@ -226,6 +252,7 @@ async fn build_and_report(
         build(&claim.drv_path, &mut shutdown).await
     };
     let duration_ms = start.elapsed().as_millis() as u64;
+    let ended_at_wall = chrono::Utc::now();
 
     // If the build was cancelled via shutdown, skip the completion
     // POST. The coordinator's reaper (claim deadline or heartbeat
@@ -245,6 +272,29 @@ async fn build_and_report(
         error_message: outcome.message.clone(),
         log_tail: outcome.log_tail.clone(),
     };
+
+    // Best-effort: upload the full log archive BEFORE /complete so the
+    // log is available the instant the failure event lands. Successful
+    // builds don't upload (we don't care about successful logs and they
+    // dominate the volume). Upload failures are logged but never block
+    // /complete — losing an archive entry is recoverable; losing the
+    // build outcome isn't.
+    if !outcome.success {
+        if let Some(full) = &outcome.full_log_raw {
+            upload_log_best_effort(
+                &client,
+                job_id,
+                &claim,
+                full,
+                outcome.original_size,
+                outcome.truncated,
+                outcome.exit_code,
+                started_at_wall,
+                ended_at_wall,
+            )
+            .await;
+        }
+    }
 
     let mut attempt: u32 = 0;
     loop {
@@ -288,6 +338,53 @@ async fn build_and_report(
     }
 }
 
+/// Gzip + POST the full build log. One attempt; failures are logged
+/// only. The 64 KiB inline tail in `CompleteRequest.log_tail` is the
+/// fallback display path when the archive is unavailable.
+#[allow(clippy::too_many_arguments)]
+async fn upload_log_best_effort(
+    client: &CoordinatorClient,
+    job_id: JobId,
+    claim: &ClaimResponse,
+    raw: &[u8],
+    original_size: u32,
+    truncated: bool,
+    exit_code: Option<i32>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    ended_at: chrono::DateTime<chrono::Utc>,
+) {
+    let gz = match gzip_bytes(raw) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = %e, drv = %claim.drv_hash, "log gzip failed; skipping upload");
+            return;
+        }
+    };
+    let drv_hash = DrvHash::new(claim.drv_hash.as_str().to_string());
+    let meta = BuildLogUploadMeta {
+        drv_hash: &drv_hash,
+        attempt: claim.attempt,
+        original_size,
+        truncated,
+        success: false,
+        exit_code,
+        started_at,
+        ended_at,
+    };
+    if let Err(e) = client.upload_log(job_id, claim.claim_id, meta, gz).await {
+        tracing::warn!(error = %e, drv = %claim.drv_hash, "log upload failed; coordinator will fall back to inline tail");
+    }
+}
+
+fn gzip_bytes(raw: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::with_capacity(raw.len() / 8), Compression::default());
+    enc.write_all(raw)?;
+    enc.finish()
+}
+
 struct BuildOutcome {
     success: bool,
     /// True when the build was interrupted by worker shutdown. Callers
@@ -296,7 +393,23 @@ struct BuildOutcome {
     exit_code: Option<i32>,
     category: Option<ErrorCategory>,
     message: Option<String>,
+    /// Last `MAX_LOG_TAIL_BYTES` of stderr as UTF-8 string, used for
+    /// inline display in `failures[].log_tail` and SSE events. None
+    /// for successful builds (we don't carry their logs).
     log_tail: Option<String>,
+    /// Full captured stderr (up to `MAX_BUILD_LOG_RAW_BYTES`) as raw
+    /// bytes — never converted to UTF-8 because gzip doesn't care and
+    /// avoiding the lossy conversion preserves binary diagnostic
+    /// output (e.g. core-dump bytes mixed into stderr). Uploaded to
+    /// the build_logs archive. None for successful builds.
+    full_log_raw: Option<Vec<u8>>,
+    /// Original (pre-truncation) size of the captured stderr. Equals
+    /// `full_log_raw.len()` when no truncation; larger when the
+    /// worker had to drop the head to fit the cap.
+    original_size: u32,
+    /// True when the captured stderr exceeded the cap and the head
+    /// was dropped.
+    truncated: bool,
 }
 
 impl BuildOutcome {
@@ -308,6 +421,9 @@ impl BuildOutcome {
             category: None,
             message: None,
             log_tail: None,
+            full_log_raw: None,
+            original_size: 0,
+            truncated: false,
         }
     }
 
@@ -315,7 +431,7 @@ impl BuildOutcome {
         exit_code: Option<i32>,
         category: ErrorCategory,
         message: impl Into<String>,
-        log_tail: Option<String>,
+        captured: CapturedLog,
     ) -> Self {
         Self {
             success: false,
@@ -323,7 +439,10 @@ impl BuildOutcome {
             exit_code,
             category: Some(category),
             message: Some(message.into()),
-            log_tail,
+            log_tail: captured.tail,
+            full_log_raw: captured.full,
+            original_size: captured.original_size,
+            truncated: captured.truncated,
         }
     }
 
@@ -335,6 +454,39 @@ impl BuildOutcome {
             category: None,
             message: None,
             log_tail: None,
+            full_log_raw: None,
+            original_size: 0,
+            truncated: false,
+        }
+    }
+}
+
+/// Result of capturing a child process's stderr — both the lossy
+/// inline tail (for display) and the raw full log (for archive).
+struct CapturedLog {
+    tail: Option<String>,
+    full: Option<Vec<u8>>,
+    original_size: u32,
+    truncated: bool,
+}
+
+impl CapturedLog {
+    fn from_raw(raw: Vec<u8>, original_size: u32, truncated: bool) -> Self {
+        if raw.is_empty() {
+            return Self {
+                tail: None,
+                full: None,
+                original_size,
+                truncated,
+            };
+        }
+        let tail_start = raw.len().saturating_sub(MAX_LOG_TAIL_BYTES);
+        let tail = String::from_utf8_lossy(&raw[tail_start..]).into_owned();
+        Self {
+            tail: Some(tail),
+            full: Some(raw),
+            original_size,
+            truncated,
         }
     }
 }
@@ -366,12 +518,12 @@ async fn build(drv_path: &str, shutdown: &mut watch::Receiver<bool>) -> BuildOut
                 None,
                 ErrorCategory::Transient,
                 format!("spawn nix build: {e}"),
-                None,
+                CapturedLog::from_raw(Vec::new(), 0, false),
             );
         }
     };
     let stderr = child.stderr.take();
-    let tail_handle = tokio::spawn(stderr_ring_tail(stderr));
+    let tail_handle = tokio::spawn(stderr_capture(stderr));
 
     // Race the build against shutdown. On shutdown, start_kill() sends
     // SIGKILL to the nix build child group; we then wait() to reap it
@@ -388,45 +540,78 @@ async fn build(drv_path: &str, shutdown: &mut watch::Receiver<bool>) -> BuildOut
         }
     };
 
-    let tail = tail_handle.await.unwrap_or_default();
+    let captured = tail_handle
+        .await
+        .unwrap_or_else(|_| StderrCapture::default());
     match status {
         Ok(s) if s.success() => BuildOutcome::success(s.code().unwrap_or(0)),
-        Ok(s) => BuildOutcome::failed(
-            s.code(),
-            classify_stderr(&tail),
-            "nix build failed",
-            Some(tail),
-        ),
+        Ok(s) => {
+            let category = classify_stderr_bytes(&captured.raw);
+            BuildOutcome::failed(
+                s.code(),
+                category,
+                "nix build failed",
+                CapturedLog::from_raw(captured.raw, captured.original_size, captured.truncated),
+            )
+        }
         Err(e) => BuildOutcome::failed(
             None,
             ErrorCategory::Transient,
             format!("wait nix build: {e}"),
-            Some(tail),
+            CapturedLog::from_raw(captured.raw, captured.original_size, captured.truncated),
         ),
     }
 }
 
-/// Ring-buffered stderr tail. Keeps at most `MAX_LOG_TAIL_BYTES` and
-/// converts to UTF-8 (lossy) at close. Never allocates more than
-/// `2 * MAX_LOG_TAIL_BYTES + STDERR_READ_CHUNK`.
-async fn stderr_ring_tail(stderr: Option<tokio::process::ChildStderr>) -> String {
+#[derive(Default)]
+struct StderrCapture {
+    raw: Vec<u8>,
+    original_size: u32,
+    truncated: bool,
+}
+
+/// Stderr capture for both archive (full, up to `MAX_BUILD_LOG_RAW_BYTES`)
+/// and inline display (last `MAX_LOG_TAIL_BYTES`). The lossy UTF-8
+/// conversion happens at the consumer.
+///
+/// Memory budget: at most `MAX_BUILD_LOG_RAW_BYTES + STDERR_READ_CHUNK`.
+async fn stderr_capture(stderr: Option<tokio::process::ChildStderr>) -> StderrCapture {
     use tokio::io::AsyncReadExt;
     let Some(mut pipe) = stderr else {
-        return String::new();
+        return StderrCapture::default();
     };
-    let mut tail: Vec<u8> = Vec::with_capacity(MAX_LOG_TAIL_BYTES);
-    let mut buf = [0u8; STDERR_READ_CHUNK];
-    while let Ok(n) = pipe.read(&mut buf).await {
+    let mut buf_in = [0u8; STDERR_READ_CHUNK];
+    let mut raw: Vec<u8> = Vec::new();
+    let mut original: u64 = 0;
+    let mut truncated = false;
+    while let Ok(n) = pipe.read(&mut buf_in).await {
         if n == 0 {
             break;
         }
-        tail.extend_from_slice(&buf[..n]);
-        if tail.len() > MAX_LOG_TAIL_BYTES {
-            let excess = tail.len() - MAX_LOG_TAIL_BYTES;
-            tail.drain(..excess);
+        original = original.saturating_add(n as u64);
+        raw.extend_from_slice(&buf_in[..n]);
+        if raw.len() > MAX_BUILD_LOG_RAW_BYTES {
+            // Drop from the head: builds are tail-biased (the failure
+            // is at the end). Mark truncated so the metadata reflects
+            // it.
+            let excess = raw.len() - MAX_BUILD_LOG_RAW_BYTES;
+            raw.drain(..excess);
+            truncated = true;
         }
     }
-    String::from_utf8_lossy(&tail).into_owned()
+    StderrCapture {
+        raw,
+        original_size: original.min(u32::MAX as u64) as u32,
+        truncated,
+    }
+}
+
+/// Lossy classification on the raw bytes — same matcher as
+/// `classify_stderr` but without the `.to_ascii_lowercase()` allocation
+/// of the full log; we lower-case ad-hoc for matching.
+fn classify_stderr_bytes(raw: &[u8]) -> ErrorCategory {
+    let s = String::from_utf8_lossy(raw);
+    classify_stderr(&s)
 }
 
 /// Classify a failed build from its stderr tail.

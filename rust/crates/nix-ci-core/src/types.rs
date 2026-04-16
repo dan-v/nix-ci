@@ -248,6 +248,14 @@ pub struct ClaimQuery {
     /// server only claims drvs whose `required_features` ⊆ this set.
     #[serde(default)]
     pub features: String,
+    /// Optional worker identifier (e.g. `host42-pid12345-a3b91c`).
+    /// Stored on the resulting `ActiveClaim` and surfaced via
+    /// `GET /claims` so an operator can map "drv X claimed for 90 min"
+    /// to a specific worker host. Free-form; cardinality is the
+    /// operator's problem (the coordinator does not put it on a
+    /// Prometheus label).
+    #[serde(default)]
+    pub worker: Option<String>,
 }
 
 impl ClaimQuery {
@@ -445,4 +453,67 @@ pub struct JobsListResponse {
     /// Pass back as `?cursor=<value>`.
     #[serde(default)]
     pub next_cursor: Option<DateTime<Utc>>,
+}
+
+// ─── API: build log archive ───────────────────────────────────────────
+
+/// Worker-side cap on captured stderr per attempt before gzip. ~10-20×
+/// compression on typical build output puts the wire payload in the
+/// 200-400 KiB range. The 64 KiB tail used for inline display is
+/// independent (`MAX_LOG_TAIL_BYTES`).
+pub const MAX_BUILD_LOG_RAW_BYTES: usize = 4 * 1024 * 1024;
+
+/// One stored attempt's metadata (no bytes). Returned by
+/// `GET /jobs/{id}/drvs/{drv_hash}/logs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildLogAttempt {
+    pub claim_id: ClaimId,
+    pub attempt: i32,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    /// Raw size before gzip (post-truncation if `truncated`).
+    pub original_size: u32,
+    /// On-disk gzipped size.
+    pub stored_size: u32,
+    /// True if the worker had to truncate the head of the log to fit
+    /// `MAX_BUILD_LOG_RAW_BYTES`.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildLogsResponse {
+    pub job_id: JobId,
+    pub drv_hash: DrvHash,
+    /// Newest attempt first.
+    pub attempts: Vec<BuildLogAttempt>,
+}
+
+// ─── API: in-flight claim listing (worker observability) ──────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveClaimSummary {
+    pub claim_id: ClaimId,
+    pub job_id: JobId,
+    pub drv_hash: DrvHash,
+    pub attempt: i32,
+    /// Free-form worker identifier supplied at claim time
+    /// (e.g. `host42-pid12345-a3b91c`). Empty when the worker is older
+    /// or doesn't set the `worker` query param.
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    /// Wall-clock when the claim was issued.
+    pub claimed_at: DateTime<Utc>,
+    /// Milliseconds since the claim was issued, snapshot at request
+    /// time. Sorted newest→oldest in the listing response.
+    pub elapsed_ms: u64,
+    /// Wall-clock deadline after which the reaper will recycle the
+    /// claim back into the runnable queue.
+    pub deadline: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimsListResponse {
+    pub claims: Vec<ActiveClaimSummary>,
 }

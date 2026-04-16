@@ -8,15 +8,29 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
 use crate::types::{
-    ClaimId, ClaimResponse, CompleteRequest, CompleteResponse, CreateJobRequest, CreateJobResponse,
-    IngestBatchRequest, IngestBatchResponse, IngestDrvRequest, IngestDrvResponse, JobId,
-    JobStatusResponse, JobsListResponse, SealJobResponse,
+    BuildLogsResponse, ClaimId, ClaimResponse, ClaimsListResponse, CompleteRequest,
+    CompleteResponse, CreateJobRequest, CreateJobResponse, DrvHash, IngestBatchRequest,
+    IngestBatchResponse, IngestDrvRequest, IngestDrvResponse, JobId, JobStatusResponse,
+    JobsListResponse, SealJobResponse,
 };
 
 #[derive(Clone)]
 pub struct CoordinatorClient {
     base: String,
     http: Client,
+}
+
+/// Metadata for a build-log upload. Borrowed from caller-owned data so
+/// the worker doesn't have to clone the drv_hash on the hot path.
+pub struct BuildLogUploadMeta<'a> {
+    pub drv_hash: &'a DrvHash,
+    pub attempt: i32,
+    pub original_size: u32,
+    pub truncated: bool,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl CoordinatorClient {
@@ -96,6 +110,8 @@ impl CoordinatorClient {
         }
     }
 
+    /// Per-job claim. Convenience wrapper over [`Self::claim_as_worker`]
+    /// without a `worker_id`. Used by tests + the legacy code paths.
     pub async fn claim(
         &self,
         job_id: JobId,
@@ -103,16 +119,31 @@ impl CoordinatorClient {
         features: &[String],
         wait_secs: u64,
     ) -> Result<Option<ClaimResponse>> {
+        self.claim_as_worker(job_id, system, features, wait_secs, None)
+            .await
+    }
+
+    /// Per-job claim with explicit worker identity. The id is recorded
+    /// on the `ActiveClaim` so `GET /claims` can attribute the work.
+    pub async fn claim_as_worker(
+        &self,
+        job_id: JobId,
+        system: &str,
+        features: &[String],
+        wait_secs: u64,
+        worker_id: Option<&str>,
+    ) -> Result<Option<ClaimResponse>> {
         let url = format!("{}/jobs/{}/claim", self.base, job_id);
         let feat_csv = features.join(",");
-        let resp = self
-            .http
-            .get(&url)
-            .query(&[
-                ("wait", wait_secs.to_string().as_str()),
-                ("system", system),
-                ("features", feat_csv.as_str()),
-            ])
+        let mut req = self.http.get(&url).query(&[
+            ("wait", wait_secs.to_string().as_str()),
+            ("system", system),
+            ("features", feat_csv.as_str()),
+        ]);
+        if let Some(w) = worker_id {
+            req = req.query(&[("worker", w)]);
+        }
+        let resp = req
             .timeout(Duration::from_secs(wait_secs + 15))
             .send()
             .await?;
@@ -133,16 +164,28 @@ impl CoordinatorClient {
         features: &[String],
         wait_secs: u64,
     ) -> Result<Option<ClaimResponse>> {
+        self.claim_any_as_worker(system, features, wait_secs, None)
+            .await
+    }
+
+    pub async fn claim_any_as_worker(
+        &self,
+        system: &str,
+        features: &[String],
+        wait_secs: u64,
+        worker_id: Option<&str>,
+    ) -> Result<Option<ClaimResponse>> {
         let url = format!("{}/claim", self.base);
         let feat_csv = features.join(",");
-        let resp = self
-            .http
-            .get(&url)
-            .query(&[
-                ("wait", wait_secs.to_string().as_str()),
-                ("system", system),
-                ("features", feat_csv.as_str()),
-            ])
+        let mut req = self.http.get(&url).query(&[
+            ("wait", wait_secs.to_string().as_str()),
+            ("system", system),
+            ("features", feat_csv.as_str()),
+        ]);
+        if let Some(w) = worker_id {
+            req = req.query(&[("worker", w)]);
+        }
+        let resp = req
             .timeout(Duration::from_secs(wait_secs + 15))
             .send()
             .await?;
@@ -151,6 +194,86 @@ impl CoordinatorClient {
         }
         let response: ClaimResponse = decode(resp).await?;
         Ok(Some(response))
+    }
+
+    /// Operator: list every active claim across every job, sorted
+    /// longest-running first by the server.
+    pub async fn list_claims(&self) -> Result<ClaimsListResponse> {
+        let url = format!("{}/claims", self.base);
+        let resp = self.http.get(&url).send().await?;
+        decode(resp).await
+    }
+
+    /// Upload a per-attempt build log. Best-effort archive — caller
+    /// should not block its main flow on failure here.
+    /// `gz` is the gzip-compressed log bytes; the worker is expected
+    /// to do the compression to keep wire bytes small.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_log(
+        &self,
+        job_id: JobId,
+        claim_id: ClaimId,
+        meta: BuildLogUploadMeta<'_>,
+        gz: Vec<u8>,
+    ) -> Result<()> {
+        let url = format!("{}/jobs/{}/claims/{}/log", self.base, job_id, claim_id);
+        let mut q: Vec<(&str, String)> = vec![
+            ("drv_hash", meta.drv_hash.as_str().to_string()),
+            ("attempt", meta.attempt.to_string()),
+            ("original_size", meta.original_size.to_string()),
+            ("truncated", meta.truncated.to_string()),
+            ("success", meta.success.to_string()),
+            ("started_at", meta.started_at.to_rfc3339()),
+            ("ended_at", meta.ended_at.to_rfc3339()),
+        ];
+        if let Some(ec) = meta.exit_code {
+            q.push(("exit_code", ec.to_string()));
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .query(&q)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(gz)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let s = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Err(Error::Internal(format!("upload_log {s}: {text}")))
+    }
+
+    /// Fetch one attempt's log decompressed as text.
+    pub async fn fetch_log(&self, job_id: JobId, claim_id: ClaimId) -> Result<String> {
+        let url = format!("{}/jobs/{}/claims/{}/log", self.base, job_id, claim_id);
+        let resp = self.http.get(&url).send().await?;
+        let s = resp.status();
+        if s.is_success() {
+            Ok(resp.text().await?)
+        } else if s == StatusCode::NOT_FOUND {
+            Err(Error::NotFound(format!("log claim={claim_id}")))
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(Error::Internal(format!("fetch_log {s}: {text}")))
+        }
+    }
+
+    /// List every stored attempt for a (job, drv).
+    pub async fn list_drv_logs(
+        &self,
+        job_id: JobId,
+        drv_hash: &DrvHash,
+    ) -> Result<BuildLogsResponse> {
+        let url = format!(
+            "{}/jobs/{}/drvs/{}/logs",
+            self.base,
+            job_id,
+            drv_hash.as_str()
+        );
+        let resp = self.http.get(&url).send().await?;
+        decode(resp).await
     }
 
     pub async fn complete(

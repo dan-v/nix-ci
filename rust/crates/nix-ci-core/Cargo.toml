@@ -27,6 +27,8 @@ tracing-subscriber.workspace = true
 prometheus-client.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+flate2.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use common::{drv_path, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
+use nix_ci_core::durable::logs::PgLogStore;
+use nix_ci_core::observability::metrics::Metrics;
 use nix_ci_core::types::{
     CompleteRequest, CreateJobRequest, ErrorCategory, IngestBatchRequest, IngestDrvRequest,
     JobStatus,
@@ -1400,9 +1402,15 @@ async fn writeback_sweep_handles_statement_timeout(pool: PgPool) {
 
     // sweep still works afterward: takes a fresh connection from the
     // pool (without the LOCAL timeout) and prunes the expired row.
-    nix_ci_core::durable::cleanup::sweep(&pool, 7)
-        .await
-        .unwrap();
+    nix_ci_core::durable::cleanup::sweep(
+        &pool,
+        7,
+        14,
+        &PgLogStore::new(pool.clone()),
+        &Metrics::new(),
+    )
+    .await
+    .unwrap();
     let rows: Vec<(String,)> = sqlx::query_as("SELECT output_path FROM failed_outputs")
         .fetch_all(&pool)
         .await
@@ -1980,9 +1988,15 @@ async fn cleanup_sweep_evicts_expired_failed_outputs_and_old_jobs(pool: PgPool) 
     .unwrap();
 
     // Retention = 7 days: old is past retention, recent is within.
-    nix_ci_core::durable::cleanup::sweep(&pool, 7)
-        .await
-        .unwrap();
+    nix_ci_core::durable::cleanup::sweep(
+        &pool,
+        7,
+        14,
+        &PgLogStore::new(pool.clone()),
+        &Metrics::new(),
+    )
+    .await
+    .unwrap();
 
     let remaining_outputs: Vec<(String,)> =
         sqlx::query_as("SELECT output_path FROM failed_outputs ORDER BY output_path")

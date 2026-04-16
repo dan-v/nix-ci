@@ -134,6 +134,28 @@ pub async fn submit_batch(
         .drvs_deduped
         .inc_by(dedup_skipped as u64);
 
+    // Soft warn (no hard cap): emit ONE log line per submission that
+    // crosses the configured threshold, so an operator can spot a
+    // runaway job before it becomes a memory problem. CAS on the
+    // per-submission flag means we don't re-warn on every batch.
+    let live_members = sub.members.read().len() as u32;
+    if live_members >= state.cfg.submission_warn_threshold {
+        use std::sync::atomic::Ordering;
+        if sub
+            .warned_oversized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            tracing::warn!(
+                job_id = %sub.id,
+                members = live_members,
+                threshold = state.cfg.submission_warn_threshold,
+                "submission crossed soft size threshold (no hard cap; this is a heads-up)"
+            );
+            state.metrics.inner.submission_warn_total.inc();
+        }
+    }
+
     Ok(Json(IngestBatchResponse {
         new_drvs,
         dedup_skipped,
