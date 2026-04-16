@@ -33,6 +33,7 @@ use crate::types::{
     ActiveClaimSummary, ClaimId, ClaimQuery, ClaimResponse, ClaimsListResponse, JobEvent, JobId,
 };
 
+#[tracing::instrument(skip_all, fields(job_id = %id, system = %q.system, worker = q.worker.as_deref()))]
 pub async fn claim(
     State(state): State<AppState>,
     Path(id): Path<JobId>,
@@ -99,6 +100,7 @@ pub async fn claim(
 /// subsequent workers naturally fall through to the next job — no
 /// starvation in practice. A future `priority` field on
 /// `CreateJobRequest` would extend the sort to `(-priority, created_at)`.
+#[tracing::instrument(skip_all, fields(system = %q.system, worker = q.worker.as_deref()))]
 pub async fn claim_any(
     State(state): State<AppState>,
     Query(mut q): Query<crate::types::ClaimQuery>,

@@ -24,6 +24,12 @@ use crate::types::{
     JobId, JobStatus, JobStatusResponse, MAX_LOG_TAIL_BYTES,
 };
 
+#[tracing::instrument(skip_all, fields(
+    job_id = %job_id,
+    claim_id = %claim_id,
+    success = req.success,
+    duration_ms = req.duration_ms,
+))]
 pub async fn complete(
     State(state): State<AppState>,
     Path((job_id, claim_id)): Path<(JobId, ClaimId)>,

@@ -3,8 +3,10 @@
 
 use std::time::Duration;
 
+use opentelemetry::propagation::Injector;
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::{Error, Result};
 use crate::types::{
@@ -46,9 +48,25 @@ impl CoordinatorClient {
         }
     }
 
+    /// Wrap `Client::get` to inject the W3C `traceparent` header off
+    /// the current tracing span. When OTLP is disabled (no exporter
+    /// configured) the global propagator is a no-op and this adds no
+    /// headers — pure cost: one stack-allocated `HeaderMap`.
+    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        inject_trace(self.http.get(url))
+    }
+
+    fn post(&self, url: &str) -> reqwest::RequestBuilder {
+        inject_trace(self.http.post(url))
+    }
+
+    fn delete(&self, url: &str) -> reqwest::RequestBuilder {
+        inject_trace(self.http.delete(url))
+    }
+
     pub async fn create_job(&self, req: &CreateJobRequest) -> Result<CreateJobResponse> {
         let url = format!("{}/jobs", self.base);
-        let resp = self.http.post(&url).json(req).send().await?;
+        let resp = self.post(&url).json(req).send().await?;
         decode(resp).await
     }
 
@@ -78,13 +96,13 @@ impl CoordinatorClient {
         req: &IngestBatchRequest,
     ) -> Result<IngestBatchResponse> {
         let url = format!("{}/jobs/{}/drvs/batch", self.base, job_id);
-        let resp = self.http.post(&url).json(req).send().await?;
+        let resp = self.post(&url).json(req).send().await?;
         decode(resp).await
     }
 
     pub async fn seal(&self, job_id: JobId) -> Result<SealJobResponse> {
         let url = format!("{}/jobs/{}/seal", self.base, job_id);
-        let resp = self.http.post(&url).send().await?;
+        let resp = self.post(&url).send().await?;
         decode(resp).await
     }
 
@@ -93,13 +111,13 @@ impl CoordinatorClient {
     /// (e.g. a CI system dropping a cancelled PR's CI job).
     pub async fn cancel(&self, job_id: JobId) -> Result<SealJobResponse> {
         let url = format!("{}/jobs/{}/cancel", self.base, job_id);
-        let resp = self.http.delete(&url).send().await?;
+        let resp = self.delete(&url).send().await?;
         decode(resp).await
     }
 
     pub async fn heartbeat(&self, job_id: JobId) -> Result<()> {
         let url = format!("{}/jobs/{}/heartbeat", self.base, job_id);
-        let resp = self.http.post(&url).send().await?;
+        let resp = self.post(&url).send().await?;
         match resp.status() {
             s if s.is_success() => Ok(()),
             StatusCode::GONE => Err(Error::Gone("job is terminal".into())),
@@ -135,7 +153,7 @@ impl CoordinatorClient {
     ) -> Result<Option<ClaimResponse>> {
         let url = format!("{}/jobs/{}/claim", self.base, job_id);
         let feat_csv = features.join(",");
-        let mut req = self.http.get(&url).query(&[
+        let mut req = self.get(&url).query(&[
             ("wait", wait_secs.to_string().as_str()),
             ("system", system),
             ("features", feat_csv.as_str()),
@@ -177,7 +195,7 @@ impl CoordinatorClient {
     ) -> Result<Option<ClaimResponse>> {
         let url = format!("{}/claim", self.base);
         let feat_csv = features.join(",");
-        let mut req = self.http.get(&url).query(&[
+        let mut req = self.get(&url).query(&[
             ("wait", wait_secs.to_string().as_str()),
             ("system", system),
             ("features", feat_csv.as_str()),
@@ -200,7 +218,7 @@ impl CoordinatorClient {
     /// longest-running first by the server.
     pub async fn list_claims(&self) -> Result<ClaimsListResponse> {
         let url = format!("{}/claims", self.base);
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.get(&url).send().await?;
         decode(resp).await
     }
 
@@ -248,7 +266,7 @@ impl CoordinatorClient {
     /// Fetch one attempt's log decompressed as text.
     pub async fn fetch_log(&self, job_id: JobId, claim_id: ClaimId) -> Result<String> {
         let url = format!("{}/jobs/{}/claims/{}/log", self.base, job_id, claim_id);
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.get(&url).send().await?;
         let s = resp.status();
         if s.is_success() {
             Ok(resp.text().await?)
@@ -272,7 +290,7 @@ impl CoordinatorClient {
             job_id,
             drv_hash.as_str()
         );
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.get(&url).send().await?;
         decode(resp).await
     }
 
@@ -283,13 +301,13 @@ impl CoordinatorClient {
         req: &CompleteRequest,
     ) -> Result<CompleteResponse> {
         let url = format!("{}/jobs/{}/claims/{}/complete", self.base, job_id, claim_id);
-        let resp = self.http.post(&url).json(req).send().await?;
+        let resp = self.post(&url).json(req).send().await?;
         decode(resp).await
     }
 
     pub async fn status(&self, job_id: JobId) -> Result<JobStatusResponse> {
         let url = format!("{}/jobs/{}", self.base, job_id);
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.get(&url).send().await?;
         decode(resp).await
     }
 
@@ -306,7 +324,7 @@ impl CoordinatorClient {
             return self.status(JobId(uuid)).await;
         }
         let url = format!("{}/jobs/by-external-ref/{}", self.base, id_or_ref);
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.get(&url).send().await?;
         decode(resp).await
     }
 
@@ -337,8 +355,46 @@ impl CoordinatorClient {
 
     pub async fn admin_snapshot(&self) -> Result<crate::types::AdminSnapshot> {
         let url = format!("{}/admin/snapshot", self.base);
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.get(&url).send().await?;
         decode(resp).await
+    }
+}
+
+/// Inject the W3C `traceparent` (and `tracestate`) header for the
+/// current `tracing::Span`'s OTel context onto an outgoing request
+/// so the coordinator can stitch the resulting server-side span into
+/// the same distributed trace.
+///
+/// When OTel is disabled (no OTLP endpoint configured) the global
+/// propagator is a `NoopTextMapPropagator` and this is effectively
+/// free — no headers added, no allocations beyond the empty
+/// `HeaderMap`.
+fn inject_trace(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let cx = tracing::Span::current().context();
+    let mut headers = reqwest::header::HeaderMap::new();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&cx, &mut HeaderMapInjector(&mut headers));
+    });
+    if headers.is_empty() {
+        builder
+    } else {
+        builder.headers(headers)
+    }
+}
+
+/// Adapter mapping OTel's `Injector` trait onto `reqwest::HeaderMap`.
+/// We accept invalid header values silently — the propagator only
+/// emits ASCII-safe strings, so this branch is unreachable in practice.
+struct HeaderMapInjector<'a>(&'a mut reqwest::header::HeaderMap);
+
+impl Injector for HeaderMapInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(k), Ok(v)) = (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(k, v);
+        }
     }
 }
 
@@ -374,5 +430,52 @@ fn preview(s: &str) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..512])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injector_set_adds_header() {
+        let mut h = reqwest::header::HeaderMap::new();
+        let mut inj = HeaderMapInjector(&mut h);
+        inj.set(
+            "traceparent",
+            "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string(),
+        );
+        assert_eq!(
+            h.get("traceparent").and_then(|v| v.to_str().ok()),
+            Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
+        );
+    }
+
+    #[test]
+    fn injector_set_silently_drops_invalid_header_name() {
+        // Spaces aren't allowed in header names; the propagator never
+        // emits them, but if it ever did we don't want to panic.
+        let mut h = reqwest::header::HeaderMap::new();
+        let mut inj = HeaderMapInjector(&mut h);
+        inj.set("bad name", "value".to_string());
+        assert!(h.is_empty(), "invalid header name must be silently dropped");
+    }
+
+    #[test]
+    fn inject_trace_is_no_op_without_propagator_context() {
+        // With no OTel context active (no parent span, no propagator
+        // registered), inject_trace must produce a builder with no
+        // traceparent header. This is the production path when OTLP
+        // is disabled.
+        let client = reqwest::Client::new();
+        let req = client.get("http://example.invalid/x");
+        let injected = inject_trace(req);
+        // We can't directly inspect headers on a RequestBuilder, but
+        // we can build it into a Request and check the header set.
+        let built = injected.build().expect("build");
+        assert!(
+            built.headers().get("traceparent").is_none(),
+            "inject_trace with no active span must not add traceparent"
+        );
     }
 }

@@ -192,9 +192,17 @@ struct ServerCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    observability::init_tracing();
-
     let cli = Cli::parse();
+    // Service-name picked per subcommand so OTLP traces from the same
+    // host (operator dev box: `run` then `status`) split into honest
+    // service buckets in Jaeger/Tempo.
+    let service_name = match &cli.cmd {
+        Cmd::Server(_) => observability::service::COORDINATOR,
+        Cmd::Worker(_) => observability::service::WORKER,
+        _ => observability::service::RUNNER,
+    };
+    observability::init_tracing(service_name);
+
     match cli.cmd {
         Cmd::Run(cmd) => run_cmd(cmd).await,
         Cmd::Server(cmd) => server_cmd(cmd).await,

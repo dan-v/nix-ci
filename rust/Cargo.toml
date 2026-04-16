@@ -52,5 +52,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 flate2 = "1"
 async-trait = "0.1"
 
+# OpenTelemetry — distributed tracing. Only the pieces we actually use:
+# `opentelemetry` for the core API, `opentelemetry_sdk` for the
+# tracer + exporter plumbing, `opentelemetry-otlp` with HTTP/protobuf
+# transport (no gRPC dep tree), `tracing-opentelemetry` to bridge the
+# existing `tracing` spans into OTel.
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
+opentelemetry-semantic-conventions = "0.27"
+tracing-opentelemetry = "0.28"
+
 # Test utilities
 tempfile = "3"

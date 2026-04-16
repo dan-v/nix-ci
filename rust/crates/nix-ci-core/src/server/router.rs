@@ -4,11 +4,13 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
-use axum::http::{HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use opentelemetry::propagation::Extractor;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::AppState;
 use super::{build_logs, claim, complete, events, heartbeat, ingest_batch, jobs, ops};
@@ -127,6 +129,12 @@ async fn http_metrics_layer(
 /// carries a consistent correlation key. The response echoes the id
 /// in the `X-Request-Id` header so a worker that captured the id on
 /// its outbound call can cross-reference it in coordinator logs.
+///
+/// Also extracts a W3C `traceparent` (and `tracestate`) header if the
+/// client sent one, and links the request span to the upstream OTel
+/// trace context. The result is a single distributed trace covering
+/// `nix-ci run` → coordinator HTTP → worker → coordinator complete,
+/// visible end-to-end in Jaeger / Tempo / Honeycomb.
 async fn request_id_layer(mut req: Request<Body>, next: Next) -> Response {
     let request_id = req
         .headers()
@@ -146,6 +154,15 @@ async fn request_id_layer(mut req: Request<Body>, next: Next) -> Response {
         method = %req.method(),
         path = req.uri().path(),
     );
+    // Bridge the upstream OTel trace context (if any) into this span.
+    // When OTLP is disabled the global propagator is a no-op and this
+    // is a cheap no-op call — no allocation, no header parsing past
+    // the missing-header miss.
+    let parent_ctx = opentelemetry::global::get_text_map_propagator(|prop| {
+        prop.extract(&HeaderMapExtractor(req.headers()))
+    });
+    span.set_parent(parent_ctx);
+
     let mut resp = tracing::Instrument::instrument(next.run(req), span).await;
 
     if let Ok(header_val) = HeaderValue::from_str(&request_id) {
@@ -154,7 +171,84 @@ async fn request_id_layer(mut req: Request<Body>, next: Next) -> Response {
     resp
 }
 
+/// Adapter for the OTel propagator API, which expects an `Extractor`
+/// trait that doesn't match `HeaderMap` directly (header names are
+/// case-insensitive in HTTP but `HeaderMap`'s API expects `HeaderName`
+/// for typed access).
+struct HeaderMapExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderMapExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
 /// Request-scoped correlation id. Available via `Extension<RequestId>`
 /// in any handler that wants to read it.
 #[derive(Debug, Clone)]
 pub struct RequestId(pub String);
+
+#[cfg(test)]
+mod extractor_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn extractor_get_returns_present_header() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "traceparent",
+            HeaderValue::from_static("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
+        );
+        let ex = HeaderMapExtractor(&h);
+        assert_eq!(
+            ex.get("traceparent"),
+            Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
+        );
+    }
+
+    #[test]
+    fn extractor_get_returns_none_for_missing() {
+        let h = HeaderMap::new();
+        let ex = HeaderMapExtractor(&h);
+        assert_eq!(ex.get("traceparent"), None);
+    }
+
+    #[test]
+    fn extractor_get_is_case_insensitive() {
+        // HTTP headers are case-insensitive; reqwest/axum lowercase
+        // them on insert so the propagator's mixed-case lookup must
+        // still resolve.
+        let mut h = HeaderMap::new();
+        h.insert("traceparent", HeaderValue::from_static("00-test-test-01"));
+        let ex = HeaderMapExtractor(&h);
+        assert_eq!(ex.get("Traceparent"), Some("00-test-test-01"));
+        assert_eq!(ex.get("TRACEPARENT"), Some("00-test-test-01"));
+    }
+
+    #[test]
+    fn extractor_keys_lists_all_header_names() {
+        let mut h = HeaderMap::new();
+        h.insert("traceparent", HeaderValue::from_static("v1"));
+        h.insert("tracestate", HeaderValue::from_static("v2"));
+        let ex = HeaderMapExtractor(&h);
+        let keys = ex.keys();
+        assert!(keys.contains(&"traceparent"));
+        assert!(keys.contains(&"tracestate"));
+    }
+
+    #[test]
+    fn long_poll_route_check_matches_known_paths() {
+        assert!(is_long_poll_route("/jobs/{id}/claim"));
+        assert!(is_long_poll_route("/claim"));
+        assert!(is_long_poll_route("/jobs/{id}/events"));
+        // Negative cases — these MUST be in the latency histogram.
+        assert!(!is_long_poll_route("/jobs/{id}/seal"));
+        assert!(!is_long_poll_route("/jobs/{id}/drvs/batch"));
+        assert!(!is_long_poll_route("/jobs"));
+    }
+}

@@ -23,6 +23,7 @@ use crate::durable::writeback;
 use crate::error::Result;
 use crate::types::{drv_hash_from_path, IngestBatchRequest, IngestBatchResponse};
 
+#[tracing::instrument(skip_all, fields(job_id = %id, batch_size = req.drvs.len()))]
 pub async fn submit_batch(
     State(state): State<AppState>,
     Path(id): Path<crate::types::JobId>,

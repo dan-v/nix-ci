@@ -15,6 +15,7 @@ use crate::types::{
     JobEvent, JobId, JobStatus, JobStatusResponse, JobSummary, JobsListResponse, SealJobResponse,
 };
 
+#[tracing::instrument(skip_all, fields(external_ref = req.external_ref.as_deref()))]
 pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
@@ -43,6 +44,7 @@ pub async fn create(
     Ok(Json(CreateJobResponse { id: job_id }))
 }
 
+#[tracing::instrument(skip_all, fields(job_id = %id))]
 pub async fn seal(
     State(state): State<AppState>,
     Path(id): Path<JobId>,

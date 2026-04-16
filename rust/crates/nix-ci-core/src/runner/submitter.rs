@@ -40,6 +40,7 @@ pub struct SubmitStats {
     pub errors: u64,
 }
 
+#[tracing::instrument(skip_all, fields(job_id = %job_id))]
 pub async fn run(
     client: Arc<CoordinatorClient>,
     job_id: JobId,

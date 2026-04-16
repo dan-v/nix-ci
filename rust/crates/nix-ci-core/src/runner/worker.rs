@@ -237,6 +237,12 @@ pub async fn run(
     Ok(())
 }
 
+#[tracing::instrument(skip_all, fields(
+    job_id = %job_id,
+    claim_id = %claim.claim_id,
+    drv_hash = %claim.drv_hash,
+    attempt = claim.attempt,
+))]
 async fn build_and_report(
     client: Arc<CoordinatorClient>,
     job_id: JobId,
@@ -491,6 +497,7 @@ impl CapturedLog {
     }
 }
 
+#[tracing::instrument(skip_all, fields(drv_path = %drv_path))]
 async fn build(drv_path: &str, shutdown: &mut watch::Receiver<bool>) -> BuildOutcome {
     // Fast-path: if shutdown is already set when we arrive (e.g., the
     // claim raced with a cancel), skip the spawn entirely.
