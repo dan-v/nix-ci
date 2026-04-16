@@ -1,9 +1,21 @@
 //! Runtime configuration. Parsed by the CLI, consumed by the server
 //! and runner.
+//!
+//! Layering for `ServerConfig`:
+//!   defaults  <  JSON config file  <  env vars  <  CLI flags
+//!
+//! All knobs are surfaced via the JSON file (operator-friendly central
+//! tuning); the historical CLI/env-var subset still works (clap-managed)
+//! and overrides whatever the file says. `ServerConfig::validate()`
+//! catches obvious nonsense before the server boots.
 
 use std::net::SocketAddr;
+use std::path::Path;
 
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub database_url: String,
     pub listen: SocketAddr,
@@ -102,6 +114,143 @@ impl Default for ServerConfig {
 /// deterministic constant that won't collide with other apps using
 /// pg advisory locks on the same database.
 pub const NIX_CI_COORDINATOR_LOCK_KEY: i64 = 0x6e69_7863_6900_0001_u64 as i64;
+
+/// Errors produced when validating a `ServerConfig`. Multiple problems
+/// can be present in one config; we report all of them in one go so an
+/// operator doesn't have to fix-rerun-fix-rerun.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigErrors {
+    pub errors: Vec<String>,
+}
+
+impl std::fmt::Display for ConfigErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for e in &self.errors {
+            writeln!(f, "  - {e}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ConfigErrors {}
+
+impl ServerConfig {
+    /// Parse a JSON config file. Missing fields fall back to
+    /// `Default::default()` thanks to `#[serde(default)]` on the
+    /// struct. Unknown fields are rejected (`deny_unknown_fields`)
+    /// so a typo like `"max_attemps"` doesn't silently inherit
+    /// the default — operators see a parse error pointing at the
+    /// offending key.
+    pub fn load_json(path: &Path) -> Result<Self, ConfigErrors> {
+        let bytes = std::fs::read(path).map_err(|e| ConfigErrors {
+            errors: vec![format!("read {}: {e}", path.display())],
+        })?;
+        serde_json::from_slice(&bytes).map_err(|e| ConfigErrors {
+            errors: vec![format!("parse {}: {e}", path.display())],
+        })
+    }
+
+    /// Sanity-check the config. Returns the full list of problems so
+    /// a misconfigured deployment surfaces every issue in a single
+    /// `--validate` invocation.
+    ///
+    /// We only validate things that would clearly break the
+    /// coordinator (zero values for active counters, ordering
+    /// invariants on timeouts). We deliberately don't validate
+    /// "reasonable" ranges — operators sometimes need to push
+    /// defaults aggressively.
+    pub fn validate(&self) -> Result<(), ConfigErrors> {
+        let mut errors = Vec::new();
+
+        if self.database_url.trim().is_empty() {
+            errors.push("database_url must be non-empty".into());
+        }
+        if self.claim_deadline_secs == 0 {
+            errors.push("claim_deadline_secs must be > 0".into());
+        }
+        if self.job_heartbeat_timeout_secs == 0 {
+            errors.push("job_heartbeat_timeout_secs must be > 0".into());
+        }
+        if self.reaper_interval_secs == 0 {
+            errors.push("reaper_interval_secs must be > 0".into());
+        }
+        if self.cleanup_interval_secs == 0 {
+            errors.push("cleanup_interval_secs must be > 0".into());
+        }
+        if self.retention_days == 0 {
+            errors.push("retention_days must be > 0".into());
+        }
+        if self.build_log_retention_days == 0 {
+            errors.push("build_log_retention_days must be > 0".into());
+        }
+        if self.submission_event_capacity == 0 {
+            errors.push("submission_event_capacity must be > 0".into());
+        }
+        if self.progress_tick_secs == 0 {
+            errors.push("progress_tick_secs must be > 0".into());
+        }
+        if self.sse_keepalive_secs == 0 {
+            errors.push("sse_keepalive_secs must be > 0".into());
+        }
+        if self.max_claim_wait_secs == 0 {
+            errors.push("max_claim_wait_secs must be > 0".into());
+        }
+        if self.max_attempts < 1 {
+            errors.push("max_attempts must be >= 1".into());
+        }
+        if self.max_request_body_bytes < 1024 {
+            errors.push("max_request_body_bytes must be >= 1024 (1 KiB)".into());
+        }
+        if self.max_drv_path_bytes < 32 {
+            errors
+                .push("max_drv_path_bytes must be >= 32 (a real Nix store path is longer)".into());
+        }
+        if self.max_drv_name_bytes < 1 {
+            errors.push("max_drv_name_bytes must be >= 1".into());
+        }
+        if self.max_failures_in_result < 1 {
+            errors.push("max_failures_in_result must be >= 1".into());
+        }
+        if self.graceful_shutdown_secs == 0 {
+            errors.push("graceful_shutdown_secs must be > 0".into());
+        }
+        if self.flaky_retry_backoff_step_ms < 0 {
+            errors.push("flaky_retry_backoff_step_ms must be >= 0".into());
+        }
+
+        // Ordering invariants: a reaper that fires faster than its
+        // own timeout window will reap claims that were just issued.
+        if self.reaper_interval_secs >= self.claim_deadline_secs {
+            errors.push(format!(
+                "reaper_interval_secs ({}) must be less than claim_deadline_secs ({})",
+                self.reaper_interval_secs, self.claim_deadline_secs
+            ));
+        }
+        if self.reaper_interval_secs >= self.job_heartbeat_timeout_secs {
+            errors.push(format!(
+                "reaper_interval_secs ({}) must be less than job_heartbeat_timeout_secs ({})",
+                self.reaper_interval_secs, self.job_heartbeat_timeout_secs
+            ));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigErrors { errors })
+        }
+    }
+
+    /// Pretty JSON dump of the merged effective config, for
+    /// `nix-ci server --print-config`. Operators paste this into bug
+    /// reports.
+    pub fn to_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|e| {
+            // Should be infallible for this struct shape; fall back to
+            // Debug if it ever isn't, rather than panicking.
+            format!("/* serialization error: {e} */\n{self:#?}")
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::config::{RunnerConfig, ServerConfig, NIX_CI_COORDINATOR_LOCK_KEY};
+use nix_ci_core::config::{RunnerConfig, ServerConfig};
 use nix_ci_core::runner::eval_jobs::EvalMode;
 use nix_ci_core::runner::worker::{self, ClaimMode, WorkerConfig};
 use nix_ci_core::runner::{self, RunArgs};
@@ -182,12 +182,32 @@ struct WorkerCmd {
 
 #[derive(Debug, Parser)]
 struct ServerCmd {
+    /// JSON config file. All knobs in `ServerConfig` are exposed
+    /// via this file. Optional — without it, defaults are used.
+    /// Override order: defaults < this file < env vars < CLI flags.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+    /// Dump the merged effective config and exit (defaults overlaid
+    /// with the JSON file overlaid with env vars / CLI flags). Useful
+    /// to confirm "what's actually live?" before starting the server.
+    #[arg(long)]
+    print_config: bool,
+    /// Validate the merged config and exit. Returns 0 on success, 1
+    /// with a diagnostic on failure. Suitable for CI hooks ahead of
+    /// rolling out a config change.
+    #[arg(long)]
+    validate: bool,
+    /// Database URL. Required ultimately; can be supplied here, via
+    /// `DATABASE_URL`, or as a `database_url` field in the config
+    /// file (in CLI > env > file priority).
     #[arg(long, env = "DATABASE_URL")]
-    database_url: String,
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    listen: String,
-    #[arg(long, default_value_t = NIX_CI_COORDINATOR_LOCK_KEY)]
-    lock_key: i64,
+    database_url: Option<String>,
+    /// Listen address. Defaults to whatever the config file specifies
+    /// (or `127.0.0.1:8080` if no file).
+    #[arg(long)]
+    listen: Option<String>,
+    #[arg(long)]
+    lock_key: Option<i64>,
 }
 
 #[tokio::main]
@@ -595,16 +615,44 @@ async fn run_cmd(cmd: RunCmd) -> anyhow::Result<()> {
 }
 
 async fn server_cmd(cmd: ServerCmd) -> anyhow::Result<()> {
-    let listen = cmd
-        .listen
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("bad --listen: {e}"))?;
-    let cfg = ServerConfig {
-        database_url: cmd.database_url,
-        listen,
-        lock_key: cmd.lock_key,
-        ..ServerConfig::default()
+    // Layering: defaults < JSON file < env vars < CLI flags.
+    // Built bottom-up: load file (or defaults), then overlay any
+    // CLI/env overrides that came in via clap.
+    let mut cfg = if let Some(path) = cmd.config.as_deref() {
+        ServerConfig::load_json(path).map_err(|e| anyhow::anyhow!("config load failed:\n{e}"))?
+    } else {
+        ServerConfig::default()
     };
+
+    if let Some(url) = cmd.database_url {
+        cfg.database_url = url;
+    }
+    if let Some(listen_str) = cmd.listen.as_deref() {
+        cfg.listen = listen_str
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| anyhow::anyhow!("bad --listen: {e}"))?;
+    }
+    if let Some(k) = cmd.lock_key {
+        cfg.lock_key = k;
+    }
+
+    if cmd.print_config {
+        // No validation here — operator wants to see exactly what
+        // they have, including invalid configs they're debugging.
+        println!("{}", cfg.to_json_pretty());
+        return Ok(());
+    }
+
+    cfg.validate().map_err(|e| {
+        anyhow::anyhow!("ServerConfig validation failed (run with --validate to see all):\n{e}")
+    })?;
+
+    if cmd.validate {
+        // Validation succeeded; print a confirmation and exit cleanly.
+        eprintln!("config OK");
+        return Ok(());
+    }
+
     server::run(cfg).await?;
     Ok(())
 }
