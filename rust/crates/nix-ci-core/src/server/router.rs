@@ -25,6 +25,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/jobs/{id}/cancel", delete(jobs::cancel))
         .route("/jobs/{id}/heartbeat", post(heartbeat::heartbeat))
         .route("/jobs/{id}/claim", get(claim::claim))
+        // Fleet claim: scans all live submissions in FIFO order. Used
+        // by `nix-ci worker` instances that aren't bound to one job.
+        .route("/claim", get(claim::claim_any))
         .route(
             "/jobs/{id}/claims/{claim_id}/complete",
             post(complete::complete),

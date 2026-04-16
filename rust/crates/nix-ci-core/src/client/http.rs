@@ -123,6 +123,36 @@ impl CoordinatorClient {
         Ok(Some(response))
     }
 
+    /// Fleet claim: ask the coordinator for ANY runnable drv across
+    /// every live submission. The response carries the owning
+    /// `job_id` so subsequent `complete`/`heartbeat` calls can target
+    /// the right job. Returns `Ok(None)` on the 204 deadline path.
+    pub async fn claim_any(
+        &self,
+        system: &str,
+        features: &[String],
+        wait_secs: u64,
+    ) -> Result<Option<ClaimResponse>> {
+        let url = format!("{}/claim", self.base);
+        let feat_csv = features.join(",");
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("wait", wait_secs.to_string().as_str()),
+                ("system", system),
+                ("features", feat_csv.as_str()),
+            ])
+            .timeout(Duration::from_secs(wait_secs + 15))
+            .send()
+            .await?;
+        if resp.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        let response: ClaimResponse = decode(resp).await?;
+        Ok(Some(response))
+    }
+
     pub async fn complete(
         &self,
         job_id: JobId,

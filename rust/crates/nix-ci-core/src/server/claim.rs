@@ -1,4 +1,15 @@
-//! `GET /jobs/{id}/claim?wait=Ns&system=X&features=...` — long-poll.
+//! Two claim endpoints:
+//!
+//! * `GET /jobs/{id}/claim?wait=Ns&system=X&features=...` — per-job
+//!   long-poll. Used by `nix-ci run`-style workers tied to a single
+//!   job; returns 410 Gone when the job terminates.
+//!
+//! * `GET /claim?wait=Ns&system=X&features=...` — fleet long-poll.
+//!   Scans every live submission in FIFO order (oldest job first)
+//!   and returns the first claimable drv. Used by persistent
+//!   `nix-ci worker` instances that are not tied to any one job.
+//!   Returns 204 when nothing is claimable within the wait window;
+//!   never 410, because there's no single job to be Gone.
 //!
 //! Pure in-memory: the dispatcher's `Submissions::pop_runnable` is the
 //! only source of truth for what's claimable, and the claim itself is
@@ -77,6 +88,74 @@ pub async fn claim(
     }
 }
 
+/// Fleet claim: scan every live submission in FIFO order and return
+/// the first runnable drv that matches `system` + `features`. Long-
+/// polls via `dispatcher.notify` when nothing is claimable.
+///
+/// Fairness: oldest submission first (FIFO by `Submission.created_at`).
+/// If the oldest job has more workers than runnable drvs (saturated),
+/// subsequent workers naturally fall through to the next job — no
+/// starvation in practice. A future `priority` field on
+/// `CreateJobRequest` would extend the sort to `(-priority, created_at)`.
+pub async fn claim_any(
+    State(state): State<AppState>,
+    Query(mut q): Query<crate::types::ClaimQuery>,
+) -> Result<Response> {
+    q.wait = q.wait.min(state.cfg.max_claim_wait_secs);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(q.wait);
+    let features_vec = q.features_vec();
+
+    loop {
+        let now_ms = Utc::now().timestamp_millis();
+        // FIFO across submissions. `all()` snapshots the map under a
+        // brief read lock; we then sort + iterate without holding any
+        // dispatcher locks.
+        let mut subs = state.dispatcher.submissions.all();
+        subs.sort_by_key(|s| s.created_at);
+        for sub in &subs {
+            // Skip submissions already moving toward terminal — their
+            // ready queues may still hold weak refs but their workers
+            // are exiting.
+            if sub.is_terminal() {
+                continue;
+            }
+            if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+                let job_id = sub.id;
+                return issue_claim(&state, sub, job_id, step, start);
+            }
+        }
+        drop(subs);
+
+        if Instant::now() >= deadline {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+
+        let wait = tokio::time::sleep_until(deadline.into());
+        let notified = state.dispatcher.notify.notified();
+        tokio::select! {
+            () = notified => continue,
+            () = wait => {
+                // One last sweep before 204 — a step may have just
+                // become runnable.
+                let now_ms = Utc::now().timestamp_millis();
+                let mut subs = state.dispatcher.submissions.all();
+                subs.sort_by_key(|s| s.created_at);
+                for sub in &subs {
+                    if sub.is_terminal() {
+                        continue;
+                    }
+                    if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+                        let job_id = sub.id;
+                        return issue_claim(&state, sub, job_id, step, start);
+                    }
+                }
+                return Ok(StatusCode::NO_CONTENT.into_response());
+            }
+        }
+    }
+}
+
 fn issue_claim(
     state: &AppState,
     sub: &Arc<crate::dispatch::Submission>,
@@ -114,6 +193,7 @@ fn issue_claim(
         .observe(started_at.elapsed().as_secs_f64());
 
     Ok(Json(ClaimResponse {
+        job_id,
         claim_id,
         drv_hash: step.drv_hash().clone(),
         drv_path: step.drv_path().to_string(),

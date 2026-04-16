@@ -1203,6 +1203,7 @@ dependencies = [
  "clap",
  "nix-ci-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

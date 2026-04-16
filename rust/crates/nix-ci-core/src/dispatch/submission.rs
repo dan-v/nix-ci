@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +16,11 @@ use super::step::Step;
 
 pub struct Submission {
     pub id: JobId,
+    /// In-memory creation timestamp. Used by the fleet `claim_any`
+    /// endpoint to drain jobs in FIFO order. NOT persisted; restarts
+    /// reset to "now" which is acceptable since restart wipes
+    /// non-terminal submissions anyway.
+    pub created_at: Instant,
     pub sealed: AtomicBool,
     /// Set when the submission status transitions to terminal.
     pub terminal: AtomicBool,
@@ -38,6 +44,7 @@ impl Submission {
         let (tx, _rx) = broadcast::channel(event_capacity);
         Arc::new(Self {
             id,
+            created_at: Instant::now(),
             sealed: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             toplevels: RwLock::new(Vec::new()),
@@ -270,6 +277,14 @@ impl Submissions {
 
     pub fn remove(&self, id: JobId) -> Option<Arc<Submission>> {
         self.inner.write().remove(&id)
+    }
+
+    /// Snapshot every live submission. Used by the fleet `/claim`
+    /// endpoint to FIFO-sort by `created_at` and drain. Cloning the
+    /// `Arc`s is cheap; the read lock is released before the caller
+    /// touches submission state.
+    pub fn all(&self) -> Vec<Arc<Submission>> {
+        self.inner.read().values().cloned().collect()
     }
 }
 

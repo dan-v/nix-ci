@@ -259,6 +259,11 @@ impl ClaimQuery {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimResponse {
+    /// Job that owns this claim. Fleet workers (no job binding at
+    /// claim time) need this to address the subsequent `/complete`
+    /// and `/heartbeat` endpoints. Per-job workers receive the same
+    /// value they passed in — populated unconditionally for symmetry.
+    pub job_id: JobId,
     pub claim_id: ClaimId,
     pub drv_hash: DrvHash,
     pub drv_path: String,

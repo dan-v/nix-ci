@@ -59,8 +59,20 @@ fn backoff_with_jitter(step: u32, initial: Duration, max: Duration) -> Duration 
     Duration::from_nanos(jittered)
 }
 
+/// What set of work this worker process pulls from.
+#[derive(Clone, Debug)]
+pub enum ClaimMode {
+    /// Single-job worker. Calls `GET /jobs/{id}/claim` and exits when
+    /// the job goes Gone (terminal). This is the `nix-ci run` mode.
+    Job(JobId),
+    /// Fleet worker. Calls `GET /claim` (FIFO across all live jobs)
+    /// and runs forever until shutdown. This is the `nix-ci worker`
+    /// mode for shared-runner deployments.
+    Fleet,
+}
+
 pub struct WorkerConfig {
-    pub job_id: JobId,
+    pub mode: ClaimMode,
     pub system: String,
     pub supported_features: Vec<String>,
     pub max_parallel: u32,
@@ -92,18 +104,35 @@ pub async fn run(
             continue;
         }
 
-        // Claim (long-poll). Shutdown aborts the poll.
-        let claim_fut = client.claim(
-            cfg.job_id,
-            &cfg.system,
-            &cfg.supported_features,
-            CLAIM_LONG_POLL_SECS,
-        );
-        let claim_result = tokio::select! {
-            r = claim_fut => r,
-            _ = shutdown.changed() => {
-                tracing::info!("worker: shutdown during claim");
-                break;
+        // Claim (long-poll). Shutdown aborts the poll. The two modes
+        // differ only in WHICH endpoint we hit; the response shape is
+        // identical (ClaimResponse carries job_id either way).
+        let claim_result = match &cfg.mode {
+            ClaimMode::Job(job_id) => {
+                let fut = client.claim(
+                    *job_id,
+                    &cfg.system,
+                    &cfg.supported_features,
+                    CLAIM_LONG_POLL_SECS,
+                );
+                tokio::select! {
+                    r = fut => r,
+                    _ = shutdown.changed() => {
+                        tracing::info!("worker: shutdown during claim");
+                        break;
+                    }
+                }
+            }
+            ClaimMode::Fleet => {
+                let fut =
+                    client.claim_any(&cfg.system, &cfg.supported_features, CLAIM_LONG_POLL_SECS);
+                tokio::select! {
+                    r = fut => r,
+                    _ = shutdown.changed() => {
+                        tracing::info!("worker: shutdown during claim");
+                        break;
+                    }
+                }
             }
         };
         let claim = match claim_result {
@@ -115,6 +144,10 @@ pub async fn run(
                 transient_failures = 0;
                 continue;
             }
+            // Gone applies only to per-job mode (the bound job
+            // terminated). Fleet workers never receive Gone — there's
+            // no single job to be Gone — so this branch only fires
+            // for `ClaimMode::Job` and is the natural exit signal.
             Err(crate::Error::Gone(_)) => {
                 tracing::info!("worker: job gone");
                 break;
@@ -139,7 +172,9 @@ pub async fn run(
         let active_cloned = active.clone();
         let client_cloned = client.clone();
         let dry_run = cfg.dry_run;
-        let job_id = cfg.job_id;
+        // ClaimResponse carries the owning job_id — use it instead of
+        // any cfg-level binding so the same code path serves both modes.
+        let job_id = claim.job_id;
         let task_shutdown = shutdown.clone();
 
         join_set.spawn(async move {

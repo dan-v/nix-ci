@@ -10,7 +10,7 @@ use crate::client::CoordinatorClient;
 use crate::config::RunnerConfig;
 use crate::error::{Error, Result};
 use crate::runner::eval_jobs::EvalMode;
-use crate::runner::worker::WorkerConfig;
+use crate::runner::worker::{ClaimMode, WorkerConfig};
 use crate::runner::{sse, submitter, worker};
 use crate::types::{CreateJobRequest, JobId, JobStatus};
 
@@ -60,7 +60,7 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
         let client = client.clone();
         let rx = shutdown_rx.clone();
         let cfg = WorkerConfig {
-            job_id,
+            mode: ClaimMode::Job(job_id),
             system: args.cfg.system.clone(),
             supported_features: args.cfg.supported_features.clone(),
             max_parallel: args.cfg.max_parallel,

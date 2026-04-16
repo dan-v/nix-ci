@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use common::spawn_server;
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::runner::worker::{self, WorkerConfig};
+use nix_ci_core::runner::worker::{self, ClaimMode, WorkerConfig};
 use nix_ci_core::types::{CreateJobRequest, IngestBatchRequest, IngestDrvRequest, JobStatus};
 use sqlx::PgPool;
 use tokio::sync::watch;
@@ -53,7 +53,7 @@ async fn worker_dryrun_drains_all_drvs_to_done(pool: PgPool) {
     let worker_handle = {
         let client = client.clone();
         let cfg = WorkerConfig {
-            job_id: job.id,
+            mode: ClaimMode::Job(job.id),
             system: "x86_64-linux".into(),
             supported_features: vec![],
             max_parallel: 4,
@@ -99,7 +99,7 @@ async fn worker_shutdown_mid_longpoll_returns_quickly(pool: PgPool) {
     let worker_handle = {
         let client = client.clone();
         let cfg = WorkerConfig {
-            job_id: job.id,
+            mode: ClaimMode::Job(job.id),
             system: "x86_64-linux".into(),
             supported_features: vec![],
             max_parallel: 1,
@@ -142,7 +142,7 @@ async fn worker_exits_on_410_gone(pool: PgPool) {
         worker::run(
             client_c,
             WorkerConfig {
-                job_id: job.id,
+                mode: ClaimMode::Job(job.id),
                 system: "x86_64-linux".into(),
                 supported_features: vec![],
                 max_parallel: 1,
