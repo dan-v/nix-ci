@@ -1955,6 +1955,100 @@ async fn seal_with_no_toplevels_transitions_to_done(pool: PgPool) {
     assert!(status.failures.is_empty());
 }
 
+// ─── Cached failure short-circuits a fresh ingest ──────────────────
+
+#[sqlx::test]
+async fn previously_failed_drv_short_circuits_on_fresh_ingest(pool: PgPool) {
+    // The whole point of failed_outputs: when a *new* job ingests a
+    // drv that already failed terminally in a prior job (within the
+    // TTL), the dispatcher must mark it failed immediately rather
+    // than dispatching another build. The short-circuit was silently
+    // broken: inserts wrote the stripped output path while ingests
+    // queried with the full `.drv` path → never matched.
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    // Job 1: drive a drv to terminal BuildFailure → cache populated.
+    let job1 = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let drv = drv_path("shorted", "pkg");
+    client
+        .ingest_drv(job1.id, &ingest(&drv, "pkg", &[], true))
+        .await
+        .unwrap();
+    client.seal(job1.id).await.unwrap();
+    let c = client
+        .claim(job1.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("claim");
+    client
+        .complete(
+            job1.id,
+            c.claim_id,
+            &CompleteRequest {
+                success: false,
+                duration_ms: 1,
+                exit_code: Some(1),
+                error_category: Some(ErrorCategory::BuildFailure),
+                error_message: Some("nope".into()),
+                log_tail: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Wait for job1 terminal.
+    for _ in 0..40 {
+        if client.status(job1.id).await.unwrap().status.is_terminal() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        client.status(job1.id).await.unwrap().status,
+        JobStatus::Failed
+    );
+
+    // Job 2: ingest the SAME drv. The cache should mark it
+    // previous_failure on ingest. After seal, the job is immediately
+    // Failed — no claim is ever issued.
+    let job2 = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    client
+        .ingest_drv(job2.id, &ingest(&drv, "pkg", &[], true))
+        .await
+        .unwrap();
+    client.seal(job2.id).await.unwrap();
+
+    // No worker should be able to claim — the drv is pre-marked
+    // finished+previous_failure on ingest.
+    let res = client.claim(job2.id, "x86_64-linux", &[], 1).await;
+    match res {
+        Ok(None) => {}                         // 204: nothing to do (terminated)
+        Err(nix_ci_core::Error::Gone(_)) => {} // 410: terminal
+        other => panic!("expected None/Gone (cache short-circuit); got {other:?}"),
+    }
+
+    // And status is Failed without ever issuing a claim.
+    for _ in 0..20 {
+        if client.status(job2.id).await.unwrap().status.is_terminal() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let s = client.status(job2.id).await.unwrap();
+    assert_eq!(
+        s.status,
+        JobStatus::Failed,
+        "second job must terminate Failed via cache short-circuit (no rebuild)"
+    );
+}
+
 // ─── Battleproof: terminal failure caches output path ───────────────
 
 #[sqlx::test]

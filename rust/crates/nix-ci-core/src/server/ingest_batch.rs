@@ -41,8 +41,15 @@ pub async fn submit_batch(
         .submissions
         .get_or_insert(id, state.cfg.submission_event_capacity);
 
-    let drv_path_refs: Vec<&str> = req.drvs.iter().map(|d| d.drv_path.as_str()).collect();
-    let known_failed = writeback::failed_output_hits(&state.pool, &drv_path_refs).await;
+    // The failed_outputs cache stores the OUTPUT path (drv_path with
+    // `.drv` stripped — matches what `nix build` produces). Query in
+    // the same form so inserts and lookups stay consistent.
+    let output_path_refs: Vec<&str> = req
+        .drvs
+        .iter()
+        .map(|d| d.drv_path.trim_end_matches(".drv"))
+        .collect();
+    let known_failed = writeback::failed_output_hits(&state.pool, &output_path_refs).await;
 
     // Phase 1: look up or create every Step.
     let mut primary: Vec<(_, Arc<Step>, bool)> = Vec::with_capacity(req.drvs.len());
@@ -72,7 +79,8 @@ pub async fn submit_batch(
                 state.cfg.max_attempts,
             )
         });
-        if is_new && known_failed.contains(&d.drv_path) {
+        let stripped: &str = d.drv_path.trim_end_matches(".drv");
+        if is_new && known_failed.contains(stripped) {
             step.previous_failure
                 .store(true, std::sync::atomic::Ordering::Release);
             step.finished
