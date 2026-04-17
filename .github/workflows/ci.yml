@@ -96,12 +96,28 @@ jobs:
         # kqueue/epoll, neither of which miri implements.
         run: cargo miri test -p nix-ci-core --lib -- --skip drain_tests
 
+  # H12.1: nightly chaos at SPEC dimensions. SPEC.md C-CORRECT-1 bar
+  # is `iters=100 jobs=200 workers=64 DAG=40` in one run. We fan that
+  # across a matrix of 10 shards × 10 iters each so wall time fits in
+  # a 90-minute window; any shard failing trips the whole job (the
+  # fail-fast default). "30 consecutive green nights" is T-NIGHTLY-
+  # GREEN; don't confuse per-run iter count with aggregate nightly
+  # history.
   chaos-scale:
-    name: chaos (production-scale nightly)
+    name: chaos (production-scale nightly, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     # Only run on schedule and pushes to main — too heavy per-PR.
     if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    strategy:
+      # fail-fast: any shard regression fails the whole chaos-scale
+      # invocation. We could argue for false (complete coverage every
+      # run) but the signal we want is "is the build currently green?"
+      # — getting a fast red is more valuable than full coverage on a
+      # known-broken commit.
+      fail-fast: true
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     services:
       postgres:
         image: postgres:16
@@ -117,18 +133,22 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/nix_ci_test
-      CHAOS_ITERS: "3"
+      CHAOS_ITERS: "10"
       CHAOS_JOBS: "200"
       CHAOS_WORKERS: "64"
       CHAOS_DAG_MAX: "40"
       CHAOS_BUDGET_SECS: "600"
+      # Seed per shard so iterations are distinct across the matrix
+      # rather than 10 copies of the same 10-iter run. The chaos
+      # harness respects CHAOS_SEED for reproducibility.
+      CHAOS_SEED: "${{ matrix.shard }}"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: scale chaos
+      - name: scale chaos shard ${{ matrix.shard }}
         working-directory: rust
         run: cargo test -p nix-ci-core --features chaos-test --test chaos --release -- --nocapture
 
