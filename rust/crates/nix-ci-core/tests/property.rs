@@ -511,3 +511,113 @@ fn property_many_submissions_overlapping_graphs() {
         }
     }
 }
+
+// ─── H1: dedup-under-concurrent-submission-drop (TSan target) ────────
+//
+// THE single load-bearing invariant of global dedup: while at least one
+// strong `Arc<Step>` for a given `drv_hash` is alive, every concurrent
+// `StepsRegistry::get_or_create` for that hash must return the same
+// allocation. A bug here = split-brain: two submissions think they're
+// coordinating on the same drv but actually hold separate Arcs, and the
+// CAS-exactly-once invariant (Invariant 3) silently breaks.
+//
+// This test holds a "pinning" strong ref per drv_hash in the main
+// thread so the Weak registry can never GC the entry during the race
+// window. Workers then spam get_or_create on that hash across threads;
+// every result must be ptr_eq to the pin. A concurrent churn thread
+// hammers `live()` so the retain/GC path runs alongside the lookups.
+//
+// Separately, Invariant 7 permits a *new* Arc after the last strong
+// ref is dropped (registry observes failed Weak::upgrade and mints a
+// fresh step). That's correct behavior, not a dedup violation — this
+// test never crosses that boundary.
+//
+// Run under TSan in CI via .github/workflows/ci.yml#tsan.
+
+#[test]
+fn property_dedup_survives_concurrent_registry_lookup() {
+    use std::sync::Arc;
+    use std::thread;
+    const THREADS: usize = 8;
+    const ITERS_PER_THREAD: usize = 500;
+    const ALPHABET_SIZE: usize = 16;
+
+    let registry = Arc::new(StepsRegistry::new());
+
+    // Pin one Arc<Step> per drv_hash upfront so the Weak entry can
+    // never expire during the race. `pins[i]` is the canonical Arc
+    // for `shared-{i:04}`.
+    let mut pins: Vec<Arc<Step>> = Vec::with_capacity(ALPHABET_SIZE);
+    for i in 0..ALPHABET_SIZE {
+        let hash = DrvHash::new(format!("shared-{i:04}"));
+        let (step, is_new) = registry.get_or_create(&hash, || {
+            Step::new(
+                hash.clone(),
+                format!("/nix/store/{hash}"),
+                format!("shared-{i:04}"),
+                "x86_64-linux".into(),
+                Vec::new(),
+                2,
+            )
+        });
+        assert!(is_new, "initial pin for {hash} must be new");
+        pins.push(step);
+    }
+    let pins = Arc::new(pins);
+
+    let mut handles = Vec::with_capacity(THREADS);
+    for t in 0..THREADS {
+        let registry = registry.clone();
+        let pins = pins.clone();
+        handles.push(thread::spawn(move || {
+            let mut rng = StdRng::seed_from_u64(0xC0FFEE ^ t as u64);
+            for _ in 0..ITERS_PER_THREAD {
+                let pick = rng.gen_range(0..ALPHABET_SIZE);
+                let hash = DrvHash::new(format!("shared-{pick:04}"));
+                let (step, is_new) = registry.get_or_create(&hash, || {
+                    Step::new(
+                        hash.clone(),
+                        format!("/nix/store/{hash}"),
+                        format!("shared-{pick:04}"),
+                        "x86_64-linux".into(),
+                        Vec::new(),
+                        2,
+                    )
+                });
+                assert!(
+                    !is_new,
+                    "DEDUP VIOLATED: get_or_create minted a new Arc for pinned hash={hash}"
+                );
+                assert!(
+                    Arc::ptr_eq(&pins[pick], &step),
+                    "DEDUP VIOLATED: Arc identity differs from pin for {hash}"
+                );
+                // Drop our local Arc; the pin keeps the step alive.
+                drop(step);
+            }
+        }));
+    }
+
+    // Churn thread: hammer `live()` so the write-locked retain/GC path
+    // runs concurrently with reader get_or_create calls. The pinned
+    // refs ensure retain never drops any alphabet hash.
+    let churn_registry = registry.clone();
+    let churn_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn_stop_clone = churn_stop.clone();
+    let churn = thread::spawn(move || {
+        while !churn_stop_clone.load(Ordering::Acquire) {
+            let live = churn_registry.live();
+            assert!(
+                live.len() >= ALPHABET_SIZE,
+                "live() must not GC pinned hashes; got {} live",
+                live.len()
+            );
+        }
+    });
+
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+    churn_stop.store(true, Ordering::Release);
+    churn.join().expect("churn thread panicked");
+}
