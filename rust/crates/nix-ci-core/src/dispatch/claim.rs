@@ -4,19 +4,25 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::types::{ClaimId, DrvHash, JobId};
 
-#[derive(Clone)]
 pub struct ActiveClaim {
     pub claim_id: ClaimId,
     pub job_id: JobId,
     pub drv_hash: DrvHash,
     pub attempt: i32,
-    pub deadline: Instant,
+    /// Deadline at which the reaper re-arms the step unless the worker
+    /// extends the lease via `POST .../claims/{id}/extend`. Mutable so
+    /// a long-running build can keep the claim alive.
+    pub deadline: Mutex<Instant>,
+    /// Original lease window. Extensions set `deadline = now() +
+    /// deadline_window` so the refresh behavior is stable even if the
+    /// server-side config changes mid-flight.
+    pub deadline_window: Duration,
     /// When the claim was issued. Used by the `Progress` event to
     /// report "currently building X (3m 12s)" — derive elapsed via
     /// `Instant::now() - started_at`. Wall-clock millis are computed
@@ -70,9 +76,21 @@ impl Claims {
         self.inner
             .read()
             .values()
-            .filter(|c| c.deadline <= now)
+            .filter(|c| *c.deadline.lock() <= now)
             .map(|c| c.claim_id)
             .collect()
+    }
+
+    /// Extend the deadline of an active claim to `now + deadline_window`.
+    /// Returns the new deadline if the claim was found, `None` otherwise
+    /// (claim already expired / completed / evicted). The caller uses
+    /// `None` as the signal to stop sending extensions.
+    pub fn extend(&self, claim_id: ClaimId, now: Instant) -> Option<Instant> {
+        let guard = self.inner.read();
+        let claim = guard.get(&claim_id)?;
+        let new_deadline = now + claim.deadline_window;
+        *claim.deadline.lock() = new_deadline;
+        Some(new_deadline)
     }
 
     /// Snapshot every active claim. Used by the reaper to find claims
@@ -94,7 +112,8 @@ mod tests {
             job_id: JobId::new(),
             drv_hash: DrvHash::new("drv-test.drv"),
             attempt: 1,
-            deadline,
+            deadline: Mutex::new(deadline),
+            deadline_window: Duration::from_secs(60),
             started_at: Instant::now(),
             started_at_wall: chrono::Utc::now(),
             worker_id: None,
@@ -145,5 +164,41 @@ mod tests {
         c.insert(mk_claim(now + Duration::from_secs(60)));
         c.insert(mk_claim(now + Duration::from_secs(120)));
         assert!(c.expired_ids(now).is_empty());
+    }
+
+    #[test]
+    fn extend_moves_deadline_forward_by_window() {
+        // A claim about to expire; extend must push the deadline out by
+        // the full deadline_window so a long-running worker stays alive.
+        let c = Claims::new();
+        let now = Instant::now();
+        let claim = mk_claim(now + Duration::from_secs(1));
+        let cid = claim.claim_id;
+        c.insert(claim);
+        let new_deadline = c.extend(cid, now).expect("claim must exist");
+        // deadline_window is 60s from mk_claim; new deadline is now + 60s
+        assert_eq!(new_deadline, now + Duration::from_secs(60));
+        // And the deadline stored in the claim matches.
+        assert!(c.expired_ids(now + Duration::from_secs(30)).is_empty());
+    }
+
+    #[test]
+    fn extend_returns_none_for_unknown_claim_id() {
+        // Stale-extension signal: the worker must know to stop sending
+        // refreshes once the coordinator has lost the claim.
+        let c = Claims::new();
+        assert!(c.extend(ClaimId::new(), Instant::now()).is_none());
+    }
+
+    #[test]
+    fn extend_after_take_is_none() {
+        // Once a claim has been completed / evicted, extend must report
+        // no-claim — callers rely on this to stop the refresh loop.
+        let c = Claims::new();
+        let claim = mk_claim(Instant::now() + Duration::from_secs(60));
+        let cid = claim.claim_id;
+        c.insert(claim);
+        let _ = c.take(cid).expect("present");
+        assert!(c.extend(cid, Instant::now()).is_none());
     }
 }

@@ -310,6 +310,15 @@ pub struct ClaimResponse {
     pub deadline: DateTime<Utc>,
 }
 
+/// Response shape for `POST /jobs/{id}/claims/{claim_id}/extend`.
+/// Carries the new wall-clock deadline so the worker can log it and/or
+/// adjust its next-refresh timer — though the simplest correct policy
+/// is to refresh at a fixed cadence tied to the original deadline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtendClaimResponse {
+    pub deadline: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteRequest {
     pub success: bool,

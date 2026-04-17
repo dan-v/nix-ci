@@ -78,6 +78,15 @@ pub fn build_router(state: AppState) -> Router {
             "/jobs/{id}/claims/{claim_id}/complete",
             post(complete::complete),
         )
+        // Claim lease refresh — a worker whose build is running longer
+        // than `claim_deadline_secs` calls this periodically to extend
+        // the deadline. Without it, long builds get reaped and another
+        // worker re-claims the drv, which turns a successful build into
+        // `ignored:true` — effectively a silent infra-caused failure.
+        .route(
+            "/jobs/{id}/claims/{claim_id}/extend",
+            post(claim::extend_claim),
+        )
         // Build log archive.
         .route(
             "/jobs/{id}/claims/{claim_id}/log",

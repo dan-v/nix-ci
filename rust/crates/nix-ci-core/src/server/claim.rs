@@ -235,7 +235,7 @@ pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<Cla
                 .min(u128::from(u64::MAX)) as u64;
             // Wall-clock deadline: if the deadline already passed,
             // the reaper hasn't run yet — Utc::now() + 0 is honest.
-            let remaining = c.deadline.saturating_duration_since(now);
+            let remaining = c.deadline.lock().saturating_duration_since(now);
             let wall_deadline = Utc::now()
                 + chrono::Duration::from_std(remaining).unwrap_or(chrono::Duration::zero());
             ActiveClaimSummary {
@@ -254,6 +254,39 @@ pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<Cla
     // the question is "what's hung?"
     summaries.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
     Ok(axum::Json(ClaimsListResponse { claims: summaries }))
+}
+
+/// `POST /jobs/{id}/claims/{claim_id}/extend` — lease refresh for a
+/// worker whose build is taking longer than the initial claim deadline.
+/// Extends by the full `deadline_window` stored on the claim so behavior
+/// is stable across server-config drift.
+///
+/// Returns 410 Gone when the claim is unknown (already completed,
+/// evicted, or reaped). The worker uses that as the signal to stop
+/// refreshing: at that point another worker may already have re-claimed
+/// the drv and there's nothing useful for us to extend.
+#[tracing::instrument(skip_all, fields(job_id = %id, claim_id = %claim_id))]
+pub async fn extend_claim(
+    State(state): State<AppState>,
+    Path((id, claim_id)): Path<(JobId, ClaimId)>,
+) -> Result<Json<crate::types::ExtendClaimResponse>> {
+    // job_id in the path is for symmetry with the other claim endpoints
+    // and to let log aggregators group by job; the claim itself carries
+    // its own job_id so we don't use the path argument for lookup.
+    let _ = id;
+    let now = Instant::now();
+    let Some(new_deadline) = state.dispatcher.claims.extend(claim_id, now) else {
+        return Err(Error::Gone(format!(
+            "claim {claim_id} is no longer active; stop refreshing"
+        )));
+    };
+    state.metrics.inner.claim_lease_extensions.inc();
+    let remaining = new_deadline.saturating_duration_since(now);
+    let wall_deadline = Utc::now()
+        + chrono::Duration::from_std(remaining).unwrap_or(chrono::Duration::zero());
+    Ok(Json(crate::types::ExtendClaimResponse {
+        deadline: wall_deadline,
+    }))
 }
 
 /// Reject an over-long `worker_id` at the claim entry point so the
@@ -300,7 +333,8 @@ fn issue_claim(
         job_id,
         drv_hash: step.drv_hash().clone(),
         attempt,
-        deadline: now + deadline_duration,
+        deadline: parking_lot::Mutex::new(now + deadline_duration),
+        deadline_window: deadline_duration,
         started_at: now,
         started_at_wall: now_wall,
         worker_id,

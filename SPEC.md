@@ -67,9 +67,11 @@ days of nightly chaos-scale + property runs without a violation.
   polls `/healthz`, submits a job, sees it complete. Required green
   under `nix flake check`.
 - **P-NIXOS-WORKER**: Same, for the worker module (once added).
-- **P-TLS-AUTH**: With `auth.bearer` enabled, unauthenticated requests
+- **P-BEARER-AUTH**: With `auth.bearer` enabled, unauthenticated requests
   receive 401; authenticated requests succeed. Measured by
-  `http_auth::unauthorized_rejected`.
+  `http_auth::unauthorized_rejected`. (TLS is terminated by a layer in
+  front of the coordinator and is explicitly out of scope here — the
+  coordinator speaks plain HTTP / h2c.)
 - **P-UPGRADE-SAFE**: Rolling deploy (coordinator N → N+1) does not
   corrupt any jobs.result or failed_outputs row that predates the
   deploy. Measured by `resilience::rolling_upgrade` (fixture DB dump

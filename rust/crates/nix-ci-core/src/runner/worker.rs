@@ -45,6 +45,14 @@ pub struct WorkerTuning {
     /// How long we wait for in-flight builds to respond to a shutdown
     /// kill before aborting the JoinSet task.
     pub shutdown_drain_timeout: Duration,
+    /// Safety margin subtracted from the claim deadline when choosing
+    /// the lease-refresh cadence. We refresh at `(deadline - now) / 3`
+    /// but never later than `deadline - lease_refresh_margin` so a
+    /// slow PUT or a clock skew doesn't race the reaper.
+    pub lease_refresh_margin: Duration,
+    /// Lower bound on the refresh interval. Prevents us from hammering
+    /// /extend in tests where the configured deadline is tiny.
+    pub lease_refresh_min: Duration,
 }
 
 impl Default for WorkerTuning {
@@ -57,6 +65,8 @@ impl Default for WorkerTuning {
             complete_retry_delay_initial: Duration::from_secs(2),
             complete_retry_delay_max: Duration::from_secs(30),
             shutdown_drain_timeout: Duration::from_secs(5),
+            lease_refresh_margin: Duration::from_secs(30),
+            lease_refresh_min: Duration::from_secs(2),
         }
     }
 }
@@ -287,6 +297,15 @@ async fn build_and_report(
 ) -> Result<()> {
     let started_at_wall = chrono::Utc::now();
     let start = Instant::now();
+
+    // Lease refresh runs for the duration of the build. It's cancelled
+    // via the `AbortOnDrop` guard below — when the build future returns,
+    // the guard drops and the refresh task stops. This is simpler than
+    // a shutdown channel and correct because refresh never holds shared
+    // state across its own iterations.
+    let refresh_handle = spawn_lease_refresh(client.clone(), job_id, &claim, tuning);
+    let _refresh_guard = AbortOnDrop(refresh_handle);
+
     let outcome = if dry_run {
         BuildOutcome::success(0)
     } else {
@@ -710,6 +729,78 @@ fn classify_stderr(tail: &str) -> ErrorCategory {
     // Everything else — network, substituter, daemon, unknown — is
     // treated as transient. Bounded by `max_attempts` at the server.
     ErrorCategory::Transient
+}
+
+/// RAII guard that aborts a `tokio::task::JoinHandle` when dropped.
+/// Used to tie the lease-refresh task's lifetime to the build future.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn the claim-lease refresh task. The cadence is derived from the
+/// server-issued deadline (`claim.deadline` is a wall-clock instant):
+/// we aim to refresh at roughly `(deadline - now) / 3` so even a single
+/// failed refresh leaves two more chances before the lease expires.
+///
+/// When the coordinator signals the claim is gone (410 Gone), the task
+/// exits immediately — no point refreshing a claim that's already been
+/// taken by another worker. Transient failures are logged and retried
+/// on the next tick; the main build continues regardless.
+fn spawn_lease_refresh(
+    client: Arc<CoordinatorClient>,
+    job_id: JobId,
+    claim: &ClaimResponse,
+    tuning: &WorkerTuning,
+) -> tokio::task::JoinHandle<()> {
+    let claim_id = claim.claim_id;
+    let drv_hash = claim.drv_hash.clone();
+    // Compute a base interval from the initial deadline. If the deadline
+    // is already in the past (race with clock skew), fall back to the
+    // minimum so we still try at least once.
+    let now_wall = chrono::Utc::now();
+    let until_deadline = (claim.deadline - now_wall)
+        .to_std()
+        .unwrap_or(Duration::from_secs(0));
+    let safety_margin = tuning.lease_refresh_margin;
+    // Two guards:
+    // 1. refresh well before the deadline, never after `deadline - margin`
+    // 2. cadence = min(until_deadline / 3, until_deadline - margin)
+    let by_thirds = until_deadline / 3;
+    let before_margin = until_deadline.saturating_sub(safety_margin);
+    let interval = by_thirds.min(before_margin).max(tuning.lease_refresh_min);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match client.extend_claim(job_id, claim_id).await {
+                Ok(Some(_)) => {
+                    tracing::debug!(
+                        drv = %drv_hash,
+                        interval_secs = interval.as_secs(),
+                        "claim lease extended"
+                    );
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        drv = %drv_hash,
+                        "claim gone; stopping lease refresh"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        drv = %drv_hash,
+                        "lease refresh failed; will retry"
+                    );
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]

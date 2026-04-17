@@ -1652,7 +1652,6 @@ async fn reaper_does_not_re_arm_step_finished_via_propagation(pool: PgPool) {
     // `runnable=true` — that would violate the dispatcher invariant
     // and leave an orphan entry in the ready queue.
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
 
     use nix_ci_core::config::ServerConfig;
     let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
@@ -1686,9 +1685,8 @@ async fn reaper_does_not_re_arm_step_finished_via_propagation(pool: PgPool) {
         .claims
         .take(c.claim_id)
         .expect("claim present");
-    let mut forced = (*claim).clone();
-    forced.deadline = std::time::Instant::now() - Duration::from_secs(10);
-    handle.dispatcher.claims.insert(Arc::new(forced));
+    *claim.deadline.lock() = std::time::Instant::now() - Duration::from_secs(10);
+    handle.dispatcher.claims.insert(claim);
 
     // Mark the step finished BEFORE the reaper runs — simulates
     // propagation from a concurrent failure beating the reaper to
@@ -1770,9 +1768,8 @@ async fn reaper_rearms_many_concurrent_expired_claims(pool: PgPool) {
     let past = std::time::Instant::now() - Duration::from_secs(10);
     for cid in &claim_ids {
         if let Some(claim) = handle.dispatcher.claims.take(*cid) {
-            let mut forced = (*claim).clone();
-            forced.deadline = past;
-            handle.dispatcher.claims.insert(std::sync::Arc::new(forced));
+            *claim.deadline.lock() = past;
+            handle.dispatcher.claims.insert(claim);
         }
     }
 
@@ -2039,9 +2036,8 @@ async fn reaper_rearms_non_finished_expired_claim(pool: PgPool) {
         .take(c.claim_id)
         .expect("claim present");
     let past = std::time::Instant::now() - Duration::from_secs(10);
-    let mut forced = (*claim).clone();
-    forced.deadline = past;
-    handle.dispatcher.claims.insert(std::sync::Arc::new(forced));
+    *claim.deadline.lock() = past;
+    handle.dispatcher.claims.insert(claim);
 
     nix_ci_core::durable::reaper::reap_expired_claims(&handle.dispatcher);
 

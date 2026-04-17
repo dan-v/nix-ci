@@ -90,6 +90,11 @@ pub struct MetricsInner {
     /// `failed_outputs` row (pre-marked finished, no worker dispatch).
     /// Compare against `drvs_ingested` to compute the cache hit rate.
     pub failed_outputs_hits_total: Counter,
+    /// Claim-lease extensions accepted by the coordinator. A steady
+    /// rate is healthy (workers with long builds keep their leases
+    /// alive); a sudden drop coinciding with rising `claims_expired`
+    /// means workers are failing to refresh.
+    pub claim_lease_extensions: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -331,6 +336,13 @@ impl Metrics {
             failed_outputs_hits_total.clone(),
         );
 
+        let claim_lease_extensions = Counter::default();
+        registry.register(
+            "nix_ci_claim_lease_extensions",
+            "Claim leases extended by worker refresh (POST .../claims/{id}/extend)",
+            claim_lease_extensions.clone(),
+        );
+
         Self {
             inner: Arc::new(MetricsInner {
                 registry: parking_lot::Mutex::new(registry),
@@ -360,6 +372,7 @@ impl Metrics {
                 pg_pool_size,
                 pg_pool_idle,
                 failed_outputs_hits_total,
+                claim_lease_extensions,
             }),
         }
     }

@@ -11,9 +11,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::error::{Error, Result};
 use crate::types::{
     BuildLogsResponse, ClaimId, ClaimResponse, ClaimsListResponse, CompleteRequest,
-    CompleteResponse, CreateJobRequest, CreateJobResponse, DrvHash, IngestBatchRequest,
-    IngestBatchResponse, IngestDrvRequest, IngestDrvResponse, JobId, JobStatusResponse,
-    JobsListResponse, SealJobResponse,
+    CompleteResponse, CreateJobRequest, CreateJobResponse, DrvHash, ExtendClaimResponse,
+    IngestBatchRequest, IngestBatchResponse, IngestDrvRequest, IngestDrvResponse, JobId,
+    JobStatusResponse, JobsListResponse, SealJobResponse,
 };
 
 #[derive(Clone)]
@@ -314,6 +314,31 @@ impl CoordinatorClient {
         );
         let resp = self.get(&url).send().await?;
         decode(resp).await
+    }
+
+    /// Extend a claim's lease. Returns `Ok(Some(..))` on success,
+    /// `Ok(None)` when the coordinator reports the claim is already
+    /// gone (terminal, evicted, or reaped) — the worker should stop
+    /// refreshing. Other errors propagate unchanged so transient
+    /// failures bubble up to the caller's retry logic.
+    pub async fn extend_claim(
+        &self,
+        job_id: JobId,
+        claim_id: ClaimId,
+    ) -> Result<Option<ExtendClaimResponse>> {
+        let url = format!("{}/jobs/{}/claims/{}/extend", self.base, job_id, claim_id);
+        let resp = self.post(&url).send().await?;
+        match resp.status() {
+            s if s.is_success() => Ok(Some(decode(resp).await?)),
+            StatusCode::GONE => Ok(None),
+            StatusCode::UNAUTHORIZED => {
+                Err(Error::Unauthorized(resp.text().await.unwrap_or_default()))
+            }
+            s => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(Error::Internal(format!("extend_claim {s}: {body}")))
+            }
+        }
     }
 
     pub async fn complete(
