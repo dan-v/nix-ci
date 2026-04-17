@@ -35,8 +35,27 @@ pub async fn complete(
     Path((job_id, claim_id)): Path<(JobId, ClaimId)>,
     Json(mut req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>> {
-    let Some(claim) = state.dispatcher.claims.take(claim_id) else {
-        return Ok(Json(CompleteResponse { ignored: true }));
+    // Atomic take-if-job-matches: without this, a cross-job POST
+    // (malformed client or hostile caller with a valid claim_id for
+    // a different job) removed the claim from the map before the
+    // path/claim job_id check fired — eating the claim and forcing
+    // the legitimate /complete on the correct job to return
+    // ignored:true. `take_for_job` leaves the claim in place on a
+    // job mismatch so the correct owner can still finish it.
+    let claim = match state
+        .dispatcher
+        .claims
+        .take_for_job(claim_id, job_id)
+    {
+        Ok(c) => c,
+        Err(crate::dispatch::ClaimJobMismatch::NotFound) => {
+            return Ok(Json(CompleteResponse { ignored: true }));
+        }
+        Err(crate::dispatch::ClaimJobMismatch::WrongJob { actual }) => {
+            return Err(Error::BadRequest(format!(
+                "claim_id {claim_id} belongs to job {actual}, not {job_id}"
+            )));
+        }
     };
     state.metrics.inner.claims_in_flight.dec();
     // H3: claim-age histogram. `started_at` is an Instant, so this is
@@ -56,12 +75,6 @@ pub async fn complete(
                 .active_claims
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
-    }
-
-    if claim.job_id != job_id {
-        return Err(Error::BadRequest(
-            "claim_id doesn't belong to this job".into(),
-        ));
     }
 
     let Some(step) = state.dispatcher.steps.get(&claim.drv_hash) else {

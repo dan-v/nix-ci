@@ -41,6 +41,20 @@ pub struct Claims {
     inner: RwLock<HashMap<ClaimId, Arc<ActiveClaim>>>,
 }
 
+/// Outcome when a caller tries to take a claim but the path-bound
+/// job_id doesn't match the claim's recorded job_id. Split from
+/// `None` so handlers can distinguish "stale claim" (treat as
+/// ignored, normal) from "wrong job" (400 BadRequest — a client
+/// contract violation worth surfacing).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClaimJobMismatch {
+    /// Claim not in the map. Treat as stale — return ignored:true.
+    NotFound,
+    /// Claim exists but belongs to `actual`. The claim is left in
+    /// place so the correct job can still complete it.
+    WrongJob { actual: JobId },
+}
+
 impl Default for Claims {
     fn default() -> Self {
         Self::new()
@@ -60,6 +74,32 @@ impl Claims {
 
     pub fn take(&self, claim_id: ClaimId) -> Option<Arc<ActiveClaim>> {
         self.inner.write().remove(&claim_id)
+    }
+
+    /// Atomic take-if-job-matches. Returned value is `Ok(claim)` when
+    /// the claim existed and `claim.job_id == expected_job_id`;
+    /// `Err(ClaimJobMismatch::NotFound)` when the claim wasn't in
+    /// the map (already completed or never issued); and
+    /// `Err(ClaimJobMismatch::WrongJob { .. })` when the claim was
+    /// found but belongs to a different job — crucially, in that case
+    /// the claim is LEFT IN PLACE, so a subsequent /complete under
+    /// the correct job_id still succeeds. Before this was introduced
+    /// a cross-job complete removed the claim before the job_id check
+    /// in server/complete.rs ran, eating the claim; this helper moves
+    /// the check inside the write-lock to close the gap.
+    pub fn take_for_job(
+        &self,
+        claim_id: ClaimId,
+        expected_job_id: JobId,
+    ) -> std::result::Result<Arc<ActiveClaim>, ClaimJobMismatch> {
+        let mut guard = self.inner.write();
+        match guard.get(&claim_id) {
+            None => Err(ClaimJobMismatch::NotFound),
+            Some(c) if c.job_id != expected_job_id => Err(ClaimJobMismatch::WrongJob {
+                actual: c.job_id,
+            }),
+            Some(_) => Ok(guard.remove(&claim_id).expect("just checked present")),
+        }
     }
 
     pub fn len(&self) -> usize {

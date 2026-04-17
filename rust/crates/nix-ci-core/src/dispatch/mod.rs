@@ -50,7 +50,7 @@ pub mod step;
 pub mod steps;
 pub mod submission;
 
-pub use claim::{ActiveClaim, Claims};
+pub use claim::{ActiveClaim, ClaimJobMismatch, Claims};
 pub use step::{Step, StepState};
 pub use steps::StepsRegistry;
 pub use submission::{Submission, Submissions};
