@@ -265,7 +265,7 @@ async fn handle_flaky_retry(
     Ok(())
 }
 
-fn collect_submissions(step: &Arc<crate::dispatch::Step>) -> Vec<Arc<Submission>> {
+pub(super) fn collect_submissions(step: &Arc<crate::dispatch::Step>) -> Vec<Arc<Submission>> {
     let st = step.state.read();
     st.submissions.iter().filter_map(|w| w.upgrade()).collect()
 }
@@ -381,7 +381,10 @@ pub(crate) fn cap_failures(mut all: Vec<DrvFailure>, cap: usize) -> Vec<DrvFailu
 /// because they owned the root. Without that restriction a dedup-shared
 /// originating failure would pollute every joined submission's failures
 /// list with drvs those submissions never submitted.
-fn propagate_failure_inmem(root: &Arc<crate::dispatch::Step>, origin: &DrvHash) -> u64 {
+pub(super) fn propagate_failure_inmem(
+    root: &Arc<crate::dispatch::Step>,
+    origin: &DrvHash,
+) -> u64 {
     use std::collections::VecDeque;
     let mut frontier: VecDeque<Arc<crate::dispatch::Step>> = VecDeque::new();
     {

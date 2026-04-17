@@ -26,11 +26,15 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
 
+use super::complete::{check_and_publish_terminal, collect_submissions, propagate_failure_inmem};
 use super::AppState;
 use crate::dispatch::claim::ActiveClaim;
+use crate::dispatch::Step;
 use crate::error::{Error, Result};
+use crate::observability::metrics::OutcomeLabels;
 use crate::types::{
-    ActiveClaimSummary, ClaimId, ClaimQuery, ClaimResponse, ClaimsListResponse, JobEvent, JobId,
+    ActiveClaimSummary, ClaimId, ClaimQuery, ClaimResponse, ClaimsListResponse, DrvFailure,
+    ErrorCategory, JobEvent, JobId,
 };
 
 #[tracing::instrument(skip_all, fields(job_id = %id, system = %q.system, worker = q.worker.as_deref()))]
@@ -64,6 +68,10 @@ pub async fn claim(
 
         let now_ms = Utc::now().timestamp_millis();
         if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+            if step_exhausted(&step) {
+                terminal_fail_exhausted(&state, &step).await?;
+                continue;
+            }
             return issue_claim(&state, &sub, id, step, start, q.worker.clone());
         }
 
@@ -84,6 +92,10 @@ pub async fn claim(
                 // immediate 30s-round-trip re-poll from the worker.
                 let now_ms = Utc::now().timestamp_millis();
                 if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+                    if step_exhausted(&step) {
+                        terminal_fail_exhausted(&state, &step).await?;
+                        return Ok(StatusCode::NO_CONTENT.into_response());
+                    }
                     return issue_claim(&state, &sub, id, step, start, q.worker.clone());
                 }
                 return Ok(StatusCode::NO_CONTENT.into_response());
@@ -112,7 +124,7 @@ pub async fn claim_any(
     let deadline = start + Duration::from_secs(q.wait);
     let features_vec = q.features_vec();
 
-    loop {
+    'outer: loop {
         let now_ms = Utc::now().timestamp_millis();
         // Priority-first, then FIFO across submissions — dual-indexed
         // Submissions returns pre-sorted by (Reverse(priority),
@@ -132,6 +144,15 @@ pub async fn claim_any(
                 continue;
             }
             if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+                if step_exhausted(&step) {
+                    drop(subs);
+                    terminal_fail_exhausted(&state, &step).await?;
+                    // Re-scan from the top: terminalizing this step
+                    // may have propagated failures to other submissions
+                    // and we want a consistent view before the next
+                    // pop.
+                    continue 'outer;
+                }
                 let job_id = sub.id;
                 return issue_claim(&state, sub, job_id, step, start, q.worker.clone());
             }
@@ -159,6 +180,11 @@ pub async fn claim_any(
                         continue;
                     }
                     if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+                        if step_exhausted(&step) {
+                            drop(subs);
+                            terminal_fail_exhausted(&state, &step).await?;
+                            return Ok(StatusCode::NO_CONTENT.into_response());
+                        }
                         let job_id = sub.id;
                         return issue_claim(&state, sub, job_id, step, start, q.worker.clone());
                     }
@@ -254,6 +280,94 @@ pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<Cla
     // the question is "what's hung?"
     summaries.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
     Ok(axum::Json(ClaimsListResponse { claims: summaries }))
+}
+
+/// Returns true when a popped step has already consumed its full
+/// `max_tries` budget — the next claim would be attempt `max_tries + 1`,
+/// violating the retry policy. Checked before `issue_claim` so a step
+/// that's been re-armed by the reaper after repeated worker crashes
+/// doesn't silently get another retry beyond the cap.
+fn step_exhausted(step: &Arc<Step>) -> bool {
+    step.tries.load(Ordering::Acquire) >= step.max_tries()
+}
+
+/// Terminal-fail a step whose retry budget is exhausted. Runs the same
+/// in-memory propagation path as a worker-reported BuildFailure would,
+/// minus the `failed_outputs` TTL cache insert: exhaustion after
+/// transient failures / claim expiries isn't strong enough evidence
+/// that the drv itself is bad (a flaky network or a repeatedly-crashing
+/// worker looks identical), so we don't poison the dedup cache.
+///
+/// The step may already be finished by a concurrent failure
+/// propagation path — guard with `finished` before doing any work so
+/// this helper is idempotent.
+async fn terminal_fail_exhausted(state: &AppState, step: &Arc<Step>) -> Result<()> {
+    if step.finished.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    step.previous_failure.store(true, Ordering::Release);
+    step.finished.store(true, Ordering::Release);
+
+    let tries = step.tries.load(Ordering::Acquire);
+    let max = step.max_tries();
+    let msg = format!(
+        "max_retries_exceeded: {tries} attempts completed (cap {max}); \
+         last claim expired before reporting"
+    );
+
+    state
+        .metrics
+        .inner
+        .builds_completed
+        .get_or_create(&OutcomeLabels {
+            outcome: "max_retries_exceeded".into(),
+        })
+        .inc();
+
+    let subs = collect_submissions(step);
+    let failure = DrvFailure {
+        drv_hash: step.drv_hash().clone(),
+        drv_name: step.drv_name().to_string(),
+        // Transient is the honest classification: we can't tell whether
+        // the drv is actually unbuildable or the builds kept hitting
+        // infra issues. The message makes the distinction clear.
+        error_category: ErrorCategory::Transient,
+        error_message: Some(msg.clone()),
+        log_tail: None,
+        propagated_from: None,
+    };
+    for sub in &subs {
+        sub.record_failure(failure.clone());
+        sub.publish(JobEvent::DrvFailed {
+            drv_hash: step.drv_hash().clone(),
+            drv_name: step.drv_name().to_string(),
+            error_category: ErrorCategory::Transient,
+            error_message: Some(msg.clone()),
+            log_tail: None,
+            attempt: tries,
+            will_retry: false,
+            used_by_attrs: Vec::new(),
+        });
+    }
+
+    let propagated = propagate_failure_inmem(step, step.drv_hash());
+    state
+        .metrics
+        .inner
+        .propagated_failures
+        .inc_by(propagated);
+
+    for sub in &subs {
+        check_and_publish_terminal(state, sub).await?;
+    }
+    state.dispatcher.wake();
+    tracing::warn!(
+        drv = %step.drv_hash(),
+        tries,
+        max,
+        "terminal-failed step after max_retries_exceeded"
+    );
+    Ok(())
 }
 
 /// `POST /jobs/{id}/claims/{claim_id}/extend` — lease refresh for a
