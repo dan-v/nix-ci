@@ -199,24 +199,7 @@ impl CoordinatorClient {
         worker_id: Option<&str>,
     ) -> Result<Option<ClaimResponse>> {
         let url = format!("{}/jobs/{}/claim", self.base, job_id);
-        let feat_csv = features.join(",");
-        let mut req = self.get(&url).query(&[
-            ("wait", wait_secs.to_string().as_str()),
-            ("system", system),
-            ("features", feat_csv.as_str()),
-        ]);
-        if let Some(w) = worker_id {
-            req = req.query(&[("worker", w)]);
-        }
-        let resp = req
-            .timeout(Duration::from_secs(wait_secs + 15))
-            .send()
-            .await?;
-        if resp.status() == StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-        let response: ClaimResponse = decode(resp).await?;
-        Ok(Some(response))
+        self.send_claim(&url, system, features, wait_secs, worker_id).await
     }
 
     /// Fleet claim: ask the coordinator for ANY runnable drv across
@@ -241,8 +224,21 @@ impl CoordinatorClient {
         worker_id: Option<&str>,
     ) -> Result<Option<ClaimResponse>> {
         let url = format!("{}/claim", self.base);
+        self.send_claim(&url, system, features, wait_secs, worker_id).await
+    }
+
+    /// Shared GET implementation for both per-job and fleet claim
+    /// endpoints. Wire format is identical; only the URL differs.
+    async fn send_claim(
+        &self,
+        url: &str,
+        system: &str,
+        features: &[String],
+        wait_secs: u64,
+        worker_id: Option<&str>,
+    ) -> Result<Option<ClaimResponse>> {
         let feat_csv = features.join(",");
-        let mut req = self.get(&url).query(&[
+        let mut req = self.get(url).query(&[
             ("wait", wait_secs.to_string().as_str()),
             ("system", system),
             ("features", feat_csv.as_str()),
@@ -250,6 +246,10 @@ impl CoordinatorClient {
         if let Some(w) = worker_id {
             req = req.query(&[("worker", w)]);
         }
+        // Client timeout is the long-poll wait plus a generous 15s for
+        // TLS + roundtrip. Without the extra, a client whose clock is
+        // a few seconds ahead of the server can trip reqwest's own
+        // timeout before the server-side 204 deadline fires.
         let resp = req
             .timeout(Duration::from_secs(wait_secs + 15))
             .send()
