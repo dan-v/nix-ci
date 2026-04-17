@@ -170,8 +170,8 @@ fn cross_submission_dedup_shares_step_arc() {
     sub_b.enqueue_ready(&a);
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let claim_a = sub_a.pop_runnable("x86_64-linux", &[], now_ms);
-    let claim_b = sub_b.pop_runnable("x86_64-linux", &[], now_ms);
+    let claim_a = sub_a.pop_runnable(&["x86_64-linux".into()], &[], now_ms);
+    let claim_b = sub_b.pop_runnable(&["x86_64-linux".into()], &[], now_ms);
 
     // One of the two must win the CAS, the other gets None.
     match (claim_a, claim_b) {
@@ -208,11 +208,11 @@ fn feature_matching_skips_mismatched() {
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     // Worker without kvm — doesn't claim
-    let miss = sub.pop_runnable("x86_64-linux", &[], now_ms);
+    let miss = sub.pop_runnable(&["x86_64-linux".into()], &[], now_ms);
     assert!(miss.is_none());
 
     // Worker with kvm — claims
-    let hit = sub.pop_runnable("x86_64-linux", &["kvm".into()], now_ms);
+    let hit = sub.pop_runnable(&["x86_64-linux".into()], &["kvm".into()], now_ms);
     assert!(hit.is_some());
 }
 
@@ -236,11 +236,11 @@ fn retry_backoff_defers_until_next_attempt_at() {
     sub.enqueue_ready(&step);
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let miss = sub.pop_runnable("x86_64-linux", &[], now_ms);
+    let miss = sub.pop_runnable(&["x86_64-linux".into()], &[], now_ms);
     assert!(miss.is_none());
 
     let much_later = future_ms + 1000;
-    let hit = sub.pop_runnable("x86_64-linux", &[], much_later);
+    let hit = sub.pop_runnable(&["x86_64-linux".into()], &[], much_later);
     assert!(hit.is_some());
 }
 

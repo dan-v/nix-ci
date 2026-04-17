@@ -118,7 +118,7 @@ fn check_invariants(nodes: &[Arc<Step>]) {
 /// was built, or None if nothing is claimable.
 fn claim_and_finish(sub: &Arc<Submission>) -> Option<Arc<Step>> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let step = sub.pop_runnable("x86_64-linux", &[], now_ms)?;
+    let step = sub.pop_runnable(&["x86_64-linux".into()], &[], now_ms)?;
     // Simulate success
     step.finished.store(true, Ordering::Release);
     make_rdeps_runnable(&step);
@@ -322,7 +322,7 @@ fn cross_submission_cas_exactly_one_winner() {
         let mut winners = 0;
         let now_ms = chrono::Utc::now().timestamp_millis();
         for i in &order {
-            if subs[*i].pop_runnable("x86_64-linux", &[], now_ms).is_some() {
+            if subs[*i].pop_runnable(&["x86_64-linux".into()], &[], now_ms).is_some() {
                 winners += 1;
             }
         }

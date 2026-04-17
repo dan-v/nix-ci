@@ -50,6 +50,110 @@ async fn worker_without_required_feature_never_claims(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn multi_system_worker_claims_any_matching_system(pool: PgPool) {
+    // A single host (e.g. a build server with cross-compilation
+    // toolchains) can advertise multiple systems by passing a
+    // comma-separated `system` query. The coordinator walks the list
+    // in order and returns the first runnable drv from any of them.
+    //
+    // Regression guard: matches the giant-nixpkgs-overlay contract
+    // where one runner slot should be able to serve drvs targeting
+    // x86_64-linux, aarch64-linux, and cross targets simultaneously.
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    // Ingest an aarch64-linux drv — the worker's "native" preference
+    // won't match, but its second-preference will.
+    client
+        .ingest_drv(
+            job.id,
+            &IngestDrvRequest {
+                drv_path: drv_path("aa", "arm-drv"),
+                drv_name: "arm-drv".into(),
+                system: "aarch64-linux".into(),
+                required_features: vec![],
+                input_drvs: vec![],
+                is_root: true,
+                attr: None,
+            },
+        )
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    // Single-system worker advertising native first, cross second.
+    let resp = client
+        .claim(job.id, "x86_64-linux,aarch64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("multi-system worker must claim the aarch64 drv");
+    assert_eq!(resp.drv_path, drv_path("aa", "arm-drv"));
+}
+
+#[sqlx::test]
+async fn multi_system_claim_prefers_first_listed_system(pool: PgPool) {
+    // Order matters: worker passes `[native, cross]` and both systems
+    // have ready drvs. The coordinator must hand out the native one
+    // first. Guards against the trivial implementation that iterates
+    // HashMap entries in arbitrary order.
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let native = IngestDrvRequest {
+        drv_path: drv_path("nn", "native"),
+        drv_name: "native".into(),
+        system: "x86_64-linux".into(),
+        required_features: vec![],
+        input_drvs: vec![],
+        is_root: true,
+        attr: None,
+    };
+    let cross = IngestDrvRequest {
+        drv_path: drv_path("cc", "cross"),
+        drv_name: "cross".into(),
+        system: "aarch64-linux".into(),
+        required_features: vec![],
+        input_drvs: vec![],
+        is_root: true,
+        attr: None,
+    };
+    client
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: vec![native, cross],
+                eval_errors: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let first = client
+        .claim(job.id, "x86_64-linux,aarch64-linux", &[], 2)
+        .await
+        .unwrap()
+        .expect("claim");
+    assert_eq!(
+        first.drv_path,
+        drv_path("nn", "native"),
+        "x86_64-linux is preferred over aarch64-linux"
+    );
+    let second = client
+        .claim(job.id, "x86_64-linux,aarch64-linux", &[], 2)
+        .await
+        .unwrap()
+        .expect("claim");
+    assert_eq!(second.drv_path, drv_path("cc", "cross"));
+}
+
+#[sqlx::test]
 async fn worker_with_wrong_system_never_claims(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);

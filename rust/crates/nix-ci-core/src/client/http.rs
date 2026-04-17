@@ -171,6 +171,11 @@ impl CoordinatorClient {
 
     /// Per-job claim. Convenience wrapper over [`Self::claim_as_worker`]
     /// without a `worker_id`. Used by tests + the legacy code paths.
+    ///
+    /// `system` accepts either a single system (`x86_64-linux`) or a
+    /// comma-separated preference list (`x86_64-linux,aarch64-linux`).
+    /// The coordinator walks the list in order and offers the first
+    /// runnable drv from any of them.
     pub async fn claim(
         &self,
         job_id: JobId,
@@ -184,6 +189,7 @@ impl CoordinatorClient {
 
     /// Per-job claim with explicit worker identity. The id is recorded
     /// on the `ActiveClaim` so `GET /claims` can attribute the work.
+    /// See [`Self::claim`] for the `system` format.
     pub async fn claim_as_worker(
         &self,
         job_id: JobId,

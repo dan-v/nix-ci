@@ -120,6 +120,12 @@ pub enum ClaimMode {
 
 pub struct WorkerConfig {
     pub mode: ClaimMode,
+    /// Comma-separated list of systems this worker can build for.
+    /// A single-system worker passes `x86_64-linux`; a multi-arch
+    /// host running nix with cross-compilation toolchains passes
+    /// `x86_64-linux,aarch64-linux`. The coordinator walks the list
+    /// in order: a worker advertising `[native, cross]` prefers
+    /// native drvs when both are ready.
     pub system: String,
     pub supported_features: Vec<String>,
     pub max_parallel: u32,

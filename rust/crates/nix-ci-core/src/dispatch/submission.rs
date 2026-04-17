@@ -228,76 +228,87 @@ impl Submission {
             .push_back(Arc::downgrade(step));
     }
 
-    /// Pop a step from this submission's ready queue that matches the
-    /// given system + feature set. Atomic CAS on `step.runnable` wins
-    /// at most once across all submissions containing this step.
+    /// Pop a step from this submission's ready queue that matches one
+    /// of the given systems + feature set. Atomic CAS on `step.runnable`
+    /// wins at most once across all submissions containing this step.
+    ///
+    /// `systems` is tried in order: a worker that advertises
+    /// `[x86_64-linux, aarch64-linux]` will prefer native linux drvs
+    /// over cross-compiled ones when both are ready. Typical single-
+    /// system callers pass a one-element slice.
     ///
     /// Returns:
     /// - `Some(step)` on win (step is now claimed; caller must transition)
-    /// - `None` if no matching step is ready
+    /// - `None` if no matching step is ready in any of the systems
     pub fn pop_runnable(
         &self,
-        system: &str,
+        systems: &[String],
         worker_features: &[String],
         now_ms: i64,
     ) -> Option<Arc<Step>> {
+        if systems.is_empty() {
+            return None;
+        }
         let mut guard = self.ready.write();
-        let queue = guard.get_mut(system)?;
-        // Two distinct requeue destinations:
-        // - `requeue` (head): feature mismatches — another worker may
-        //   have the feature; put the entry back in the same position
-        //   so we don't bias against it.
-        // - `requeue_tail` (tail): retry-backoff entries whose
-        //   next_attempt_at is still in the future; rotating them to
-        //   the tail avoids re-popping them on every single claim.
-        let mut requeue: Vec<Weak<Step>> = Vec::new();
-        let mut requeue_tail: Vec<Weak<Step>> = Vec::new();
-        let result = loop {
-            let Some(weak) = queue.pop_front() else {
-                break None;
+        // Walk each system queue in the order the worker supplied. The
+        // first runnable match wins; a miss on `x86_64-linux` then
+        // falls through to `aarch64-linux`. We take the write lock
+        // once for the whole search because `ready` is cheap to hold
+        // and we don't want another claim slipping in between the
+        // per-system probes.
+        for sys in systems {
+            let Some(queue) = guard.get_mut(sys) else {
+                continue;
             };
-            let Some(step) = weak.upgrade() else {
-                continue; // GC'd, drop silently
+            // Two distinct requeue destinations:
+            // - `requeue` (head): feature mismatches — another worker
+            //   may have the feature; put the entry back in the same
+            //   position so we don't bias against it.
+            // - `requeue_tail` (tail): retry-backoff entries whose
+            //   next_attempt_at is still in the future; rotating them
+            //   to the tail avoids re-popping them on every single
+            //   claim.
+            let mut requeue: Vec<Weak<Step>> = Vec::new();
+            let mut requeue_tail: Vec<Weak<Step>> = Vec::new();
+            let result = loop {
+                let Some(weak) = queue.pop_front() else {
+                    break None;
+                };
+                let Some(step) = weak.upgrade() else {
+                    continue; // GC'd, drop silently
+                };
+                if step.finished.load(Ordering::Acquire) {
+                    continue;
+                }
+                if !features_subset(step.required_features(), worker_features) {
+                    requeue.push(Arc::downgrade(&step));
+                    continue;
+                }
+                let next_at = step.next_attempt_at.load(Ordering::Acquire);
+                if next_at > now_ms {
+                    requeue_tail.push(Arc::downgrade(&step));
+                    continue;
+                }
+                if step
+                    .runnable
+                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break Some(step);
+                }
+                // CAS lost to another submission; another worker got it.
             };
-            // Skip if already terminal or not ready
-            if step.finished.load(Ordering::Acquire) {
-                continue;
+            for w in requeue.into_iter().rev() {
+                queue.push_front(w);
             }
-            // Features filter. If worker can't do this, re-queue at tail.
-            if !features_subset(step.required_features(), worker_features) {
-                requeue.push(Arc::downgrade(&step));
-                continue;
+            for w in requeue_tail {
+                queue.push_back(w);
             }
-            // Retry backoff: not yet eligible. Push to the TAIL of the
-            // queue instead of the head so we don't spin re-popping
-            // the same still-waiting entry on every claim attempt.
-            // `next_attempt_at == 0` means no backoff; since now_ms is
-            // always wall-clock positive, `0 > now_ms` is false and the
-            // comparison alone suffices.
-            let next_at = step.next_attempt_at.load(Ordering::Acquire);
-            if next_at > now_ms {
-                requeue_tail.push(Arc::downgrade(&step));
-                continue;
+            if let Some(step) = result {
+                return Some(step);
             }
-            // CAS claim
-            if step
-                .runnable
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break Some(step);
-            }
-            // CAS lost to another submission; drop this weak, another
-            // submission's worker got it.
-        };
-        // Put back the skipped entries:
-        for w in requeue.into_iter().rev() {
-            queue.push_front(w);
         }
-        for w in requeue_tail {
-            queue.push_back(w);
-        }
-        result
+        None
     }
 
     pub fn publish(&self, event: JobEvent) {
@@ -908,9 +919,9 @@ mod tests {
         sub.enqueue_ready(&step);
 
         // now_ms < next_attempt_at: not claimable.
-        assert!(sub.pop_runnable("x86_64-linux", &[], 999).is_none());
+        assert!(sub.pop_runnable(&["x86_64-linux".into()], &[], 999).is_none());
         // now_ms == next_attempt_at: eligible (`>` not `>=`).
-        let claimed = sub.pop_runnable("x86_64-linux", &[], 1_000);
+        let claimed = sub.pop_runnable(&["x86_64-linux".into()], &[], 1_000);
         assert!(
             claimed.is_some(),
             "must claim at exact eligibility boundary"
@@ -923,6 +934,6 @@ mod tests {
         let sub2 = Submission::new(JobId::new(), 8);
         sub2.add_member(&fresh);
         sub2.enqueue_ready(&fresh);
-        assert!(sub2.pop_runnable("x86_64-linux", &[], 0).is_some());
+        assert!(sub2.pop_runnable(&["x86_64-linux".into()], &[], 0).is_some());
     }
 }

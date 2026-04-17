@@ -286,6 +286,14 @@ pub struct ClaimQuery {
     /// Seconds to long-poll. Capped server-side to 60.
     #[serde(default = "ClaimQuery::default_wait")]
     pub wait: u64,
+    /// Comma-separated list of systems this worker can build for
+    /// (e.g. `x86_64-linux` or `x86_64-linux,aarch64-linux`). A host
+    /// running nix with cross-compilation toolchains can advertise
+    /// every target it genuinely supports; the coordinator walks the
+    /// list in order and offers the first matching runnable drv.
+    ///
+    /// Single-system callers pass a bare `x86_64-linux` — backwards-
+    /// compatible, no escaping required.
     pub system: String,
     /// Worker-supported features as a comma-separated string. The
     /// server only claims drvs whose `required_features` ⊆ this set.
@@ -308,6 +316,18 @@ impl ClaimQuery {
 
     pub fn features_vec(&self) -> Vec<String> {
         self.features
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// Parse `system` into a list of system strings, preserving order
+    /// (used as a claim-priority hint by `pop_runnable`). Empty
+    /// entries and whitespace are stripped. A single-system call
+    /// (the 99% case) produces a one-element vec.
+    pub fn systems_vec(&self) -> Vec<String> {
+        self.system
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

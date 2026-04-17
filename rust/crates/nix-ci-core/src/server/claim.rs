@@ -67,6 +67,12 @@ pub async fn claim(
     let start = Instant::now();
     let deadline = start + Duration::from_secs(q.wait);
     let features_vec = q.features_vec();
+    let systems_vec = q.systems_vec();
+    if systems_vec.is_empty() {
+        return Err(Error::BadRequest(
+            "system query param must be non-empty".into(),
+        ));
+    }
 
     loop {
         // Check submission terminal status: a concurrent cancel / fail
@@ -78,7 +84,7 @@ pub async fn claim(
         }
 
         let now_ms = Utc::now().timestamp_millis();
-        if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+        if let Some(step) = sub.pop_runnable(&systems_vec, &features_vec, now_ms) {
             if step_exhausted(&step) {
                 terminal_fail_exhausted(&state, &step).await?;
                 continue;
@@ -102,7 +108,7 @@ pub async fn claim(
                 // timer fired. Retry once before the 204 to avoid an
                 // immediate 30s-round-trip re-poll from the worker.
                 let now_ms = Utc::now().timestamp_millis();
-                if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+                if let Some(step) = sub.pop_runnable(&systems_vec, &features_vec, now_ms) {
                     if step_exhausted(&step) {
                         terminal_fail_exhausted(&state, &step).await?;
                         return Ok(StatusCode::NO_CONTENT.into_response());
@@ -140,6 +146,12 @@ pub async fn claim_any(
     let start = Instant::now();
     let deadline = start + Duration::from_secs(q.wait);
     let features_vec = q.features_vec();
+    let systems_vec = q.systems_vec();
+    if systems_vec.is_empty() {
+        return Err(Error::BadRequest(
+            "system query param must be non-empty".into(),
+        ));
+    }
 
     'outer: loop {
         let now_ms = Utc::now().timestamp_millis();
@@ -160,7 +172,7 @@ pub async fn claim_any(
             if sub.at_worker_cap() {
                 continue;
             }
-            if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+            if let Some(step) = sub.pop_runnable(&systems_vec, &features_vec, now_ms) {
                 if step_exhausted(&step) {
                     drop(subs);
                     terminal_fail_exhausted(&state, &step).await?;
@@ -196,7 +208,7 @@ pub async fn claim_any(
                     if sub.at_worker_cap() {
                         continue;
                     }
-                    if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
+                    if let Some(step) = sub.pop_runnable(&systems_vec, &features_vec, now_ms) {
                         if step_exhausted(&step) {
                             drop(subs);
                             terminal_fail_exhausted(&state, &step).await?;

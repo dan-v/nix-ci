@@ -157,3 +157,50 @@ fn print_config_emits_valid_json() {
     let _: ServerConfig = serde_json::from_str(&pretty)
         .unwrap_or_else(|e| panic!("--print-config emitted unparseable JSON: {e}\n{pretty}"));
 }
+
+#[test]
+fn print_config_redacts_bearer_tokens() {
+    // Operators paste `--print-config` output into tickets. The
+    // plaintext token MUST NOT appear even if the operator forgets to
+    // strip it. Both the worker bearer and the optional admin bearer
+    // have to be redacted, and the redacted form still has to parse.
+    let cfg = ServerConfig {
+        auth_bearer: Some("super-secret-worker".into()),
+        admin_bearer: Some("super-secret-admin".into()),
+        ..ServerConfig::default()
+    };
+    let pretty = cfg.to_json_pretty();
+    assert!(
+        !pretty.contains("super-secret-worker"),
+        "auth_bearer plaintext leaked: {pretty}"
+    );
+    assert!(
+        !pretty.contains("super-secret-admin"),
+        "admin_bearer plaintext leaked: {pretty}"
+    );
+    assert!(pretty.contains("<redacted>"));
+    // Round-trips as valid JSON (with redacted values in place).
+    let _: ServerConfig = serde_json::from_str(&pretty)
+        .unwrap_or_else(|e| panic!("redacted config is unparseable: {e}\n{pretty}"));
+}
+
+#[test]
+fn validate_rejects_log_retention_longer_than_job_retention() {
+    // The build_logs_job_fk CASCADE deletes logs when their parent job
+    // is pruned. If log retention outlives job retention, the cascade
+    // fires before the log-cutoff fires, defeating the separate
+    // retention knob. Surface it at boot, not via missing logs in prod.
+    let cfg = ServerConfig {
+        retention_days: 7,
+        build_log_retention_days: 30,
+        ..ServerConfig::default()
+    };
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        err.errors
+            .iter()
+            .any(|e| e.contains("build_log_retention_days") && e.contains("retention_days")),
+        "expected log-vs-job retention ordering error; got {:?}",
+        err.errors
+    );
+}
