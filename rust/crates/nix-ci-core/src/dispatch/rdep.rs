@@ -73,6 +73,30 @@ pub fn enqueue_for_all_submissions(step: &Arc<Step>) {
     }
 }
 
+/// Re-arm a step whose claim just vanished (reaper deadline or admin
+/// evict) so another worker can pick it up. Guards against the race
+/// where a concurrent failure-propagation path flips `finished` to true
+/// between our `finished` probe and the `runnable=true` store — we
+/// re-check and undo so we never enqueue a queue entry that's already
+/// terminal.
+///
+/// No-op if the step is already `finished`. `pop_runnable` also skips
+/// finished steps, so the undo is belt-and-suspenders cleanup rather
+/// than a correctness boundary — preserving the property that the
+/// ready deque contains only live candidates keeps the hot path honest.
+pub fn rearm_step_if_live(step: &Arc<Step>) {
+    use std::sync::atomic::Ordering;
+    if step.finished.load(Ordering::Acquire) {
+        return;
+    }
+    step.runnable.store(true, Ordering::Release);
+    if step.finished.load(Ordering::Acquire) {
+        step.runnable.store(false, Ordering::Release);
+    } else {
+        enqueue_for_all_submissions(step);
+    }
+}
+
 /// Attach a step→dep edge in a lock-ordered way. Caller holds no
 /// locks. The step's state is mutated, then the dep's state is
 /// mutated to add a reverse weak reference.

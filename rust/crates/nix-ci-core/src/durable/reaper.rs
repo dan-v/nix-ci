@@ -183,25 +183,7 @@ pub fn reap_expired_claims(dispatcher: &Dispatcher) {
             sub.decrement_active_claim();
         }
         if let Some(step) = dispatcher.steps.get(&claim.drv_hash) {
-            if !step.finished.load(std::sync::atomic::Ordering::Acquire) {
-                step.runnable
-                    .store(true, std::sync::atomic::Ordering::Release);
-                // Race: between the load above and the store, a
-                // concurrent failure-propagation could have set
-                // finished=true. Re-check and undo so we don't
-                // enqueue a queue entry that's already terminal.
-                // `pop_runnable` skips finished steps regardless, so
-                // even if an enqueue slipped through it would be
-                // silently dropped at claim time; this undo is
-                // belt-and-suspenders cleanup, not a correctness
-                // boundary.
-                if step.finished.load(std::sync::atomic::Ordering::Acquire) {
-                    step.runnable
-                        .store(false, std::sync::atomic::Ordering::Release);
-                } else {
-                    crate::dispatch::rdep::enqueue_for_all_submissions(&step);
-                }
-            }
+            crate::dispatch::rdep::rearm_step_if_live(&step);
         }
     }
     dispatcher.wake();

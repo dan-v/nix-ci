@@ -249,20 +249,10 @@ pub async fn admin_evict_claim(
     if let Some(sub) = state.dispatcher.submissions.get(claim.job_id) {
         sub.decrement_active_claim();
     }
-    // Re-arm the step unless it's already finished (race with complete
-    // / failure propagation). Use the same guarded pattern as the
-    // deadline reaper: set runnable=true, re-check finished, undo if
-    // the check flipped to true to preserve dispatcher invariant 4.
+    // Re-arm the step (guarded against the complete / propagation race
+    // via the shared helper, which preserves dispatcher invariant 4).
     if let Some(step) = state.dispatcher.steps.get(&claim.drv_hash) {
-        use std::sync::atomic::Ordering;
-        if !step.finished.load(Ordering::Acquire) {
-            step.runnable.store(true, Ordering::Release);
-            if step.finished.load(Ordering::Acquire) {
-                step.runnable.store(false, Ordering::Release);
-            } else {
-                crate::dispatch::rdep::enqueue_for_all_submissions(&step);
-            }
-        }
+        crate::dispatch::rdep::rearm_step_if_live(&step);
     }
     state.dispatcher.wake();
     tracing::warn!(%id, "admin: claim force-evicted");
