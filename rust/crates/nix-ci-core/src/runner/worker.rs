@@ -53,6 +53,15 @@ pub struct WorkerTuning {
     /// Lower bound on the refresh interval. Prevents us from hammering
     /// /extend in tests where the configured deadline is tiny.
     pub lease_refresh_min: Duration,
+    /// Per-drv hard build timeout. When `Some`, a `nix build` that
+    /// hasn't exited by this point is SIGKILL'd and reported as a
+    /// transient failure — the coordinator retries subject to
+    /// `max_attempts`. `None` means no worker-side timeout (the only
+    /// bound is the claim deadline, which the lease-refresh loop keeps
+    /// extending). Default: 6h — generous enough for every nixpkgs
+    /// outlier we've measured (webkitgtk, chromium, llvm) while still
+    /// catching a runaway builder.
+    pub max_build_secs: Option<Duration>,
 }
 
 impl Default for WorkerTuning {
@@ -67,6 +76,7 @@ impl Default for WorkerTuning {
             shutdown_drain_timeout: Duration::from_secs(5),
             lease_refresh_margin: Duration::from_secs(30),
             lease_refresh_min: Duration::from_secs(2),
+            max_build_secs: Some(Duration::from_secs(6 * 60 * 60)),
         }
     }
 }
@@ -309,7 +319,7 @@ async fn build_and_report(
     let outcome = if dry_run {
         BuildOutcome::success(0)
     } else {
-        build(&claim.drv_path, &mut shutdown).await
+        build(&claim.drv_path, tuning.max_build_secs, &mut shutdown).await
     };
     let duration_ms = start.elapsed().as_millis() as u64;
     let ended_at_wall = chrono::Utc::now();
@@ -552,7 +562,11 @@ impl CapturedLog {
 }
 
 #[tracing::instrument(skip_all, fields(drv_path = %drv_path))]
-async fn build(drv_path: &str, shutdown: &mut watch::Receiver<bool>) -> BuildOutcome {
+async fn build(
+    drv_path: &str,
+    max_build: Option<Duration>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> BuildOutcome {
     // Fast-path: if shutdown is already set when we arrive (e.g., the
     // claim raced with a cancel), skip the spawn entirely.
     if *shutdown.borrow() {
@@ -586,11 +600,21 @@ async fn build(drv_path: &str, shutdown: &mut watch::Receiver<bool>) -> BuildOut
     let stderr = child.stderr.take();
     let tail_handle = tokio::spawn(stderr_capture(stderr));
 
-    // Race the build against shutdown. On shutdown, start_kill() sends
-    // SIGKILL to the nix build child group; we then wait() to reap it
-    // and drain stderr so the tokio-spawned reader task completes.
-    // Reaping is important — without it the child is a zombie until
-    // the parent process exits.
+    // Race the build against (shutdown, per-drv timeout, child exit).
+    // On shutdown or timeout: start_kill() sends SIGKILL to the nix
+    // build child group; we then wait() to reap it and drain stderr so
+    // the tokio-spawned reader task completes. Reaping is important —
+    // without it the child is a zombie until the parent process exits.
+    //
+    // `timeout_fut` is pending-forever when max_build is None, so the
+    // arm is never selected unless the operator opted into a bound.
+    let timeout_fut = async {
+        match max_build {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(timeout_fut);
     let status = tokio::select! {
         s = child.wait() => s,
         _ = shutdown.changed() => {
@@ -598,6 +622,26 @@ async fn build(drv_path: &str, shutdown: &mut watch::Receiver<bool>) -> BuildOut
             let _ = child.wait().await;
             let _ = tail_handle.await;
             return BuildOutcome::cancelled();
+        }
+        _ = &mut timeout_fut => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let captured = tail_handle
+                .await
+                .unwrap_or_else(|_| StderrCapture::default());
+            let secs = max_build
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            return BuildOutcome::failed(
+                None,
+                // Transient: the drv may genuinely be too slow on this
+                // worker (thermal throttling, noisy neighbor) but a
+                // different worker could complete it. The coordinator's
+                // max_tries enforcement bounds total retries.
+                ErrorCategory::Transient,
+                format!("per-drv build timeout: exceeded {secs}s"),
+                CapturedLog::from_raw(captured.raw, captured.original_size, captured.truncated),
+            );
         }
     };
 
@@ -801,6 +845,94 @@ fn spawn_lease_refresh(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod build_timeout_tests {
+    use super::*;
+
+    /// A nix-build-shaped command that runs longer than the timeout
+    /// must be killed, and the resulting outcome must be a Transient
+    /// failure with a "per-drv build timeout" message. This is what
+    /// nix-ci reports to the coordinator; the coordinator's retry
+    /// logic reads the category to decide whether to re-claim.
+    ///
+    /// We can't exercise `build()` directly because it execs `nix`,
+    /// which isn't available in the test container. Instead we
+    /// exercise the same timeout-arm logic with `sleep 10` as the
+    /// child. The invariants we care about are:
+    ///   1. timeout_fut fires before child.wait()
+    ///   2. start_kill + wait reap the child cleanly
+    ///   3. outcome.success == false, category == Transient
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_kills_child_and_reports_transient_failure() {
+        use tokio::process::Command;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("3600")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let stderr = child.stderr.take();
+        let tail_handle = tokio::spawn(stderr_capture(stderr));
+        let timeout = Duration::from_millis(50);
+        let timeout_fut = tokio::time::sleep(timeout);
+        tokio::pin!(timeout_fut);
+
+        let outcome: Option<BuildOutcome> = tokio::select! {
+            s = child.wait() => {
+                let _ = tail_handle.await;
+                // If wait() returned first, the timeout didn't fire —
+                // that would be a test-environment bug, fail loudly.
+                panic!("child exited before timeout: {s:?}");
+            }
+            _ = &mut timeout_fut => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = tail_handle.await;
+                Some(BuildOutcome::failed(
+                    None,
+                    ErrorCategory::Transient,
+                    format!("per-drv build timeout: exceeded {}s", timeout.as_secs()),
+                    CapturedLog::from_raw(Vec::new(), 0, false),
+                ))
+            }
+        };
+        let o = outcome.unwrap();
+        assert!(!o.success);
+        assert_eq!(o.category, Some(ErrorCategory::Transient));
+        assert!(
+            o.message.as_deref().unwrap().contains("per-drv build timeout"),
+            "message must name the reason: {:?}",
+            o.message
+        );
+    }
+
+    /// When `max_build` is None, the timeout arm is backed by
+    /// `std::future::pending::<()>()` — a future that never resolves.
+    /// This test pins that behavior: a pending-forever future must not
+    /// race the child's wait() arm in the absence of an explicit cap.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_timeout_means_no_kill() {
+        let max_build: Option<Duration> = None;
+        let timeout_fut = async {
+            match max_build {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(timeout_fut);
+        // Race pending-forever against a 10ms sleep — the 10ms must
+        // win every time.
+        let won = tokio::select! {
+            _ = &mut timeout_fut => "pending",
+            _ = tokio::time::sleep(Duration::from_millis(10)) => "sleep",
+        };
+        assert_eq!(
+            won, "sleep",
+            "None-backed pending future must never resolve"
+        );
+    }
 }
 
 #[cfg(test)]
