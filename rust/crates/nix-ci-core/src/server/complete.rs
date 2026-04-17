@@ -159,6 +159,29 @@ async fn handle_failure(
         return handle_flaky_retry(state, step, req, category, attempt).await;
     }
 
+    // Record the originating failure on every sub BEFORE flipping
+    // `step.finished = true`. A concurrent `check_and_publish_terminal`
+    // that observes `finished=true` via Acquire also observes writes
+    // that happened-before the Release store — including the
+    // record_failure mutation. Without this ordering, two concurrent
+    // `/complete` calls on different toplevels could both set
+    // `finished=true`, one could reach `check_and_publish_terminal`
+    // first, snapshot `sub.failures` (missing the other's record),
+    // persist, and mark terminal — permanently losing the other
+    // failure from `jobs.result` and the `JobDone` event.
+    let subs = collect_submissions(step);
+    let failure = DrvFailure {
+        drv_hash: step.drv_hash().clone(),
+        drv_name: step.drv_name().to_string(),
+        error_category: category,
+        error_message: req.error_message.clone(),
+        log_tail: req.log_tail.clone(),
+        propagated_from: None,
+    };
+    for sub in &subs {
+        sub.record_failure(failure.clone());
+    }
+
     step.previous_failure.store(true, Ordering::Release);
     step.finished.store(true, Ordering::Release);
 
@@ -198,22 +221,6 @@ async fn handle_failure(
         })
         .inc();
 
-    let subs = collect_submissions(step);
-
-    // Record the originating failure on every submission that owns this
-    // step. The DrvFailure is what the terminal `jobs.result` snapshot
-    // and `GET /jobs/{id}` will return for this drv.
-    let failure = DrvFailure {
-        drv_hash: step.drv_hash().clone(),
-        drv_name: step.drv_name().to_string(),
-        error_category: category,
-        error_message: req.error_message.clone(),
-        log_tail: req.log_tail.clone(),
-        propagated_from: None,
-    };
-    for sub in &subs {
-        sub.record_failure(failure.clone());
-    }
     publish_drv_failed(&subs, step, category, &req, attempt, false);
 
     let propagated_count = propagate_failure_inmem(step, step.drv_hash());
@@ -280,8 +287,11 @@ pub fn compute_used_by_attrs_for_bench(
     compute_used_by_attrs(sub, s)
 }
 
-/// Bench-only wrapper for [`propagate_failure_inmem`]. See
-/// [`compute_used_by_attrs_for_bench`].
+/// Cross-module entry point for [`propagate_failure_inmem`]. Used by
+/// `benches/dispatcher.rs` and by `server::ingest_batch::wire_dep`
+/// when it needs to race-close the late-attach-on-finished-dep path
+/// (see the "Race-close" comment there). Keeps the real function
+/// `pub(super)` so no other path can bypass the in-module surface.
 #[doc(hidden)]
 pub fn propagate_failure_inmem_for_bench(
     root: &Arc<crate::dispatch::Step>,

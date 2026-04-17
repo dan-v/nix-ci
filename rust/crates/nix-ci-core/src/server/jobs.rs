@@ -54,6 +54,24 @@ pub async fn create(
             )));
         }
     }
+    // Per-job overrides: ServerConfig::validate() enforces > 0 for the
+    // server-wide defaults, but the per-job overrides (claim_deadline_secs,
+    // max_workers) are caller-supplied and bypass that validation. A
+    // `claim_deadline_secs = 0` produces claims whose deadline = now,
+    // so every claim expires on the next reaper tick → re-claim → reap
+    // thrash that burns worker cycles forever. A `max_workers = 0`
+    // means the submission is permanently at its in-flight cap → no
+    // claim ever issued → job stalls until heartbeat reaper cancels.
+    if matches!(req.claim_deadline_secs, Some(0)) {
+        return Err(Error::BadRequest(
+            "claim_deadline_secs, when set, must be > 0".into(),
+        ));
+    }
+    if matches!(req.max_workers, Some(0)) {
+        return Err(Error::BadRequest(
+            "max_workers, when set, must be > 0".into(),
+        ));
+    }
     // Idempotent on external_ref: a retry with the same ref resolves
     // to the existing id (whatever its status — client decides what to
     // do with a cancelled / failed result). On hit, the existing
@@ -72,8 +90,15 @@ pub async fn create(
             return Ok(Json(CreateJobResponse { id: existing }));
         }
     }
-    let job_id = JobId::new();
-    writeback::upsert_job(&state.pool, job_id, req.external_ref.as_deref()).await?;
+    let candidate_id = JobId::new();
+    // upsert_job returns the WINNING id: either `candidate_id` (fresh
+    // insert) or the existing id when a concurrent creator beat us on
+    // `external_ref`. Using the returned id closes the TOCTOU between
+    // the idempotency lookup above and the INSERT below — without it
+    // the losing racer crashed with a 500 on the
+    // `jobs_external_ref_uniq` unique violation.
+    let job_id =
+        writeback::upsert_job(&state.pool, candidate_id, req.external_ref.as_deref()).await?;
     let _ = state.dispatcher.submissions.get_or_insert_with_options(
         job_id,
         state.cfg.submission_event_capacity,

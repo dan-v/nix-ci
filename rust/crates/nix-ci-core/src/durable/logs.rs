@@ -98,9 +98,18 @@ pub trait LogStore: Send + Sync + 'static {
     async fn row_count(&self) -> Result<u64>;
 }
 
-/// Convenience: fetch + gunzip into a UTF-8 string. Returns `None` if
-/// the row is absent. Returns an error if decompression or UTF-8
-/// conversion fails.
+/// Convenience: fetch + gunzip into a display-safe string. Returns
+/// `None` if the row is absent. Returns an error only if decompression
+/// itself fails (truncated / corrupt gzip).
+///
+/// Non-UTF-8 bytes in the decompressed payload are mapped to U+FFFD via
+/// `String::from_utf8_lossy` rather than failing. The worker deliberately
+/// stores raw stderr bytes (comment in runner/worker.rs: "avoiding the
+/// lossy conversion preserves binary diagnostic output"), so a strict
+/// UTF-8 read here would reject every build whose stderr contained a
+/// core-dump fragment or non-UTF-8 locale output. The replacement char
+/// surfaces in the operator's log view; all the surrounding text is
+/// preserved.
 pub async fn fetch_decompressed(
     store: &dyn LogStore,
     job_id: JobId,
@@ -109,11 +118,11 @@ pub async fn fetch_decompressed(
     let Some(gz) = store.fetch_gz(job_id, claim_id).await? else {
         return Ok(None);
     };
-    let mut out = String::new();
+    let mut raw: Vec<u8> = Vec::new();
     flate2::read::GzDecoder::new(gz.as_slice())
-        .read_to_string(&mut out)
+        .read_to_end(&mut raw)
         .map_err(|e| Error::Internal(format!("gunzip build log: {e}")))?;
-    Ok(Some(out))
+    Ok(Some(String::from_utf8_lossy(&raw).into_owned()))
 }
 
 /// Postgres-backed implementation. Cheap to clone (wraps `PgPool`).

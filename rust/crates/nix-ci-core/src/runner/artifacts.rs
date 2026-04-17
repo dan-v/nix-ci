@@ -121,16 +121,31 @@ fn unique_filename(drv_name: &str, used: &mut HashSet<String>) -> String {
     unreachable!()
 }
 
-/// Replace characters that are problematic in filenames. Nix drv_names
-/// are already fairly clean (alphanumeric + `-` + `.` + `_`) but
-/// guard against edge cases.
+/// Replace characters that are problematic in filenames and defuse
+/// bare `.` / `..` components so `Path::join(base, result)` cannot
+/// escape `base`. Nix drv_names are normally alphanumeric + `-` + `.`
+/// + `_`, but a hostile flake can declare a derivation whose `name`
+/// is `..` / `../../etc/passwd` / similar — left unsanitized, that
+/// becomes a traversal when the runner writes
+/// `<artifacts_dir>/build_logs/<name>.log`.
 fn sanitize_filename(s: &str) -> String {
-    s.chars()
+    let sanitized: String = s
+        .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
             c => c,
         })
-        .collect()
+        .collect();
+    // Reject standalone `.` / `..` — those would be interpreted as
+    // path components by the filesystem even in the absence of `/`
+    // separators in the filename itself. Embedded `..` (e.g.
+    // `.._.._etc_passwd`) is harmless: it's a single filename with
+    // no separators, so `Path::join(base, that)` stays in `base`.
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "_".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// Set up the artifacts directory structure. Call once at the start of

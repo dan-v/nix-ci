@@ -189,4 +189,139 @@ mod tests {
             StatusCode::FORBIDDEN
         );
     }
+
+    #[test]
+    fn all_4xx_variants_map_to_their_canonical_status() {
+        // The status-code table is the HTTP contract for the whole
+        // server. A silent re-wiring here (e.g., Gone reverting to
+        // NotFound) would break client logic that branches on status —
+        // workers treat 410 Gone as "stop polling," and a 404 would
+        // keep them retrying forever.
+        assert_eq!(
+            Error::BadRequest("x".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            Error::NotFound("x".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(Error::Gone("x".into()).status_code(), StatusCode::GONE);
+        assert_eq!(
+            Error::PayloadTooLarge("x".into()).status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            Error::Unauthorized("x".into()).status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            Error::Forbidden("x".into()).status_code(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn all_5xx_variants_classify_into_sanitized_body() {
+        // ServiceUnavailable, Internal, Config, and bare wrapped errors
+        // (Io, Serde, Subprocess) must all land as 5xx with a fixed-
+        // shape body. The specific plaintext contents must not echo
+        // the underlying cause.
+        for e in [
+            Error::ServiceUnavailable("pool saturated".into()),
+            Error::Internal("/var/nix-ci/secret leaked in path".into()),
+            Error::Config("bad env".into()),
+            Error::Io(std::io::Error::other("rm -rf / was attempted")),
+            Error::Subprocess {
+                tool: "nix-eval-jobs".into(),
+                code: 1,
+            },
+        ] {
+            let status = e.status_code();
+            assert!(
+                status.is_server_error(),
+                "expected 5xx for {e:?}, got {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_body_is_sanitized_with_canonical_reason() {
+        let e = Error::ServiceUnavailable(
+            "pool saturated; 12 tasks queued on internal-host-7".into(),
+        );
+        assert_eq!(e.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = e.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "service unavailable");
+        assert_eq!(body["code"], 503);
+    }
+
+    #[tokio::test]
+    async fn gone_body_carries_original_message_for_workers() {
+        // Workers branch on the 410 Gone message to decide whether the
+        // job was cancelled vs. terminally failed. 4xx messages are
+        // part of the contract — they MUST reach the client verbatim.
+        let e = Error::Gone("job X has been reaped".into());
+        let resp = e.into_response();
+        assert_eq!(resp.status(), StatusCode::GONE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "gone: job X has been reaped");
+        assert_eq!(body["code"], 410);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_body_carries_auth_hint_for_client() {
+        let e = Error::Unauthorized("bearer required".into());
+        let resp = e.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "unauthorized: bearer required");
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_is_4xx_with_original_message() {
+        let e = Error::PayloadTooLarge("batch of 2000001 drvs exceeds cap".into());
+        let resp = e.into_response();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("2000001"),
+            "4xx payload must retain caller-facing detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn io_error_maps_to_500_sanitized() {
+        // An io::Error's Display can include absolute paths or OS-level
+        // error codes — both are information-disclosure risks. Must be
+        // scrubbed for 5xx, same as Internal.
+        let e = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/etc/nix-ci/secrets/production.key: permission denied",
+        ));
+        assert_eq!(e.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        let resp = e.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let msg = body["error"].as_str().unwrap();
+        assert_eq!(msg, "internal server error");
+        assert!(!msg.contains("/etc/"), "io error path leaked");
+    }
+
+    #[tokio::test]
+    async fn subprocess_error_maps_to_500_sanitized() {
+        let e = Error::Subprocess {
+            tool: "nix-eval-jobs".into(),
+            code: 101,
+        };
+        let resp = e.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "internal server error");
+    }
 }

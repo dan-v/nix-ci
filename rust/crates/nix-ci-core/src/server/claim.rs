@@ -346,8 +346,6 @@ async fn terminal_fail_exhausted(state: &AppState, step: &Arc<Step>) -> Result<(
     if step.finished.load(Ordering::Acquire) {
         return Ok(());
     }
-    step.previous_failure.store(true, Ordering::Release);
-    step.finished.store(true, Ordering::Release);
 
     let tries = step.tries.load(Ordering::Acquire);
     let max = step.max_tries();
@@ -356,15 +354,11 @@ async fn terminal_fail_exhausted(state: &AppState, step: &Arc<Step>) -> Result<(
          last claim expired before reporting"
     );
 
-    state
-        .metrics
-        .inner
-        .builds_completed
-        .get_or_create(&OutcomeLabels {
-            outcome: "max_retries_exceeded".into(),
-        })
-        .inc();
-
+    // Same ordering contract as `handle_failure`: record the failure
+    // on every sub BEFORE flipping `step.finished = true`, so a
+    // concurrent `check_and_publish_terminal` that observes
+    // `finished=true` is guaranteed (via the Release barrier) to
+    // observe the recorded failure in `sub.failures`.
     let subs = collect_submissions(step);
     let failure = DrvFailure {
         drv_hash: step.drv_hash().clone(),
@@ -379,6 +373,21 @@ async fn terminal_fail_exhausted(state: &AppState, step: &Arc<Step>) -> Result<(
     };
     for sub in &subs {
         sub.record_failure(failure.clone());
+    }
+
+    step.previous_failure.store(true, Ordering::Release);
+    step.finished.store(true, Ordering::Release);
+
+    state
+        .metrics
+        .inner
+        .builds_completed
+        .get_or_create(&OutcomeLabels {
+            outcome: "max_retries_exceeded".into(),
+        })
+        .inc();
+
+    for sub in &subs {
         sub.publish(JobEvent::DrvFailed {
             drv_hash: step.drv_hash().clone(),
             drv_name: step.drv_name().to_string(),

@@ -11,21 +11,71 @@ use sqlx::PgPool;
 use crate::error::{Error, Result};
 use crate::types::{DrvHash, JobId, JobStatusResponse};
 
-/// Insert the job row. Idempotent on `id`: concurrent retries of a
-/// lost POST /jobs response will no-op rather than double-insert.
-pub async fn upsert_job(pool: &PgPool, job_id: JobId, external_ref: Option<&str>) -> Result<()> {
-    sqlx::query(
+/// Insert the job row and return the winning id. Idempotent under
+/// concurrent retries on EITHER unique constraint:
+///
+/// * On `id` — a retry of a lost `POST /jobs` response (no external_ref)
+///   resolves to the same id it would have gotten.
+/// * On `external_ref` — two concurrent `POST /jobs` with the same
+///   caller-supplied ref resolve to the SAME id. Previously the
+///   handler's "look up, then upsert" path was a TOCTOU: both
+///   lookups returned None, both inserts tried, and the loser hit
+///   `jobs_external_ref_uniq` (which `ON CONFLICT (id)` does not
+///   cover) → 500 response instead of idempotent success.
+///
+/// Implementation: we first run the INSERT with `ON CONFLICT (id)` as
+/// the arbiter. If that raises a unique-violation on a different
+/// constraint (specifically `jobs_external_ref_uniq`), fall through
+/// and SELECT the existing row by `external_ref`. This keeps the
+/// happy path a single round trip and only pays the extra SELECT on
+/// the rare external-ref race.
+pub async fn upsert_job(
+    pool: &PgPool,
+    job_id: JobId,
+    external_ref: Option<&str>,
+) -> Result<JobId> {
+    let inserted: std::result::Result<Option<(sqlx::types::Uuid,)>, sqlx::Error> = sqlx::query_as(
         r#"
         INSERT INTO jobs (id, status, external_ref)
         VALUES ($1, 'pending', $2)
         ON CONFLICT (id) DO NOTHING
+        RETURNING id
         "#,
     )
     .bind(job_id.0)
     .bind(external_ref)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .fetch_optional(pool)
+    .await;
+    match inserted {
+        Ok(Some((id,))) => Ok(JobId(id)),
+        Ok(None) => {
+            // `ON CONFLICT (id)` fired — our generated UUID already
+            // exists (should not happen in practice, but honor the
+            // idempotent contract).
+            Ok(job_id)
+        }
+        Err(sqlx::Error::Database(db_err))
+            if db_err.constraint() == Some("jobs_external_ref_uniq") =>
+        {
+            // Concurrent creator won the external_ref race; resolve
+            // to the winner's id.
+            let Some(ext) = external_ref else {
+                // Can't happen — the partial unique index only covers
+                // non-NULL external_ref, so a conflict on it implies
+                // external_ref is Some. Treat as a DB error if PG
+                // ever surprises us.
+                return Err(sqlx::Error::Database(db_err).into());
+            };
+            let row: (sqlx::types::Uuid,) = sqlx::query_as(
+                "SELECT id FROM jobs WHERE external_ref = $1 LIMIT 1",
+            )
+            .bind(ext)
+            .fetch_one(pool)
+            .await?;
+            Ok(JobId(row.0))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Look up an existing job by `external_ref`. The POST /jobs handler

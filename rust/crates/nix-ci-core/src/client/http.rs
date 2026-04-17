@@ -296,8 +296,13 @@ impl CoordinatorClient {
         if let Some(ec) = meta.exit_code {
             q.push(("exit_code", ec.to_string()));
         }
+        // Route through `self.post()` (not `self.http.post()`) so the
+        // bearer-auth header and OTel traceparent are attached. Before
+        // this was switched back, deployments with `auth_bearer` set
+        // silently 401'd on every upload — the caller logs and moves
+        // on, so the archive was lost without any symptom except
+        // missing logs at retrieval time.
         let resp = self
-            .http
             .post(&url)
             .query(&q)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -389,6 +394,20 @@ impl CoordinatorClient {
         format!("{}/jobs/{}/events", self.base, job_id)
     }
 
+    /// Build an authenticated GET request for the SSE event stream.
+    /// The SSE consumer lives in `runner::sse`; exposing a builder
+    /// (rather than sending here) lets the caller own the streaming
+    /// response + reconnect loop while still going through the shared
+    /// auth + trace-propagation path. Without this helper the SSE
+    /// consumer created a bare `reqwest::Client::new()` and lost the
+    /// bearer token — every `nix-ci run` against an auth-enabled
+    /// coordinator 401'd at the `/events` subscription and then hung.
+    pub fn events_request(&self, job_id: JobId) -> reqwest::RequestBuilder {
+        let url = self.events_url(job_id);
+        self.get(&url)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+    }
+
     /// Resolve "id-or-external-ref" → terminal status snapshot. Tries
     /// the UUID path first; if the input doesn't parse as a UUID,
     /// falls back to the by-external-ref endpoint. Used by
@@ -413,8 +432,10 @@ impl CoordinatorClient {
         limit: u32,
     ) -> Result<JobsListResponse> {
         let url = format!("{}/jobs", self.base);
+        // `self.get()` — NOT `self.http.get()` — so bearer auth and
+        // OTel traceparent propagate. The raw reqwest path was a
+        // latent 401 for every auth-enabled deployment.
         let mut req = self
-            .http
             .get(&url)
             .query(&[("status", status), ("limit", &limit.to_string())]);
         if let Some(s) = since {

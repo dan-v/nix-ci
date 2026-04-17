@@ -297,11 +297,33 @@ fn wire_dep(
             state.cfg.max_attempts,
         )
     });
+    // Fast-path: dep already done at check time. Skip the edge entirely.
     if dep.finished.load(Ordering::Acquire) {
         return Ok(());
     }
     attach_dep(parent, &dep);
     attach_step_to_submission(sub, &dep);
+
+    // Race-close: dep may have transitioned to `finished=true` between
+    // the load above and `attach_dep` — in which case the step's
+    // one-shot propagation (`make_rdeps_runnable` from `handle_success`
+    // or `propagate_failure_inmem` from `handle_failure`) already
+    // iterated an rdep list that didn't contain `parent`. Without this
+    // re-check, `parent` would sit with a finished dep in its
+    // `state.deps` set forever — `arm_if_leaf` would never see
+    // `deps.is_empty()` and the whole job would stall until the
+    // heartbeat reaper cancelled it.
+    //
+    // Re-running the appropriate propagation is idempotent: success
+    // path CASes `runnable` (already-armed rdeps are no-ops); failure
+    // path short-circuits on already-`finished` rdeps.
+    if dep.finished.load(Ordering::Acquire) {
+        if dep.previous_failure.load(Ordering::Acquire) {
+            super::complete::propagate_failure_inmem_for_bench(&dep, dep.drv_hash());
+        } else {
+            crate::dispatch::rdep::make_rdeps_runnable(&dep);
+        }
+    }
     Ok(())
 }
 

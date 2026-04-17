@@ -64,26 +64,34 @@ pub async fn connect_and_migrate(
 /// are unreachable and their workers' next poll will 410. Also evicts
 /// expired entries from the `failed_outputs` TTL cache so the first
 /// cleanup tick doesn't have to. Idempotent.
+///
+/// The sentinel's `id` field is populated per-row from `id::text` so
+/// `JobStatusResponse` can round-trip it through `serde_json::from_value`.
+/// A global `'id': null` constant would pass serde_json serialization but
+/// fail on later `GET /jobs/{id}` deserialization because `JobId(Uuid)`
+/// rejects JSON null. The reaper's sentinel uses the same per-row shape;
+/// keep them in sync.
 pub async fn clear_busy(pool: &PgPool) -> Result<()> {
-    let sentinel = serde_json::json!({
-        "id": null,
-        "status": "cancelled",
-        "sealed": false,
-        "counts": { "total": 0, "pending": 0, "building": 0, "done": 0, "failed": 0 },
-        "failures": [],
-        "eval_error": "coordinator restarted; job aborted"
-    });
-
     let res = sqlx::query(
         r#"
         UPDATE jobs
         SET status = 'cancelled',
             done_at = now(),
-            result = $1
+            result = jsonb_build_object(
+                'id', id::text,
+                'status', 'cancelled',
+                'sealed', sealed,
+                'counts', jsonb_build_object(
+                    'total', 0, 'pending', 0, 'building', 0,
+                    'done', 0, 'failed', 0
+                ),
+                'failures', '[]'::jsonb,
+                'eval_error', 'coordinator restarted; job aborted',
+                'eval_errors', '[]'::jsonb
+            )
         WHERE status = 'pending' AND done_at IS NULL
         "#,
     )
-    .bind(&sentinel)
     .execute(pool)
     .await?;
 

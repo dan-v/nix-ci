@@ -59,11 +59,11 @@ pub async fn print_events_with(
             // sentinel meaning "we never observed a terminal event."
             return Ok(JobStatus::Pending);
         }
-        let url = client.events_url(job_id);
-        let send_fut = reqwest::Client::new()
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .send();
+        // Route through `client.events_request` so the bearer token
+        // (and OTel traceparent) are attached. A bare
+        // `reqwest::Client::new()` used to construct the SSE GET and
+        // silently 401'd against any auth-enabled coordinator.
+        let send_fut = client.events_request(job_id).send();
         let resp = tokio::select! {
             r = send_fut => r,
             _ = shutdown.changed() => return Ok(JobStatus::Pending),
