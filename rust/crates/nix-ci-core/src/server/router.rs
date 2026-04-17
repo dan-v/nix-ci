@@ -110,6 +110,21 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/debug/dispatcher-dump",
             get(ops::admin_dispatcher_dump),
         )
+        // Drain: stop accepting new jobs / new claims without
+        // killing in-flight work. Rolling upgrades poll GET until
+        // in_flight_claims hits 0, then SIGTERM.
+        .route(
+            "/admin/drain",
+            post(ops::admin_drain_start).get(ops::admin_drain_status),
+        )
+        // Fence: per-worker claim block. A retiring host stops
+        // receiving new work; its existing claims finish normally.
+        .route(
+            "/admin/fence",
+            post(ops::admin_fence_add)
+                .get(ops::admin_fence_list)
+                .delete(ops::admin_fence_remove),
+        )
         .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::from_fn_with_state(
             metrics_for_layer,

@@ -45,6 +45,17 @@ pub async fn claim(
 ) -> Result<Response> {
     q.wait = q.wait.min(state.cfg.max_claim_wait_secs);
     validate_worker_id(&q.worker, state.cfg.max_identifier_bytes)?;
+    // Drain / fence short-circuit: return 204 immediately so the
+    // worker exits its poll loop cleanly rather than holding the
+    // connection open until the wait deadline. Long-polling
+    // workers during a drain would otherwise leave claim_in_flight
+    // RSS pinned for up to max_claim_wait_secs.
+    if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    if worker_is_fenced(&state, q.worker.as_deref()) {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
 
     let Some(sub) = state.dispatcher.submissions.get(id) else {
         // Submission absent: job is terminal, never existed, or the
@@ -120,6 +131,12 @@ pub async fn claim_any(
 ) -> Result<Response> {
     q.wait = q.wait.min(state.cfg.max_claim_wait_secs);
     validate_worker_id(&q.worker, state.cfg.max_identifier_bytes)?;
+    if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    if worker_is_fenced(&state, q.worker.as_deref()) {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(q.wait);
     let features_vec = q.features_vec();
@@ -280,6 +297,15 @@ pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<Cla
     // the question is "what's hung?"
     summaries.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
     Ok(axum::Json(ClaimsListResponse { claims: summaries }))
+}
+
+/// True when the worker identified by `worker_id` is in the admin
+/// fence set. Missing (None) worker_ids are never fenced — the fence
+/// is an explicit opt-in for known hosts. Read-only snapshot via the
+/// RwLock; no `.await` under the guard.
+fn worker_is_fenced(state: &AppState, worker_id: Option<&str>) -> bool {
+    let Some(w) = worker_id else { return false };
+    state.fenced_workers.read().contains(w)
 }
 
 /// Returns true when a popped step has already consumed its full

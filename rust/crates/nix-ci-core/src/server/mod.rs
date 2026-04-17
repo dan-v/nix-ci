@@ -51,6 +51,8 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         metrics: metrics.clone(),
         cfg: Arc::new(cfg.clone()),
         log_store: log_store.clone(),
+        draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        fenced_workers: Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new())),
     };
 
     // Shared shutdown signal for background loops. axum has its own

@@ -245,3 +245,118 @@ pub struct DispatcherDumpClaim {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub elapsed_secs: u64,
 }
+
+/// `POST /admin/drain` — flip the coordinator into drain mode. New
+/// job creation returns 503 and new claims return 204 (nothing
+/// claimable); already-running workers finish their current build and
+/// POST /complete as usual. The response carries a snapshot of
+/// remaining work so operators can decide when to SIGTERM.
+///
+/// `GET /admin/drain` returns the same snapshot without flipping the
+/// flag — useful for polling convergence.
+#[tracing::instrument(skip_all)]
+pub async fn admin_drain_start(State(state): State<AppState>) -> Json<DrainStatus> {
+    state
+        .draining
+        .store(true, std::sync::atomic::Ordering::Release);
+    // Wake long-pollers so they immediately see the drain flag and
+    // return 204 rather than sleeping to their deadline.
+    state.dispatcher.wake();
+    Json(drain_snapshot(&state))
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn admin_drain_status(State(state): State<AppState>) -> Json<DrainStatus> {
+    Json(drain_snapshot(&state))
+}
+
+fn drain_snapshot(state: &AppState) -> DrainStatus {
+    let submissions = state.dispatcher.submissions.all();
+    let in_flight_claims = state.dispatcher.claims.len() as u32;
+    let open_submissions = submissions.iter().filter(|s| !s.is_terminal()).count() as u32;
+    DrainStatus {
+        draining: state.draining.load(std::sync::atomic::Ordering::Acquire),
+        open_submissions,
+        in_flight_claims,
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct DrainStatus {
+    pub draining: bool,
+    /// Submissions that haven't yet transitioned terminal. Continues
+    /// ticking down as workers complete their claims.
+    pub open_submissions: u32,
+    /// Claims outstanding. When both this and `open_submissions` are
+    /// zero, it's safe to SIGTERM without losing work.
+    pub in_flight_claims: u32,
+}
+
+/// `POST /admin/fence?worker_id=X` — prevent new claims going to the
+/// named worker. Claims that were already issued to it continue to
+/// complete normally. Designed for "this host is being retired; drain
+/// its existing work but don't give it more." Idempotent: adding a
+/// worker that's already fenced is a no-op.
+///
+/// `DELETE /admin/fence?worker_id=X` removes the fence. `GET
+/// /admin/fence` lists the currently-fenced set.
+#[tracing::instrument(skip_all, fields(worker_id = %q.worker_id))]
+pub async fn admin_fence_add(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<FenceQuery>,
+) -> Result<Json<FenceStatus>, crate::Error> {
+    validate_worker_id(&q.worker_id, state.cfg.max_identifier_bytes)?;
+    state.fenced_workers.write().insert(q.worker_id);
+    state.dispatcher.wake();
+    Ok(Json(FenceStatus {
+        fenced: fenced_vec(&state),
+    }))
+}
+
+#[tracing::instrument(skip_all, fields(worker_id = %q.worker_id))]
+pub async fn admin_fence_remove(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<FenceQuery>,
+) -> Result<Json<FenceStatus>, crate::Error> {
+    validate_worker_id(&q.worker_id, state.cfg.max_identifier_bytes)?;
+    state.fenced_workers.write().remove(&q.worker_id);
+    state.dispatcher.wake();
+    Ok(Json(FenceStatus {
+        fenced: fenced_vec(&state),
+    }))
+}
+
+pub async fn admin_fence_list(State(state): State<AppState>) -> Json<FenceStatus> {
+    Json(FenceStatus {
+        fenced: fenced_vec(&state),
+    })
+}
+
+fn fenced_vec(state: &AppState) -> Vec<String> {
+    let mut v: Vec<String> = state.fenced_workers.read().iter().cloned().collect();
+    v.sort();
+    v
+}
+
+fn validate_worker_id(worker_id: &str, max_bytes: usize) -> Result<(), crate::Error> {
+    if worker_id.is_empty() {
+        return Err(crate::Error::BadRequest("worker_id must be non-empty".into()));
+    }
+    if worker_id.len() > max_bytes {
+        return Err(crate::Error::BadRequest(format!(
+            "worker_id exceeds max_identifier_bytes ({} > {max_bytes})",
+            worker_id.len()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+pub struct FenceQuery {
+    pub worker_id: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct FenceStatus {
+    pub fenced: Vec<String>,
+}

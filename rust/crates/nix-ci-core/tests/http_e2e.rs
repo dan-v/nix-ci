@@ -6,7 +6,7 @@ mod common;
 use common::{drv_path, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
 use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest, JobStatus,
+    CompleteRequest, CreateJobRequest, IngestDrvRequest, JobStatus,
 };
 use sqlx::PgPool;
 use std::time::Duration;

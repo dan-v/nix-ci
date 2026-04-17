@@ -24,6 +24,24 @@ pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<Json<CreateJobResponse>> {
+    // Drain: refuse new jobs during graceful shutdown so in-flight
+    // work can finish without accumulating fresh claims. Idempotent
+    // retries against an already-existing external_ref still succeed
+    // (see below) — that path is not "new work", it just hands back
+    // an existing id.
+    if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+        let already_exists = match req.external_ref.as_deref() {
+            Some(ext) => writeback::find_job_by_external_ref(&state.pool, ext)
+                .await?
+                .is_some(),
+            None => false,
+        };
+        if !already_exists {
+            return Err(Error::ServiceUnavailable(
+                "coordinator is draining; not accepting new jobs".into(),
+            ));
+        }
+    }
     // Bounded identifier: external_ref propagates into DB text columns,
     // log lines, and JSONB snapshots. An unbounded value from a broken
     // or hostile client would bloat every row and line it touches.
