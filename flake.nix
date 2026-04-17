@@ -48,6 +48,17 @@
           legacyPackages = pkgs;
           packages = import ./nix/packages { inherit pkgs; };
 
+          # NixOS VM tests. `nix flake check` runs these, proving the
+          # coordinator module + package + systemd wiring hang together
+          # end-to-end. Smoke-only: no actual builds, just health +
+          # HTTP API surface.
+          checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            coordinator-smoke = import ./nix/checks/coordinator-smoke.nix {
+              inherit pkgs system;
+              inherit self;
+            };
+          };
+
           devShells.default = pkgs.mkShell {
             buildInputs = with pkgs; [
               (rust-bin.stable.latest.default.override {
