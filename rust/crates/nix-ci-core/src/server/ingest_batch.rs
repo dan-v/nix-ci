@@ -11,14 +11,15 @@
 //!    Steps — safe because `make_rdeps_runnable` respects the barrier.
 //! 3. Arm `created=true` → `runnable` on fresh leaves.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::Json;
 
-use super::ingest_common::{arm_if_leaf, attach_step_to_submission, reject_if_terminal, wire_dep};
 use super::AppState;
-use crate::dispatch::Step;
+use crate::dispatch::rdep::{attach_dep, enqueue_for_all_submissions};
+use crate::dispatch::{Step, Submission};
 use crate::durable::writeback;
 use crate::error::Result;
 use crate::observability::metrics::TerminalLabels;
@@ -84,7 +85,7 @@ pub async fn submit_batch(
     let incoming_u32: u32 = req.drvs.len().try_into().unwrap_or(u32::MAX);
     if let Some(cap) = state.cfg.max_drvs_per_job {
         if !sub.try_reserve_drvs(incoming_u32, cap) {
-            let reserved = sub.reserved_drvs.load(std::sync::atomic::Ordering::Acquire);
+            let reserved = sub.reserved_drvs.load(Ordering::Acquire);
             let reason = format!(
                 "eval_too_large: job {id} would exceed max_drvs_per_job={cap} \
                  (reserved={reserved}, incoming={incoming_u32})"
@@ -147,9 +148,9 @@ pub async fn submit_batch(
         let stripped: &str = d.drv_path.trim_end_matches(".drv");
         if is_new && known_failed.contains(stripped) {
             step.previous_failure
-                .store(true, std::sync::atomic::Ordering::Release);
+                .store(true, Ordering::Release);
             step.finished
-                .store(true, std::sync::atomic::Ordering::Release);
+                .store(true, Ordering::Release);
             state.metrics.inner.failed_outputs_hits_total.inc();
         }
         primary.push((d, step, is_new));
@@ -168,7 +169,7 @@ pub async fn submit_batch(
         .unwrap_or(u32::MAX);
     if dedup_in_batch > 0 && state.cfg.max_drvs_per_job.is_some() {
         sub.reserved_drvs
-            .fetch_sub(dedup_in_batch, std::sync::atomic::Ordering::AcqRel);
+            .fetch_sub(dedup_in_batch, Ordering::AcqRel);
     }
 
     // Phase 2: membership + edges.
@@ -221,21 +222,19 @@ pub async fn submit_batch(
     // runaway job before it becomes a memory problem. CAS on the
     // per-submission flag means we don't re-warn on every batch.
     let live_members = sub.members.read().len() as u32;
-    if live_members >= state.cfg.submission_warn_threshold {
-        use std::sync::atomic::Ordering;
-        if sub
+    if live_members >= state.cfg.submission_warn_threshold
+        && sub
             .warned_oversized
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-        {
-            tracing::warn!(
-                job_id = %sub.id,
-                members = live_members,
-                threshold = state.cfg.submission_warn_threshold,
-                "submission crossed soft size threshold (no hard cap; this is a heads-up)"
-            );
-            state.metrics.inner.submission_warn_total.inc();
-        }
+    {
+        tracing::warn!(
+            job_id = %sub.id,
+            members = live_members,
+            threshold = state.cfg.submission_warn_threshold,
+            "submission crossed soft size threshold (no hard cap; this is a heads-up)"
+        );
+        state.metrics.inner.submission_warn_total.inc();
     }
 
     Ok(Json(IngestBatchResponse {
@@ -243,6 +242,123 @@ pub async fn submit_batch(
         dedup_skipped,
         errored,
     }))
+}
+
+// ─── Helpers (previously in ingest_common.rs) ─────────────────────────
+//
+// These were split out when there were two ingest handlers (single +
+// batch). After the single-drv endpoint was removed, the batch handler
+// is the only caller, so the helpers live here directly. Keeping them
+// `fn` (not `pub(super)`) makes the module boundary visible.
+
+/// Attach a step to a submission. Adds the membership strong ref,
+/// pushes a weak submission ref onto the step, and — if the step is
+/// already runnable for some other submission — queues it on ours so
+/// our workers race for the shared claim.
+fn attach_step_to_submission(sub: &Arc<Submission>, step: &Arc<Step>) {
+    sub.add_member(step);
+    let was_new_attach = step.state.write().attach_submission(sub);
+    if was_new_attach
+        && step.runnable.load(Ordering::Acquire)
+        && !step.finished.load(Ordering::Acquire)
+    {
+        sub.enqueue_ready(step);
+    }
+}
+
+/// Wire an edge from `parent` to `dep`. Loads or placeholder-creates
+/// the dep Step, attaches it to the submission, and enqueues it if
+/// it's already runnable. No-op if the dep is finished.
+fn wire_dep(
+    state: &AppState,
+    sub: &Arc<Submission>,
+    parent: &Arc<Step>,
+    dep_path: &str,
+    inherit_system: &str,
+) -> Result<()> {
+    let dep_hash = drv_hash_from_path(dep_path)
+        .ok_or_else(|| crate::Error::BadRequest(format!("bad input drv_path: {dep_path}")))?;
+    // Cheap self-loop guard. The post-seal cycle scan catches longer
+    // cycles (A→B→A etc.); this anchor prevents the simplest bad input
+    // from ever entering the graph and reaching `attach_dep` with
+    // parent == dep (which would wedge a step forever).
+    if parent.drv_hash() == &dep_hash {
+        return Err(crate::Error::BadRequest(format!(
+            "self-loop: drv {dep_path} depends on itself"
+        )));
+    }
+    let (dep, _) = state.dispatcher.steps.get_or_create(&dep_hash, || {
+        Step::new(
+            dep_hash.clone(),
+            dep_path.to_string(),
+            placeholder_name_from(dep_path),
+            inherit_system.to_string(),
+            Vec::new(),
+            state.cfg.max_attempts,
+        )
+    });
+    if dep.finished.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    attach_dep(parent, &dep);
+    attach_step_to_submission(sub, &dep);
+    Ok(())
+}
+
+/// Arm `runnable` on a fresh Step whose deps are all attached.
+/// Invariant 1: `created=true` before the CAS, and `deps.is_empty()`
+/// at CAS time.
+fn arm_if_leaf(step: &Arc<Step>) {
+    if step.finished.load(Ordering::Acquire) {
+        return;
+    }
+    step.created.store(true, Ordering::Release);
+    let deps_empty = step.state.read().deps.is_empty();
+    if deps_empty
+        && step
+            .runnable
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        enqueue_for_all_submissions(step);
+    }
+}
+
+/// Derive a placeholder drv_name from a drv_path like
+/// `/nix/store/abc-hello-1.0.drv` → `hello-1.0`. Used when we see a
+/// dep edge to a drv we haven't received full metadata for yet.
+fn placeholder_name_from(drv_path: &str) -> String {
+    let base = drv_path.rsplit('/').next().unwrap_or(drv_path);
+    let stripped = base.trim_end_matches(".drv");
+    stripped
+        .split_once('-')
+        .map(|(_, rest)| rest)
+        .unwrap_or(stripped)
+        .to_string()
+}
+
+/// Reject ingest if the job is terminal OR sealed. Once a submission
+/// is sealed the caller has told us "no more drvs coming" — a late
+/// ingest call after seal is almost certainly a bug (or a lost
+/// retry / out-of-order client), and accepting it could re-open a
+/// submission that already fired `JobDone`. We reject with 410 Gone
+/// so the client sees a clear terminal signal.
+async fn reject_if_terminal(state: &AppState, id: JobId) -> Result<()> {
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT status, sealed FROM jobs WHERE id = $1")
+            .bind(id.0)
+            .fetch_optional(&state.pool)
+            .await?;
+    let (status, sealed) = row.ok_or_else(|| crate::Error::NotFound(format!("job {id}")))?;
+    if matches!(status.as_str(), "done" | "failed" | "cancelled") {
+        return Err(crate::Error::Gone(format!("job {id} is terminal")));
+    }
+    if sealed {
+        return Err(crate::Error::Gone(format!(
+            "job {id} is sealed; no further ingest accepted"
+        )));
+    }
+    Ok(())
 }
 
 /// Force a job to terminal=Failed with a sentinel `eval_error` when an
@@ -297,4 +413,32 @@ async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Resul
         .inc();
     state.dispatcher.wake();
     Ok(())
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_name_handles_common_shapes() {
+        assert_eq!(
+            placeholder_name_from("/nix/store/abc-hello-2.12.1.drv"),
+            "hello-2.12.1"
+        );
+        assert_eq!(
+            placeholder_name_from("/nix/store/hash-stdenv-linux.drv"),
+            "stdenv-linux"
+        );
+        assert_eq!(placeholder_name_from("/nix/store/noprefix.drv"), "noprefix");
+        assert_eq!(placeholder_name_from("bare.drv"), "bare");
+        assert_eq!(placeholder_name_from("/nix/store/hash-foo"), "foo");
+    }
+
+    #[test]
+    fn drv_hash_from_path_rejects_empty_and_trivial() {
+        assert!(crate::types::drv_hash_from_path("").is_none());
+        assert!(crate::types::drv_hash_from_path("nodrv").is_none());
+        assert!(crate::types::drv_hash_from_path("/nix/store/nohyphen.drv").is_none());
+        assert!(crate::types::drv_hash_from_path("/nix/store/hash-foo.drv").is_some());
+    }
 }

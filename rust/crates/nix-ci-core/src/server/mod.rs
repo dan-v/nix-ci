@@ -7,7 +7,6 @@ pub mod complete;
 pub mod events;
 pub mod heartbeat;
 pub mod ingest_batch;
-pub(crate) mod ingest_common;
 pub mod jobs;
 pub mod ops;
 pub mod router;

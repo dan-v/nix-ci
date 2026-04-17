@@ -39,6 +39,11 @@ jobs:
       - name: unit tests
         working-directory: rust
         run: cargo test --workspace --lib --bins
+      # Doc tests catch broken rustdoc examples before they rot in
+      # published docs. Cheap — runs in seconds on a cached build.
+      - name: doc tests
+        working-directory: rust
+        run: cargo test --workspace --doc
 
   # Integration tests: require Postgres.
   integration-tests:
@@ -67,7 +72,13 @@ jobs:
           workspaces: rust
       - name: integration tests
         working-directory: rust
-        run: cargo test -p nix-ci-core --tests
+        # Serial execution: every sqlx::test gets its own database
+        # (so they don't share tables), but several tests spin up
+        # multiple pools per test and a highly parallel runner can
+        # exhaust the shared Postgres connection limit. Running with
+        # --test-threads=1 is deterministic, keeps pool churn
+        # bounded, and costs ~20% wall time on the current suite.
+        run: cargo test -p nix-ci-core --tests -- --test-threads=1
 
   miri:
     name: miri (UB + data-race detection on unit tests)
