@@ -75,63 +75,68 @@ pub async fn run(
 /// `cancelled` in Postgres with a sentinel result, drop their
 /// in-memory submissions (so next `/claim` returns 410), and discard
 /// any in-memory claims tied to those jobs.
+///
+/// One `UPDATE ... RETURNING id` does the whole transition atomically
+/// and tells us exactly which jobs moved — avoiding the SELECT+loop
+/// pattern's failure mode where a crash mid-loop left some rows
+/// cancelled in PG but still pinned in memory until restart.
+/// Sentinel JSON is built inside Postgres via `jsonb_build_object` so
+/// we don't round-trip it per row.
 pub async fn reap_stale_jobs(
     pool: &PgPool,
     dispatcher: &Dispatcher,
     timeout: Duration,
 ) -> Result<()> {
     let secs = timeout.as_secs() as i64;
-    let stale_ids: Vec<(sqlx::types::Uuid,)> = sqlx::query_as(
+    let reaped: Vec<(sqlx::types::Uuid,)> = sqlx::query_as(
         r#"
-        SELECT id FROM jobs
+        UPDATE jobs
+        SET status = 'cancelled',
+            done_at = now(),
+            result = jsonb_build_object(
+                'id', id::text,
+                'status', 'cancelled',
+                'sealed', false,
+                'counts', jsonb_build_object(
+                    'total', 0, 'pending', 0, 'building', 0,
+                    'done', 0, 'failed', 0
+                ),
+                'failures', '[]'::jsonb,
+                'eval_error', 'heartbeat timeout; job reaped',
+                'eval_errors', '[]'::jsonb
+            )
         WHERE status = 'pending'
           AND last_heartbeat < now() - make_interval(secs => $1::bigint)
+          AND done_at IS NULL
+        RETURNING id
         "#,
     )
     .bind(secs)
     .fetch_all(pool)
     .await?;
 
-    if stale_ids.is_empty() {
+    if reaped.is_empty() {
         return Ok(());
     }
-    tracing::warn!(n = stale_ids.len(), "reaping stale jobs");
+    tracing::warn!(n = reaped.len(), "reaped stale jobs (atomic)");
     dispatcher
         .metrics
         .inner
         .jobs_reaped
-        .inc_by(stale_ids.len() as u64);
+        .inc_by(reaped.len() as u64);
 
-    for (uuid,) in &stale_ids {
+    // Postgres already transitioned every row; now mirror the state
+    // in memory. Each eviction is idempotent (submissions.remove is
+    // a no-op when the id is absent, and claims.take / mark_terminal
+    // are one-shot), so partial failure here is safe: the next
+    // reaper tick won't re-attempt (the PG WHERE filters those rows
+    // out), but claim-time 410s and admin eviction handle any
+    // surviving orphans. A deliberate trade: we'd rather have
+    // consistent durable state than risk a bulk UPDATE/bulk-evict
+    // split transaction.
+    for (uuid,) in &reaped {
         let job_id = JobId(*uuid);
-        let sentinel = serde_json::json!({
-            "id": job_id.0.to_string(),
-            "status": "cancelled",
-            "sealed": false,
-            "counts": { "total": 0, "pending": 0, "building": 0, "done": 0, "failed": 0 },
-            "failures": [],
-            "eval_error": "heartbeat timeout; job reaped"
-        });
-        if let Err(e) = sqlx::query(
-            r#"
-            UPDATE jobs
-            SET status = 'cancelled', done_at = now(), result = $2
-            WHERE id = $1 AND done_at IS NULL
-            "#,
-        )
-        .bind(job_id.0)
-        .bind(&sentinel)
-        .execute(pool)
-        .await
-        {
-            tracing::warn!(error = %e, %job_id, "reap: transition failed");
-            continue;
-        }
-
         if let Some(sub) = dispatcher.submissions.remove(job_id) {
-            // Evict in-flight claims for the reaped job in the same
-            // step so the gauge balances and we don't pin the step's
-            // drv_hash until the claim's deadline.
             dispatcher.evict_claims_for(job_id);
             if sub.mark_terminal() {
                 sub.publish(crate::types::JobEvent::JobDone {
