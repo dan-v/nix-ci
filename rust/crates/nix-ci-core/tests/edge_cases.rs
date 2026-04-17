@@ -3293,3 +3293,73 @@ async fn wrong_token_is_rejected(pool: PgPool) {
         other => panic!("expected Unauthorized, got {other:?}"),
     }
 }
+
+// ─── Admin claim-evict endpoint ─────────────────────────────────────
+
+/// DELETE /admin/claims/{claim_id} force-expires a live claim so the
+/// next reaper tick evicts it. Used to unstick a worker that hasn't
+/// crossed the deadline but clearly isn't making progress.
+#[sqlx::test]
+async fn admin_evict_claim_force_expires(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    // Short reaper interval so the eviction completes within the test's
+    // timeout budget.
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.reaper_interval_secs = 1;
+        cfg.job_heartbeat_timeout_secs = 30;
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let drv = drv_path("stucka001", "hung");
+    client
+        .ingest_drv(job.id, &ingest(&drv, "hung", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    // Issue a claim but never complete it.
+    let c = client
+        .claim(job.id, "x86_64-linux", &[], 2)
+        .await
+        .unwrap()
+        .expect("first claim must succeed");
+
+    // Force-evict via the admin endpoint.
+    let http = reqwest::Client::new();
+    let resp = http
+        .delete(format!("{}/admin/claims/{}", handle.base_url, c.claim_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // Wait for the reaper tick + re-arm. Poll the claim endpoint; a
+    // second claim for the same drv must succeed within ~3s.
+    let mut re_claimed = None;
+    for _ in 0..30 {
+        if let Ok(Some(c2)) = client.claim(job.id, "x86_64-linux", &[], 1).await {
+            re_claimed = Some(c2);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let re_claimed = re_claimed.expect("evicted claim must be re-issuable after reaper tick");
+    assert_eq!(re_claimed.drv_path, drv);
+    assert_ne!(re_claimed.claim_id, c.claim_id, "must be a fresh claim id");
+
+    // Evicting a nonexistent claim 404s.
+    let resp = http
+        .delete(format!(
+            "{}/admin/claims/{}",
+            handle.base_url,
+            nix_ci_core::types::ClaimId::new()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}

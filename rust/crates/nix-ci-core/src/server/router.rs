@@ -63,6 +63,11 @@ pub fn build_router(state: AppState) -> Router {
         // longest-running first so "what's stuck?" is answered by the
         // first row.
         .route("/claims", get(claim::list_claims))
+        // Admin: force-evict a specific claim. Intended for the
+        // operator-run "this worker is stuck and won't heartbeat"
+        // recovery flow. Gated by the same bearer-token middleware as
+        // other mutating routes when auth is enabled.
+        .route("/admin/claims/{claim_id}", delete(claim::admin_evict_claim))
         .route(
             "/jobs/{id}/claims/{claim_id}/complete",
             post(complete::complete),

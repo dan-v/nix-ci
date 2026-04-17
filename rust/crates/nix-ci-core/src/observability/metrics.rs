@@ -86,6 +86,10 @@ pub struct MetricsInner {
     pub pg_pool_size: Gauge,
     /// Current idle Postgres connections.
     pub pg_pool_idle: Gauge,
+    /// Ingest-batch drvs whose output path matched a live
+    /// `failed_outputs` row (pre-marked finished, no worker dispatch).
+    /// Compare against `drvs_ingested` to compute the cache hit rate.
+    pub failed_outputs_hits_total: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -318,6 +322,15 @@ impl Metrics {
             pg_pool_idle.clone(),
         );
 
+        let failed_outputs_hits_total = Counter::default();
+        // Library appends `_total` per OpenMetrics — don't include it in
+        // the registered name. Wire becomes `nix_ci_failed_outputs_hits_total`.
+        registry.register(
+            "nix_ci_failed_outputs_hits",
+            "Ingested drvs whose output path was in the failed_outputs TTL cache",
+            failed_outputs_hits_total.clone(),
+        );
+
         Self {
             inner: Arc::new(MetricsInner {
                 registry: parking_lot::Mutex::new(registry),
@@ -346,6 +359,7 @@ impl Metrics {
                 ingest_batch_drvs,
                 pg_pool_size,
                 pg_pool_idle,
+                failed_outputs_hits_total,
             }),
         }
     }

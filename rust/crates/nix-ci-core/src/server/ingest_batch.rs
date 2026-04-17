@@ -132,6 +132,7 @@ pub async fn submit_batch(
                 .store(true, std::sync::atomic::Ordering::Release);
             step.finished
                 .store(true, std::sync::atomic::Ordering::Release);
+            state.metrics.inner.failed_outputs_hits_total.inc();
         }
         primary.push((d, step, is_new));
     }

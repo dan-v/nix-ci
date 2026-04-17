@@ -167,6 +167,55 @@ pub async fn claim_any(
     }
 }
 
+/// `DELETE /admin/claims/{claim_id}` — operator lever for unsticking
+/// a worker that hasn't crossed the claim deadline but clearly isn't
+/// making progress. Removes the claim synchronously (not via the
+/// reaper so eviction is immediate, even if reaper ticks are long or
+/// paused), decrements active_claims, and re-arms the step so another
+/// worker can pick it up. Returns 404 if the claim doesn't exist.
+#[tracing::instrument(skip_all, fields(claim_id = %id))]
+pub async fn admin_evict_claim(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<ClaimId>,
+) -> Result<Response> {
+    let Some(claim) = state.dispatcher.claims.take(id) else {
+        return Err(Error::NotFound(format!("claim {id}")));
+    };
+    state.metrics.inner.claims_in_flight.dec();
+    state
+        .metrics
+        .inner
+        .claim_age_seconds
+        .observe(claim.started_at.elapsed().as_secs_f64());
+    // Mirror the active_claims decrement on the owning submission so
+    // the fleet-cap semantics don't drift.
+    if let Some(sub) = state.dispatcher.submissions.get(claim.job_id) {
+        let prev = sub.active_claims.load(std::sync::atomic::Ordering::Acquire);
+        if prev > 0 {
+            sub.active_claims
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    // Re-arm the step unless it's already finished (race with complete
+    // / failure propagation). Use the same guarded pattern as the
+    // deadline reaper: set runnable=true, re-check finished, undo if
+    // the check flipped to true to preserve dispatcher invariant 4.
+    if let Some(step) = state.dispatcher.steps.get(&claim.drv_hash) {
+        use std::sync::atomic::Ordering;
+        if !step.finished.load(Ordering::Acquire) {
+            step.runnable.store(true, Ordering::Release);
+            if step.finished.load(Ordering::Acquire) {
+                step.runnable.store(false, Ordering::Release);
+            } else {
+                crate::dispatch::rdep::enqueue_for_all_submissions(&step);
+            }
+        }
+    }
+    state.dispatcher.wake();
+    tracing::warn!(%id, "admin: claim force-evicted");
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `GET /claims` — point-in-time list of every active claim, sorted
 /// longest-running first. Operator's main "what's stuck?" lever.
 /// Cheap: snapshots the in-memory `Claims` map and returns. No DB.
