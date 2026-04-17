@@ -100,7 +100,23 @@ in
           name = lib.mkOption {
             type = lib.types.str;
             example = "my-org-overlay";
-            description = "Cachix cache name (without the .cachix.org suffix).";
+            description = ''
+              Cache name (as the Cachix server knows it). For
+              app.cachix.org this is the short name (`my-org`); for
+              self-hosted instances it's whatever the server's
+              configuration assigns.
+            '';
+          };
+          host = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "https://cachix.internal.example.com";
+            description = ''
+              Base URL of the Cachix instance. Leave null to target
+              app.cachix.org (the default). Set this to your internal
+              cachix-self-hosted URL to push to a private deployment.
+              Translated into `cachix --host <url>` at hook time.
+            '';
           };
           authTokenFile = lib.mkOption {
             type = lib.types.path;
@@ -108,9 +124,18 @@ in
             description = ''
               Path to a file containing the Cachix auth token. The file
               must be readable by the nix-daemon user (not the worker
-              user). Contents are read at daemon start and baked into
-              the cachix push wrapper; consider a secrets provisioning
-              agent that rotates it without restarting the daemon.
+              user). Contents are read per hook invocation so rotating
+              the file takes effect without restarting the daemon.
+            '';
+          };
+          extraArgs = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+            example = [ "--compression-method" "zstd" ];
+            description = ''
+              Additional flags passed to `cachix push` verbatim.
+              Escape hatch for options this module doesn't surface
+              directly (compression, signing key paths, etc.).
             '';
           };
         };
@@ -126,13 +151,14 @@ in
         everyone still builds everything."
 
         The post-build-hook runs under the nix daemon (not the worker
-        process), which is why the auth token is read at daemon start
-        and the file must be daemon-readable.
+        process), which is why the auth token file must be daemon-
+        readable.
 
-        If your deployment uses Attic, a self-hosted binary cache, or
-        a bespoke push mechanism, set `pushCache = null` here and
-        configure nix.settings.post-build-hook directly with a custom
-        script.
+        Works with both app.cachix.org (leave `host = null`) and
+        self-hosted Cachix deployments (set `host` to your instance's
+        base URL). For stores that aren't Cachix-protocol-compatible —
+        Attic, harmonia, bespoke scripts — set `pushCache = null` and
+        configure `nix.settings.post-build-hook` directly.
       '';
     };
   };
@@ -149,8 +175,11 @@ in
         if [ -z "''${OUT_PATHS:-}" ]; then exit 0; fi
         token=$(cat ${lib.escapeShellArg cfg.pushCache.authTokenFile})
         exec ${pkgs.cachix}/bin/cachix \
+          ${lib.optionalString (cfg.pushCache.host != null) "--host ${lib.escapeShellArg cfg.pushCache.host}"} \
           --auth-token "$token" \
-          push ${lib.escapeShellArg cfg.pushCache.name} $OUT_PATHS
+          push ${lib.escapeShellArg cfg.pushCache.name} \
+          ${lib.escapeShellArgs cfg.pushCache.extraArgs} \
+          $OUT_PATHS
       '';
     };
   in lib.mkMerge [ pushHook {
