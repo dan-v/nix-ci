@@ -64,17 +64,8 @@ pub async fn complete(
     state.metrics.inner.claim_age_seconds.observe(claim_age);
     // Mirror active_claims decrement on the submission so the fleet
     // scheduler's per-job cap accounts for the finished worker.
-    // Saturating subtract guards against a prior drift (e.g., a
-    // reaper + complete race that both decrement).
     if let Some(sub_for_counter) = state.dispatcher.submissions.get(claim.job_id) {
-        let prev = sub_for_counter
-            .active_claims
-            .load(std::sync::atomic::Ordering::Acquire);
-        if prev > 0 {
-            sub_for_counter
-                .active_claims
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        }
+        sub_for_counter.decrement_active_claim();
     }
 
     let Some(step) = state.dispatcher.steps.get(&claim.drv_hash) else {

@@ -247,11 +247,7 @@ pub async fn admin_evict_claim(
     // Mirror the active_claims decrement on the owning submission so
     // the fleet-cap semantics don't drift.
     if let Some(sub) = state.dispatcher.submissions.get(claim.job_id) {
-        let prev = sub.active_claims.load(std::sync::atomic::Ordering::Acquire);
-        if prev > 0 {
-            sub.active_claims
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        }
+        sub.decrement_active_claim();
     }
     // Re-arm the step unless it's already finished (race with complete
     // / failure propagation). Use the same guarded pattern as the

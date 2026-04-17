@@ -163,6 +163,18 @@ impl Submission {
         self.active_claims.load(Ordering::Acquire) >= cap
     }
 
+    /// Saturating decrement of the in-flight-claims counter. No-op when
+    /// the counter is already zero, guarding against the reaper +
+    /// complete race where both paths decrement the same claim. Every
+    /// claim-ending path (complete, reaper expiry, admin evict) goes
+    /// through this so drift of the counter vs actual claims stays
+    /// impossible regardless of ordering.
+    pub fn decrement_active_claim(&self) {
+        if self.active_claims.load(Ordering::Acquire) > 0 {
+            self.active_claims.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     /// Append a failure record for this submission. Idempotent on
     /// `drv_hash` — the first record wins (originating failure has
     /// priority over a later propagation for the same drv).
