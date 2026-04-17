@@ -150,9 +150,7 @@ pub fn reap_expired_claims(dispatcher: &Dispatcher) {
         // Mirror active_claims decrement on the owning submission so
         // the fleet scheduler's per-job cap clears as claims expire.
         if let Some(sub) = dispatcher.submissions.get(claim.job_id) {
-            let prev = sub
-                .active_claims
-                .load(std::sync::atomic::Ordering::Acquire);
+            let prev = sub.active_claims.load(std::sync::atomic::Ordering::Acquire);
             if prev > 0 {
                 sub.active_claims
                     .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);

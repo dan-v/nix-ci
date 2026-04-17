@@ -40,9 +40,10 @@ async fn many_workers_single_job_exactly_once(pool: PgPool) {
     let n_drvs = 100;
     let n_workers = 32;
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
 
@@ -192,9 +193,10 @@ async fn concurrent_ingest_same_drv_single_step(pool: PgPool) {
     let base = handle.base_url.clone();
     let client = CoordinatorClient::new(&base);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
 
@@ -240,9 +242,10 @@ async fn wide_fan_out_sequences_correctly_under_load(pool: PgPool) {
     let base = handle.base_url.clone();
     let client = CoordinatorClient::new(&base);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
 

@@ -583,10 +583,7 @@ mod tests {
             "secondary index must drop in lockstep"
         );
         // The removed id must not appear in the sorted snapshot.
-        assert!(subs
-            .sorted_by_created_at()
-            .iter()
-            .all(|s| s.id != ids[2]));
+        assert!(subs.sorted_by_created_at().iter().all(|s| s.id != ids[2]));
     }
 
     #[test]

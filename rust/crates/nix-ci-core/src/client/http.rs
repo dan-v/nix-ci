@@ -140,9 +140,9 @@ impl CoordinatorClient {
         match resp.status() {
             s if s.is_success() => Ok(()),
             StatusCode::GONE => Err(Error::Gone("job is terminal".into())),
-            StatusCode::UNAUTHORIZED => Err(Error::Unauthorized(
-                resp.text().await.unwrap_or_default(),
-            )),
+            StatusCode::UNAUTHORIZED => {
+                Err(Error::Unauthorized(resp.text().await.unwrap_or_default()))
+            }
             s => {
                 let body = resp.text().await.unwrap_or_default();
                 Err(Error::Internal(format!("heartbeat {s}: {body}")))

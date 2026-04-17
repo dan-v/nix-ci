@@ -112,9 +112,10 @@ async fn fetch_log_404_when_missing(pool: PgPool) {
     let h = spawn_server(pool).await;
     let client = CoordinatorClient::new(&h.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let bogus = ClaimId::new();
@@ -132,9 +133,10 @@ async fn upload_overwrites_on_same_claim_id(pool: PgPool) {
     let h = spawn_server(pool.clone()).await;
     let client = CoordinatorClient::new(&h.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let drv = drv_path("bbb", "demo");
@@ -184,9 +186,10 @@ async fn upload_rejects_oversized_body(pool: PgPool) {
     let h = spawn_server(pool).await;
     let client = CoordinatorClient::new(&h.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let drv = drv_path("ccc", "demo");
@@ -393,9 +396,10 @@ async fn list_claims_sorts_longest_running_first(pool: PgPool) {
     let h = spawn_server(pool).await;
     let client = CoordinatorClient::new(&h.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let drv1 = drv_path("yyy1", "first");
@@ -442,9 +446,10 @@ async fn http_metrics_record_per_endpoint_latency(pool: PgPool) {
     let h = spawn_server(pool).await;
     let client = CoordinatorClient::new(&h.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let drv = drv_path("met", "metricsdrv");
@@ -550,9 +555,10 @@ async fn submission_warn_fires_once_when_threshold_crossed(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&h.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     // First batch of 3 — under threshold.

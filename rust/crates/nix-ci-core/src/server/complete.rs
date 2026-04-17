@@ -41,15 +41,8 @@ pub async fn complete(
     state.metrics.inner.claims_in_flight.dec();
     // H3: claim-age histogram. `started_at` is an Instant, so this is
     // monotonic and safe to subtract.
-    let claim_age = claim
-        .started_at
-        .elapsed()
-        .as_secs_f64();
-    state
-        .metrics
-        .inner
-        .claim_age_seconds
-        .observe(claim_age);
+    let claim_age = claim.started_at.elapsed().as_secs_f64();
+    state.metrics.inner.claim_age_seconds.observe(claim_age);
     // Mirror active_claims decrement on the submission so the fleet
     // scheduler's per-job cap accounts for the finished worker.
     // Saturating subtract guards against a prior drift (e.g., a

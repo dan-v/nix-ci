@@ -74,7 +74,6 @@ pub struct MetricsInner {
     pub submission_warn_total: Counter,
 
     // H3 observability additions: metrics that matter at 3am.
-
     /// Histogram of how long claims live before being completed or
     /// expired. Tail = stuck workers. P99 > 10 min in a healthy
     /// nixpkgs deployment usually means a drv with runaway IO or a
@@ -290,8 +289,9 @@ impl Metrics {
         );
 
         // H3: new observability metrics (not registered yet).
-        let claim_age_seconds =
-            Histogram::new([0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0]);
+        let claim_age_seconds = Histogram::new([
+            0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0,
+        ]);
         registry.register(
             "nix_ci_claim_age_seconds",
             "Time from claim issued to claim ended (complete or expire)",

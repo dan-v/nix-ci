@@ -275,9 +275,10 @@ async fn drv_failed_event_carries_used_by_attrs(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
 
@@ -374,9 +375,10 @@ async fn progress_event_carries_enrichments(pool: PgPool) {
     .await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     client
@@ -463,9 +465,10 @@ async fn regression_fleet_worker_still_drains_jobs(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None,
-    ..Default::default()
-})
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
         .await
         .unwrap();
     let drvs: Vec<_> = (0..4)

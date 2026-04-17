@@ -93,6 +93,17 @@ days of nightly chaos-scale + property runs without a violation.
 - Every dispatcher invariant has at least one failing-test-first
   regression guard.
 
+## Known deferred
+
+- **Claim-handoff on coordinator restart (C6)**: the v3 contract is
+  "restart = cancel all in-flight jobs, caller retries." This means a
+  30-min build that's 29 min in still re-runs from scratch on a
+  redeploy. A v3.5 design could persist claim records to PG so
+  workers' `/complete` calls succeed across a restart, but rehydrating
+  the step graph is incompatible with the ephemeral-dispatcher
+  position. For now: document the cost, set `graceful_shutdown_secs`
+  generously, and route redeploys through a quiet window.
+
 ## Scoring
 
 Run `scripts/spec_report.sh` (to be added) to print a green/red table of

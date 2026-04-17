@@ -245,8 +245,7 @@ impl ServerConfig {
         }
         if let Some(cap) = self.max_drvs_per_job {
             if cap == 0 {
-                errors
-                    .push("max_drvs_per_job, when set, must be > 0 (use null to disable)".into());
+                errors.push("max_drvs_per_job, when set, must be > 0 (use null to disable)".into());
             } else if cap < self.submission_warn_threshold {
                 errors.push(format!(
                     "max_drvs_per_job ({cap}) must be >= submission_warn_threshold ({})",
