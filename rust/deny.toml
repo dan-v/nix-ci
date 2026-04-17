@@ -1,0 +1,64 @@
+# cargo-deny policy for nix-ci. Run via `cargo deny --workspace check`.
+# CI fails the PR on any vulnerability, unlicensed dep, or unannounced
+# duplicate version. Tune thresholds here rather than papering over
+# specific findings in CI YAML.
+
+[advisories]
+# Error on any known vulnerability. Unmaintained / informational
+# advisories warn so we notice but don't block releases on them —
+# most are in transitive deps outside our control.
+version = 2
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0097: rand unsoundness with custom logger +
+    # thread_rng + specific feature combo. We use rand only in
+    # tests (dev-dependencies), not in any production path, and do
+    # not define a custom logger. The preconditions are not
+    # reachable from nix-ci code. Re-evaluate when a rand upgrade
+    # with the fix reaches stable transitives.
+    { id = "RUSTSEC-2026-0097", reason = "test-only dep; no custom logger; preconditions not reachable" },
+]
+
+[licenses]
+version = 2
+# Allowlist: every top-level dep + transitive we actually use today.
+# Add rather than remove; if a new dep pulls in a license not on this
+# list, the PR fails and a human decides.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    # Linux Foundation data license. Used by webpki-roots bundled data
+    # (Mozilla's CA root store). No code, just a certificate bundle.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal workspace deps (path = ...) have no version, which looks
+# like a wildcard to cargo-deny. Exempt them — the deny rule is for
+# external wildcard versions, not our own crate's path deps.
+allow-wildcard-paths = true
+# Deny a short list of crates we never want to pull in — unmaintained
+# crypto, known-problematic parsers, etc. Add here as needed.
+deny = []
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Our one non-crates-io source: the DeterminateSystems Nix inputs
+# are Nix-only (flake inputs, not cargo deps), so no allow-git entry
+# is needed for them. If we ever add a cargo dep via git, add the
+# URL here rather than flipping the unknown-git policy.
+allow-git = []

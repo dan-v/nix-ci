@@ -57,6 +57,13 @@
               inherit pkgs system;
               inherit self;
             };
+            # H11.1: two-node VM test proving the worker NixOS module
+            # starts, authenticates, and drives a claim through to a
+            # reported completion against a real coordinator.
+            worker-smoke = import ./nix/checks/worker-smoke.nix {
+              inherit pkgs system;
+              inherit self;
+            };
           };
 
           devShells.default = pkgs.mkShell {

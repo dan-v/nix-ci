@@ -228,6 +228,23 @@ jobs:
         working-directory: rust
         run: cargo llvm-cov report --package nix-ci-core
 
+  # Supply-chain: fail PRs that introduce known-vulnerable or
+  # unlicensed deps (SPEC.md T-DEP-AUDIT). Config is in deny.toml at
+  # the repo root. cargo-deny's default advisory DB is fetched from
+  # rustsec/advisory-db so this is always up-to-date at CI time.
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        working-directory: rust
+        run: cargo deny --workspace check
+
   nix-flake-check:
     name: nix flake check
     runs-on: ubuntu-latest
