@@ -34,7 +34,7 @@ async fn worker_dryrun_drains_all_drvs_to_done(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
 
@@ -92,7 +92,7 @@ async fn worker_shutdown_mid_longpoll_returns_quickly(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     // Don't seal, don't ingest — worker will sit in a long-poll.
@@ -132,7 +132,7 @@ async fn worker_exits_on_410_gone(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();

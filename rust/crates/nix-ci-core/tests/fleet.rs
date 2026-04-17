@@ -37,7 +37,7 @@ async fn claim_any_drains_oldest_job_first(pool: PgPool) {
 
     // Job 1 created first.
     let job1 = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     let drv1 = drv_path("fifo1", "first");
@@ -52,7 +52,7 @@ async fn claim_any_drains_oldest_job_first(pool: PgPool) {
 
     // Job 2 created later. Same shape.
     let job2 = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     let drv2 = drv_path("fifo2", "second");
@@ -108,7 +108,7 @@ async fn claim_any_falls_through_to_next_job_when_oldest_is_saturated(pool: PgPo
 
     // Job 1: ONE root drv (gets claimed first by worker A).
     let job1 = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     let drv1 = drv_path("sat1", "only");
@@ -122,7 +122,7 @@ async fn claim_any_falls_through_to_next_job_when_oldest_is_saturated(pool: PgPo
 
     // Job 2 (newer): also one root.
     let job2 = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     let drv2 = drv_path("sat2", "next");
@@ -180,7 +180,7 @@ async fn fleet_worker_drains_multiple_jobs_concurrently(pool: PgPool) {
     let mut job_ids = Vec::new();
     for j in 0..2u32 {
         let job = client
-            .create_job(&CreateJobRequest { external_ref: None })
+            .create_job(&CreateJobRequest::default())
             .await
             .unwrap();
         let drvs: Vec<IngestDrvRequest> = (0..6)
@@ -259,7 +259,7 @@ async fn fleet_worker_outlives_individual_jobs(pool: PgPool) {
 
     // Submit + wait for job 1 to finish.
     let job1 = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     client
@@ -287,7 +287,7 @@ async fn fleet_worker_outlives_individual_jobs(pool: PgPool) {
 
     // Now submit job 2 — same worker should pick it up.
     let job2 = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     client
@@ -322,7 +322,7 @@ async fn many_fleet_workers_one_job_exactly_once_each(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     let n_drvs = 30;

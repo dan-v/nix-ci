@@ -21,6 +21,17 @@ pub struct Submission {
     /// reset to "now" which is acceptable since restart wipes
     /// non-terminal submissions anyway.
     pub created_at: Instant,
+    /// Caller-supplied priority. Higher = scanned first by the fleet
+    /// scheduler. In-memory only; a restart cancels the submission
+    /// and the caller retries with whatever priority they want.
+    pub priority: i32,
+    /// Caller-supplied per-job cap on concurrent in-flight claims.
+    /// `None` = no cap. When `active_claims >= max_workers`, the
+    /// fleet scheduler skips this submission until one completes.
+    pub max_workers: Option<u32>,
+    /// Live counter of in-flight claims for this submission. Bumped
+    /// by `issue_claim`, decremented by `complete` / `evict_claims_for`.
+    pub active_claims: AtomicU32,
     pub sealed: AtomicBool,
     /// Set when the submission status transitions to terminal.
     pub terminal: AtomicBool,
@@ -59,10 +70,22 @@ pub struct Submission {
 
 impl Submission {
     pub fn new(id: JobId, event_capacity: usize) -> Arc<Self> {
+        Self::with_options(id, event_capacity, 0, None)
+    }
+
+    pub fn with_options(
+        id: JobId,
+        event_capacity: usize,
+        priority: i32,
+        max_workers: Option<u32>,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(event_capacity);
         Arc::new(Self {
             id,
             created_at: Instant::now(),
+            priority,
+            max_workers,
+            active_claims: AtomicU32::new(0),
             sealed: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             toplevels: RwLock::new(Vec::new()),
@@ -75,6 +98,15 @@ impl Submission {
             transient_retries: AtomicU32::new(0),
             warned_oversized: AtomicBool::new(false),
         })
+    }
+
+    /// True if this submission is at its in-flight claim cap. Fleet
+    /// scheduler uses this as a "skip this submission for now" signal.
+    pub fn at_worker_cap(&self) -> bool {
+        let Some(cap) = self.max_workers else {
+            return false;
+        };
+        self.active_claims.load(Ordering::Acquire) >= cap
     }
 
     /// Append a failure record for this submission. Idempotent on
@@ -361,11 +393,19 @@ pub struct Submissions {
 
 struct SubmissionsInner {
     by_id: HashMap<JobId, Arc<Submission>>,
-    /// Secondary index: `(created_at, id)` → `Arc<Submission>`. The
-    /// tuple key makes equal `created_at` values well-ordered by id,
-    /// keeping the iteration deterministic even if two submissions
-    /// land on the same `Instant` tick (possible on fast hardware).
-    by_created_at: std::collections::BTreeMap<(Instant, JobId), Arc<Submission>>,
+    /// Secondary index keyed on the scheduling tuple
+    /// `(Reverse(priority), created_at, id)`. BTreeMap iterates in
+    /// ascending-key order, so `Reverse(priority)` puts higher-priority
+    /// jobs FIRST; within a tier, older `created_at` wins; within the
+    /// same `Instant`, id is a stable tiebreaker. Maintained atomically
+    /// with `by_id` under a single write lock.
+    by_schedule: std::collections::BTreeMap<ScheduleKey, Arc<Submission>>,
+}
+
+type ScheduleKey = (std::cmp::Reverse<i32>, Instant, JobId);
+
+fn schedule_key(sub: &Submission) -> ScheduleKey {
+    (std::cmp::Reverse(sub.priority), sub.created_at, sub.id)
 }
 
 impl Default for Submissions {
@@ -379,7 +419,7 @@ impl Submissions {
         Self {
             inner: RwLock::new(SubmissionsInner {
                 by_id: HashMap::new(),
-                by_created_at: std::collections::BTreeMap::new(),
+                by_schedule: std::collections::BTreeMap::new(),
             }),
         }
     }
@@ -397,6 +437,21 @@ impl Submissions {
     }
 
     pub fn get_or_insert(&self, id: JobId, event_capacity: usize) -> Arc<Submission> {
+        self.get_or_insert_with_options(id, event_capacity, 0, None)
+    }
+
+    /// Insert with explicit scheduling options. Used by the POST /jobs
+    /// handler to attach priority + max_workers at the authoritative
+    /// creation point. On dedup hit, returns the existing submission —
+    /// the options are **not** applied retroactively (an already-live
+    /// submission keeps its original priority).
+    pub fn get_or_insert_with_options(
+        &self,
+        id: JobId,
+        event_capacity: usize,
+        priority: i32,
+        max_workers: Option<u32>,
+    ) -> Arc<Submission> {
         if let Some(existing) = self.inner.read().by_id.get(&id).cloned() {
             return existing;
         }
@@ -404,17 +459,17 @@ impl Submissions {
         if let Some(existing) = guard.by_id.get(&id).cloned() {
             return existing;
         }
-        let sub = Submission::new(id, event_capacity);
-        let key = (sub.created_at, id);
+        let sub = Submission::with_options(id, event_capacity, priority, max_workers);
+        let key = schedule_key(&sub);
         guard.by_id.insert(id, sub.clone());
-        guard.by_created_at.insert(key, sub.clone());
+        guard.by_schedule.insert(key, sub.clone());
         sub
     }
 
     pub fn remove(&self, id: JobId) -> Option<Arc<Submission>> {
         let mut guard = self.inner.write();
         let removed = guard.by_id.remove(&id)?;
-        guard.by_created_at.remove(&(removed.created_at, id));
+        guard.by_schedule.remove(&schedule_key(&removed));
         Some(removed)
     }
 
@@ -424,18 +479,12 @@ impl Submissions {
         self.inner.read().by_id.values().cloned().collect()
     }
 
-    /// Snapshot every live submission in FIFO order (oldest first).
-    /// Used by the fleet `/claim` endpoint: walking the oldest jobs
-    /// first gives predictable fairness and naturally drains
-    /// over-saturated jobs onto the next one. O(N) Arc-clones, no
-    /// sort.
+    /// Snapshot every live submission in schedule order:
+    /// higher-priority first, then oldest first within a priority
+    /// tier. Used by the fleet `/claim` endpoint — no per-call sort
+    /// even under thousand-worker wake storms.
     pub fn sorted_by_created_at(&self) -> Vec<Arc<Submission>> {
-        self.inner
-            .read()
-            .by_created_at
-            .values()
-            .cloned()
-            .collect()
+        self.inner.read().by_schedule.values().cloned().collect()
     }
 }
 

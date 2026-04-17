@@ -112,16 +112,21 @@ pub async fn claim_any(
 
     loop {
         let now_ms = Utc::now().timestamp_millis();
-        // FIFO across submissions — dual-indexed Submissions now
-        // returns pre-sorted; no per-call O(N log N) sort, critical
-        // under 1000+ workers racing on a single `notify_waiters()`
-        // edge.
+        // Priority-first, then FIFO across submissions — dual-indexed
+        // Submissions returns pre-sorted by (Reverse(priority),
+        // created_at, id); no per-call O(N log N) sort, critical under
+        // 1000+ workers racing on a single `notify_waiters()` edge.
         let subs = state.dispatcher.submissions.sorted_by_created_at();
         for sub in &subs {
             // Skip submissions already moving toward terminal — their
             // ready queues may still hold weak refs but their workers
             // are exiting.
             if sub.is_terminal() {
+                continue;
+            }
+            // Per-job concurrency cap: already at the caller-configured
+            // limit, let other submissions have this worker slot.
+            if sub.at_worker_cap() {
                 continue;
             }
             if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
@@ -146,6 +151,9 @@ pub async fn claim_any(
                 let subs = state.dispatcher.submissions.sorted_by_created_at();
                 for sub in &subs {
                     if sub.is_terminal() {
+                        continue;
+                    }
+                    if sub.at_worker_cap() {
                         continue;
                     }
                     if let Some(step) = sub.pop_runnable(&q.system, &features_vec, now_ms) {
@@ -223,6 +231,11 @@ fn issue_claim(
         started_at_wall: now_wall,
         worker_id,
     }));
+    // Per-submission in-flight counter for max_workers cap. Decremented
+    // in `complete` and in the claim-deadline reaper. `evict_claims_for`
+    // doesn't decrement because its callers have just removed the
+    // submission; the counter drops with the Arc.
+    sub.active_claims.fetch_add(1, Ordering::AcqRel);
 
     sub.publish(JobEvent::DrvStarted {
         drv_hash: step.drv_hash().clone(),

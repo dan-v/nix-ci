@@ -51,7 +51,7 @@ async fn submitter_ingests_drv_closure_into_coordinator(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
 
@@ -106,7 +106,7 @@ async fn submitter_skips_attr_with_eval_error(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
 
@@ -152,7 +152,7 @@ async fn submitter_skips_fully_cached_attr(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
 
@@ -199,7 +199,7 @@ async fn submitter_dedups_across_overlapping_closures(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
 
@@ -270,7 +270,7 @@ async fn submitter_records_server_dedup_skipped_across_runs(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
 
@@ -331,7 +331,7 @@ async fn submitter_records_server_errored_in_stats(pool: PgPool) {
     .await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
 
@@ -368,7 +368,7 @@ async fn submitter_reports_errors_for_unreadable_root(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
 

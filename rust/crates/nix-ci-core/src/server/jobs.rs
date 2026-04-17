@@ -15,30 +15,40 @@ use crate::types::{
     JobEvent, JobId, JobStatus, JobStatusResponse, JobSummary, JobsListResponse, SealJobResponse,
 };
 
-#[tracing::instrument(skip_all, fields(external_ref = req.external_ref.as_deref()))]
+#[tracing::instrument(skip_all, fields(
+    external_ref = req.external_ref.as_deref(),
+    priority = req.priority,
+    max_workers = req.max_workers,
+))]
 pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<Json<CreateJobResponse>> {
     // Idempotent on external_ref: a retry with the same ref resolves
     // to the existing id (whatever its status — client decides what to
-    // do with a cancelled / failed result).
+    // do with a cancelled / failed result). On hit, the existing
+    // submission keeps its original priority / max_workers — we don't
+    // retroactively mutate scheduling params on an in-flight job.
     if let Some(ext) = req.external_ref.as_deref() {
         if let Some(existing) = writeback::find_job_by_external_ref(&state.pool, ext).await? {
-            let _ = state
-                .dispatcher
-                .submissions
-                .get_or_insert(existing, state.cfg.submission_event_capacity);
+            let _ = state.dispatcher.submissions.get_or_insert_with_options(
+                existing,
+                state.cfg.submission_event_capacity,
+                req.priority,
+                req.max_workers,
+            );
             tracing::debug!(%existing, external_ref = ext, "job create: external_ref hit");
             return Ok(Json(CreateJobResponse { id: existing }));
         }
     }
     let job_id = JobId::new();
     writeback::upsert_job(&state.pool, job_id, req.external_ref.as_deref()).await?;
-    let _ = state
-        .dispatcher
-        .submissions
-        .get_or_insert(job_id, state.cfg.submission_event_capacity);
+    let _ = state.dispatcher.submissions.get_or_insert_with_options(
+        job_id,
+        state.cfg.submission_event_capacity,
+        req.priority,
+        req.max_workers,
+    );
     state.metrics.inner.jobs_created.inc();
     tracing::info!(%job_id, "job created");
     Ok(Json(CreateJobResponse { id: job_id }))

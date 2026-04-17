@@ -39,6 +39,20 @@ pub async fn complete(
         return Ok(Json(CompleteResponse { ignored: true }));
     };
     state.metrics.inner.claims_in_flight.dec();
+    // Mirror active_claims decrement on the submission so the fleet
+    // scheduler's per-job cap accounts for the finished worker.
+    // Saturating subtract guards against a prior drift (e.g., a
+    // reaper + complete race that both decrement).
+    if let Some(sub_for_counter) = state.dispatcher.submissions.get(claim.job_id) {
+        let prev = sub_for_counter
+            .active_claims
+            .load(std::sync::atomic::Ordering::Acquire);
+        if prev > 0 {
+            sub_for_counter
+                .active_claims
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
 
     if claim.job_id != job_id {
         return Err(Error::BadRequest(

@@ -35,7 +35,9 @@ async fn ingest_rejects_empty_drv_path(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let bad = IngestDrvRequest {
@@ -59,7 +61,9 @@ async fn ingest_rejects_malformed_drv_path(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     // No trailing .drv, no hyphen — drv_hash_from_path should reject.
@@ -84,7 +88,9 @@ async fn ingest_batch_partial_validation_counts_errors(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let good = drv_path("good", "pkg");
@@ -121,7 +127,9 @@ async fn ingest_after_cancel_returns_gone(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -151,7 +159,9 @@ async fn heartbeat_after_cancel_returns_gone(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -177,7 +187,9 @@ async fn worker_without_required_feature_never_claims(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("kvm", "vm-test");
@@ -210,7 +222,9 @@ async fn worker_with_wrong_system_never_claims(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("linuxonly", "kernel");
@@ -246,7 +260,9 @@ async fn retryable_exhaustion_becomes_terminal(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("flk", "flaky");
@@ -325,7 +341,9 @@ async fn cancel_while_claim_outstanding(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("can", "cancelme");
@@ -388,7 +406,9 @@ async fn sse_job_done_event_surfaces_for_success(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("sse", "single");
@@ -454,7 +474,9 @@ async fn metrics_counts_ingested_and_completed(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("met", "measure");
@@ -533,7 +555,9 @@ async fn admin_snapshot_reflects_live_state(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let a = drv_path("aaa", "a");
@@ -594,6 +618,7 @@ async fn terminal_jobs_removed_from_in_memory_map(pool: PgPool) {
         let job = client
             .create_job(&CreateJobRequest {
                 external_ref: Some(format!("terminal-cleanup-{i}")),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -653,7 +678,9 @@ async fn heartbeat_keeps_live_job_fresh(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     client.heartbeat(job.id).await.unwrap();
@@ -669,7 +696,9 @@ async fn ingest_on_sealed_job_is_rejected(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("sealed", "pkg");
@@ -696,7 +725,9 @@ async fn overlong_drv_path_rejected(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     // drv_path with >4096 bytes trips max_drv_path_bytes.
@@ -714,7 +745,9 @@ async fn overlong_drv_name_rejected(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let name = "y".repeat(2000);
@@ -738,7 +771,9 @@ async fn terminal_snapshot_caps_failures(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -862,7 +897,9 @@ async fn server_accepts_h2c_prior_knowledge_clients(pool: PgPool) {
     // negotiate fine.
     let job: nix_ci_core::types::CreateJobResponse = h2_client
         .post(format!("{}/jobs", handle.base_url))
-        .json(&CreateJobRequest { external_ref: None })
+        .json(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .send()
         .await
         .unwrap()
@@ -912,7 +949,9 @@ async fn sse_consumer_returns_pending_on_clean_shutdown(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -951,7 +990,9 @@ async fn sse_drv_completed_event_carries_real_duration(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("dur", "timed");
@@ -1034,7 +1075,9 @@ async fn sse_lagged_event_fires_when_subscriber_falls_behind(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -1100,7 +1143,9 @@ async fn shutdown_terminates_in_flight_claim_longpoll(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();
@@ -1148,7 +1193,9 @@ async fn ingest_length_boundaries_accept_at_max_reject_above(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -1212,7 +1259,9 @@ async fn ingest_batch_counts_wire_dep_errors(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let parent = drv_path("wdpar", "pkg");
@@ -1250,7 +1299,9 @@ async fn claim_response_deadline_matches_config(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("dl", "pkg");
@@ -1303,7 +1354,9 @@ async fn claim_longpoll_returns_204_after_wait_deadline(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     // Deliberately do NOT seal — an empty seal immediately terminates
@@ -1342,7 +1395,9 @@ async fn ingest_batch_rejects_empty_drv_name(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let mut bad = ingest(&drv_path("ok", "ignored"), "ignored", &[], true);
@@ -1358,7 +1413,9 @@ async fn ingest_batch_rejects_empty_system(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let mut bad = ingest(&drv_path("ok", "ignored"), "ignored", &[], true);
@@ -1448,7 +1505,9 @@ async fn metrics_expose_dispatcher_snapshot_gauges(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     for i in 0..3 {
@@ -1497,7 +1556,9 @@ async fn broadcast_preserves_per_subscriber_publish_order(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let sub = handle
@@ -1570,7 +1631,9 @@ async fn reaper_does_not_re_arm_step_finished_via_propagation(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("racefin", "pkg");
@@ -1638,7 +1701,9 @@ async fn reaper_rearms_many_concurrent_expired_claims(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drvs: Vec<IngestDrvRequest> = (0..N)
@@ -1717,7 +1782,9 @@ async fn cancel_evicts_in_flight_claims_for_that_job(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("orphan", "pkg");
@@ -1878,12 +1945,14 @@ async fn find_job_by_external_ref_roundtrips(pool: PgPool) {
     let first = client
         .create_job(&CreateJobRequest {
             external_ref: Some("idempotent-ref-xyz".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
     let second = client
         .create_job(&CreateJobRequest {
             external_ref: Some("idempotent-ref-xyz".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1909,7 +1978,9 @@ async fn reaper_rearms_non_finished_expired_claim(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("rearm", "pkg");
@@ -2028,7 +2099,9 @@ async fn seal_with_no_toplevels_transitions_to_done(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -2063,7 +2136,9 @@ async fn previously_failed_drv_short_circuits_on_fresh_ingest(pool: PgPool) {
 
     // Job 1: drive a drv to terminal BuildFailure → cache populated.
     let job1 = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("shorted", "pkg");
@@ -2109,7 +2184,9 @@ async fn previously_failed_drv_short_circuits_on_fresh_ingest(pool: PgPool) {
     // previous_failure on ingest. After seal, the job is immediately
     // Failed — no claim is ever issued.
     let job2 = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     client
@@ -2154,7 +2231,9 @@ async fn terminal_failure_caches_output_path(pool: PgPool) {
     let handle = spawn_server(pool.clone()).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("fo", "cache-me");
@@ -2212,7 +2291,9 @@ async fn transient_retry_exhaustion_does_not_cache_output_path(pool: PgPool) {
     let handle = spawn_server(pool.clone()).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("nopoison", "flaky");
@@ -2274,7 +2355,9 @@ async fn diskfull_retry_exhaustion_does_not_cache_output_path(pool: PgPool) {
     let handle = spawn_server(pool.clone()).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("nopoisondsk", "toobig");
@@ -2336,7 +2419,9 @@ async fn sse_drv_failed_event_surfaces_for_terminal_failure(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("drvfail", "oops");
@@ -2427,7 +2512,9 @@ async fn flaky_retry_sets_next_attempt_at_to_linear_backoff(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("retrybk", "retryme");
@@ -2502,7 +2589,9 @@ async fn propagated_failures_count_matches_rdep_closure(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -2594,7 +2683,9 @@ async fn admin_snapshot_counts_scale_linearly_with_members(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drvs: Vec<IngestDrvRequest> = (0..5)
@@ -2646,6 +2737,126 @@ async fn admin_snapshot_counts_scale_linearly_with_members(pool: PgPool) {
     assert_eq!(status.counts.pending, 3);
 }
 
+// ─── Priority + per-job concurrency cap (C4) ─────────────────────────
+
+/// Fleet claim must scan higher-priority jobs first, then FIFO within a
+/// tier. Without priority support, an urgent hotfix would wait behind a
+/// large already-running batch job.
+#[sqlx::test]
+async fn fleet_claim_honors_priority(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    // Create low-priority job first (so FIFO by created_at alone would
+    // pick it).
+    let low = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some("low-p".into()),
+            priority: 0,
+            max_workers: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    let high = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some("high-p".into()),
+            priority: 100,
+            max_workers: None,
+        })
+        .await
+        .unwrap();
+
+    let low_drv = drv_path("lowpria01", "low");
+    let high_drv = drv_path("highpri01", "high");
+    client
+        .ingest_drv(low.id, &ingest(&low_drv, "low", &[], true))
+        .await
+        .unwrap();
+    client
+        .ingest_drv(high.id, &ingest(&high_drv, "high", &[], true))
+        .await
+        .unwrap();
+
+    // Fleet claim: must hand back the high-priority drv first even
+    // though low was created earlier.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/claim?wait=2&system=x86_64-linux",
+            handle.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: nix_ci_core::types::ClaimResponse = resp.json().await.unwrap();
+    assert_eq!(
+        body.drv_path, high_drv,
+        "high-priority drv must be claimed first; got {}",
+        body.drv_path
+    );
+}
+
+/// max_workers caps per-job concurrency. With cap=1 and 2 claimable
+/// drvs, only one claim at a time should be outstanding — the fleet
+/// scheduler falls through to the next submission once the cap is hit.
+#[sqlx::test]
+async fn fleet_claim_respects_max_workers(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    let job = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some("capped".into()),
+            priority: 0,
+            max_workers: Some(1),
+        })
+        .await
+        .unwrap();
+    let d1 = drv_path("cappedAA1", "first");
+    let d2 = drv_path("cappedBB2", "second");
+    client
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: vec![
+                    ingest(&d1, "first", &[], true),
+                    ingest(&d2, "second", &[], true),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+    // First fleet claim succeeds.
+    let http = reqwest::Client::new();
+    let r1 = http
+        .get(format!(
+            "{}/claim?wait=2&system=x86_64-linux",
+            handle.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), reqwest::StatusCode::OK);
+
+    // Second claim (before the first completes) must 204 — submission
+    // is at its worker cap and no other submissions exist.
+    let r2 = http
+        .get(format!(
+            "{}/claim?wait=1&system=x86_64-linux",
+            handle.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r2.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "at max_workers=1, second concurrent claim must 204"
+    );
+}
+
 // ─── Dep-cycle detection at seal (C2) ────────────────────────────────
 
 /// A cyclic dep graph (a → b → a) must fail the job at seal time with a
@@ -2657,7 +2868,9 @@ async fn seal_rejects_dep_cycle(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let a = drv_path("cyclea", "a");
@@ -2703,7 +2916,9 @@ async fn ingest_strips_self_loop(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let a = drv_path("selfloopX", "a");
@@ -2736,7 +2951,9 @@ async fn seal_accepts_clean_dag(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     // a → b → c (linear chain).
@@ -2776,7 +2993,9 @@ async fn ingest_drv_cap_auto_fails_job(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -2848,7 +3067,9 @@ async fn ingest_drv_cap_disabled_allows_large_batch(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -2874,7 +3095,9 @@ async fn oversized_batch_rejected_with_413(pool: PgPool) {
     let client = reqwest::Client::new();
     let job_resp: nix_ci_core::types::CreateJobResponse = client
         .post(format!("{}/jobs", handle.base_url))
-        .json(&CreateJobRequest { external_ref: None })
+        .json(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .send()
         .await
         .unwrap()

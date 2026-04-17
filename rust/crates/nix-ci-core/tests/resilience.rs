@@ -46,7 +46,9 @@ async fn cancel_mid_flight_invalidates_claim(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -129,7 +131,9 @@ async fn cancel_is_idempotent(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -148,7 +152,9 @@ async fn heartbeat_timeout_reaps_job(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("hb1", "solo");
@@ -207,7 +213,9 @@ async fn heartbeat_timeout_drops_in_memory_claims(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -264,7 +272,9 @@ async fn restart_cancels_in_flight_and_stale_complete_is_ignored(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("rst", "solo");
@@ -342,12 +352,14 @@ async fn concurrent_cross_job_claim_exactly_one_winner(pool: PgPool) {
     let a = client
         .create_job(&CreateJobRequest {
             external_ref: Some("race-a".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
     let b = client
         .create_job(&CreateJobRequest {
             external_ref: Some("race-b".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -440,7 +452,9 @@ async fn heartbeat_timeout_respects_configured_window(pool: PgPool) {
     .await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -481,12 +495,14 @@ async fn propagated_failures_stay_in_owning_submission(pool: PgPool) {
     let a = client
         .create_job(&CreateJobRequest {
             external_ref: Some("prop-a".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
     let b = client
         .create_job(&CreateJobRequest {
             external_ref: Some("prop-b".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -586,7 +602,9 @@ async fn worker_dies_mid_build_heartbeat_reaps_cleanly(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("zw1", "solo");
@@ -649,7 +667,9 @@ async fn concurrent_complete_same_claim_exactly_one_wins(pool: PgPool) {
     let client = CoordinatorClient::new(&base);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("cc1", "solo");
@@ -710,7 +730,9 @@ async fn cancel_propagates_to_in_flight_long_poll(pool: PgPool) {
     let client = CoordinatorClient::new(&base);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     // No ingest — pop_runnable will always return None; claim loops

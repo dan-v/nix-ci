@@ -100,6 +100,7 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
     let job = client
         .create_job(&CreateJobRequest {
             external_ref: Some("load-test".into()),
+            ..Default::default()
         })
         .await
         .unwrap();

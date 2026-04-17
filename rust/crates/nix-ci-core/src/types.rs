@@ -166,10 +166,25 @@ impl ErrorCategory {
 
 // ─── API: create job ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateJobRequest {
     #[serde(default)]
     pub external_ref: Option<String>,
+    /// Higher-priority jobs are scanned first by the fleet `/claim`
+    /// endpoint. Within a priority tier, older jobs go first (FIFO).
+    /// Default 0. Negative values deprioritize below ordinary jobs
+    /// (e.g., batch rebuilds); positive values preempt ordinary ones
+    /// (e.g., urgent hotfix). Not a strict preemption mechanism — an
+    /// already-dispatched worker finishes its current drv before the
+    /// next claim decision.
+    #[serde(default)]
+    pub priority: i32,
+    /// Per-job max concurrent workers. When set, the fleet scheduler
+    /// stops dispatching new claims for this job once this many
+    /// claims are in flight, letting the remaining workers drain to
+    /// other jobs. `None` = no cap. Defaults to no cap.
+    #[serde(default)]
+    pub max_workers: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

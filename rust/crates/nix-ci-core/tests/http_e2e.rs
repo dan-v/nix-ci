@@ -29,7 +29,9 @@ async fn create_and_status(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let status = client.status(job.id).await.unwrap();
@@ -43,7 +45,9 @@ async fn linear_chain_of_three_completes(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -115,7 +119,9 @@ async fn build_failure_marks_job_failed(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -166,7 +172,9 @@ async fn failure_propagates_to_dependents(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -242,7 +250,9 @@ async fn retryable_failure_retries_then_succeeds(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("rrr", "flaky");
@@ -322,7 +332,9 @@ async fn stale_complete_returns_ignored(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drv = drv_path("sss", "solo");
@@ -382,7 +394,9 @@ async fn batch_ingest_full_dag_sequences_builds(pool: PgPool) {
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -447,12 +461,14 @@ async fn batch_ingest_cross_job_transitive_dedup(pool: PgPool) {
     let job_a = client
         .create_job(&CreateJobRequest {
             external_ref: Some("a".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
     let job_b = client
         .create_job(&CreateJobRequest {
             external_ref: Some("b".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -541,12 +557,14 @@ async fn cross_job_dedup_only_one_worker_builds(pool: PgPool) {
     let job_a = client
         .create_job(&CreateJobRequest {
             external_ref: Some("a".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
     let job_b = client
         .create_job(&CreateJobRequest {
             external_ref: Some("b".into()),
+            ..Default::default()
         })
         .await
         .unwrap();

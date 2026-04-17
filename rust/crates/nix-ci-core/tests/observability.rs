@@ -80,6 +80,7 @@ async fn list_jobs_returns_failures_newest_first(pool: PgPool) {
         let job = client
             .create_job(&CreateJobRequest {
                 external_ref: Some(format!("ext-{i}")),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -117,6 +118,7 @@ async fn list_jobs_paginates_by_cursor(pool: PgPool) {
         let job = client
             .create_job(&CreateJobRequest {
                 external_ref: Some(format!("p{i}")),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -173,6 +175,7 @@ async fn by_external_ref_resolves_terminal_job(pool: PgPool) {
     let job = client
         .create_job(&CreateJobRequest {
             external_ref: Some("my-build-42".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -204,6 +207,7 @@ async fn show_job_resolves_uuid_and_external_ref(pool: PgPool) {
     let job = client
         .create_job(&CreateJobRequest {
             external_ref: Some("two-paths".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -229,6 +233,7 @@ async fn snapshot_recent_failures_lists_top_5_newest(pool: PgPool) {
         let job = client
             .create_job(&CreateJobRequest {
                 external_ref: Some(format!("rec-{i}")),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -270,7 +275,9 @@ async fn drv_failed_event_carries_used_by_attrs(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
 
@@ -367,7 +374,9 @@ async fn progress_event_carries_enrichments(pool: PgPool) {
     .await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     client
@@ -454,7 +463,9 @@ async fn regression_fleet_worker_still_drains_jobs(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
-        .create_job(&CreateJobRequest { external_ref: None })
+        .create_job(&CreateJobRequest { external_ref: None,
+    ..Default::default()
+})
         .await
         .unwrap();
     let drvs: Vec<_> = (0..4)

@@ -38,6 +38,7 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
     let job = client
         .create_job(&CreateJobRequest {
             external_ref: args.external_ref.clone(),
+            ..Default::default()
         })
         .await?;
     let job_id = job.id;

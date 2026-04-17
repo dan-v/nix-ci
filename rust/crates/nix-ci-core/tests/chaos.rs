@@ -300,6 +300,7 @@ async fn chaos_single_iter(pool: PgPool) {
             let j = client
                 .create_job(&CreateJobRequest {
                     external_ref: Some(format!("chaos-{seed}-{i}")),
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
