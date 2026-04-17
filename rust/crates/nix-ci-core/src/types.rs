@@ -185,6 +185,15 @@ pub struct CreateJobRequest {
     /// other jobs. `None` = no cap. Defaults to no cap.
     #[serde(default)]
     pub max_workers: Option<u32>,
+    /// Per-job override of `ServerConfig::claim_deadline_secs`. A stuck
+    /// worker holds a drv for at most this duration before the reaper
+    /// re-arms it for a different worker. Lower values give faster tail
+    /// recovery (most nixpkgs drvs build in < 10 min, so a 1h job-level
+    /// deadline is dramatically tighter than the 2h server default
+    /// while still covering outliers like webkitgtk). `None` = inherit
+    /// server default.
+    #[serde(default)]
+    pub claim_deadline_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

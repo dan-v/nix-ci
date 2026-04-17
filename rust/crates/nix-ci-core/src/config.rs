@@ -102,7 +102,7 @@ impl Default for ServerConfig {
             database_url: "postgres://localhost/nix_ci".to_string(),
             listen: "127.0.0.1:8080".parse().unwrap(),
             lock_key: NIX_CI_COORDINATOR_LOCK_KEY,
-            claim_deadline_secs: 2 * 60 * 60, // 2h
+            claim_deadline_secs: 60 * 60, // 1h — dramatically faster tail recovery than the old 2h, still generous for the long nixpkgs outliers (webkitgtk, chromium). Per-job overridable via CreateJobRequest.claim_deadline_secs.
             job_heartbeat_timeout_secs: 30,
             reaper_interval_secs: 15,
             cleanup_interval_secs: 5 * 60,

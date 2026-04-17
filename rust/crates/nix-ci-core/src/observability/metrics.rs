@@ -72,6 +72,21 @@ pub struct MetricsInner {
     /// Soft warnings emitted when a single submission's member count
     /// crossed `submission_warn_threshold`. Counts events, not drvs.
     pub submission_warn_total: Counter,
+
+    // H3 observability additions: metrics that matter at 3am.
+
+    /// Histogram of how long claims live before being completed or
+    /// expired. Tail = stuck workers. P99 > 10 min in a healthy
+    /// nixpkgs deployment usually means a drv with runaway IO or a
+    /// hung network operation.
+    pub claim_age_seconds: Histogram,
+    /// Histogram of per-batch ingest size (drvs per POST
+    /// `/jobs/{}/drvs/batch`). Helps debug ingest latency tails.
+    pub ingest_batch_drvs: Histogram,
+    /// Current total size of the Postgres pool (acquired + idle).
+    pub pg_pool_size: Gauge,
+    /// Current idle Postgres connections.
+    pub pg_pool_idle: Gauge,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -274,6 +289,35 @@ impl Metrics {
             submission_warn_total.clone(),
         );
 
+        // H3: new observability metrics (not registered yet).
+        let claim_age_seconds =
+            Histogram::new([0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0]);
+        registry.register(
+            "nix_ci_claim_age_seconds",
+            "Time from claim issued to claim ended (complete or expire)",
+            claim_age_seconds.clone(),
+        );
+        let ingest_batch_drvs = Histogram::new([
+            1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0,
+        ]);
+        registry.register(
+            "nix_ci_ingest_batch_drvs",
+            "Per-batch ingest size (drvs per POST request)",
+            ingest_batch_drvs.clone(),
+        );
+        let pg_pool_size = Gauge::default();
+        registry.register(
+            "nix_ci_pg_pool_size",
+            "Total Postgres connections in the coordinator pool",
+            pg_pool_size.clone(),
+        );
+        let pg_pool_idle = Gauge::default();
+        registry.register(
+            "nix_ci_pg_pool_idle",
+            "Idle Postgres connections in the coordinator pool",
+            pg_pool_idle.clone(),
+        );
+
         Self {
             inner: Arc::new(MetricsInner {
                 registry: parking_lot::Mutex::new(registry),
@@ -298,6 +342,10 @@ impl Metrics {
                 build_logs_truncated_total,
                 drvs_per_job,
                 submission_warn_total,
+                claim_age_seconds,
+                ingest_batch_drvs,
+                pg_pool_size,
+                pg_pool_idle,
             }),
         }
     }

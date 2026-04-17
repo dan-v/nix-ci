@@ -140,6 +140,13 @@ pub fn reap_expired_claims(dispatcher: &Dispatcher) {
             continue;
         };
         dispatcher.metrics.inner.claims_in_flight.dec();
+        // H3: observe claim age on expire so the histogram captures
+        // both fast (complete) and slow (expire) tails.
+        dispatcher
+            .metrics
+            .inner
+            .claim_age_seconds
+            .observe(claim.started_at.elapsed().as_secs_f64());
         // Mirror active_claims decrement on the owning submission so
         // the fleet scheduler's per-job cap clears as claims expire.
         if let Some(sub) = dispatcher.submissions.get(claim.job_id) {

@@ -2754,6 +2754,7 @@ async fn fleet_claim_honors_priority(pool: PgPool) {
             external_ref: Some("low-p".into()),
             priority: 0,
             max_workers: None,
+            claim_deadline_secs: None,
         })
         .await
         .unwrap();
@@ -2763,6 +2764,7 @@ async fn fleet_claim_honors_priority(pool: PgPool) {
             external_ref: Some("high-p".into()),
             priority: 100,
             max_workers: None,
+            claim_deadline_secs: None,
         })
         .await
         .unwrap();
@@ -2810,6 +2812,7 @@ async fn fleet_claim_respects_max_workers(pool: PgPool) {
             external_ref: Some("capped".into()),
             priority: 0,
             max_workers: Some(1),
+            claim_deadline_secs: None,
         })
         .await
         .unwrap();

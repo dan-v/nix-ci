@@ -53,6 +53,18 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         .inner
         .steps_registry_size
         .set(state.dispatcher.steps.len() as i64);
+    // H3: PG pool usage — saturation is a leading indicator for
+    // coordinator-induced latency spikes.
+    state
+        .metrics
+        .inner
+        .pg_pool_size
+        .set(state.pool.size() as i64);
+    state
+        .metrics
+        .inner
+        .pg_pool_idle
+        .set(state.pool.num_idle() as i64);
 
     let body = state.metrics.render();
     let mut headers = HeaderMap::new();

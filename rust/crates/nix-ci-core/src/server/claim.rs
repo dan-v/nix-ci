@@ -215,7 +215,14 @@ fn issue_claim(
 ) -> Result<Response> {
     let attempt = step.tries.fetch_add(1, Ordering::AcqRel) + 1;
     let claim_id = ClaimId::new();
-    let deadline_duration = Duration::from_secs(state.cfg.claim_deadline_secs);
+    // Per-job deadline override (C5): the caller can tighten the
+    // claim deadline for a single job (e.g., "this job only builds
+    // small leaf packages, cap at 10 min"). Falls back to the server
+    // default when unset.
+    let deadline_secs = sub
+        .claim_deadline_secs
+        .unwrap_or(state.cfg.claim_deadline_secs);
+    let deadline_duration = Duration::from_secs(deadline_secs);
     let wall_deadline =
         Utc::now() + chrono::Duration::from_std(deadline_duration).unwrap_or_default();
 

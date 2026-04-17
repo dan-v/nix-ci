@@ -33,6 +33,13 @@ pub async fn submit_batch(
     Path(id): Path<crate::types::JobId>,
     Json(req): Json<IngestBatchRequest>,
 ) -> Result<Json<IngestBatchResponse>> {
+    // H3: track batch size distribution so slow-ingest incidents can be
+    // attributed to a runaway submitter emitting unusually large batches.
+    state
+        .metrics
+        .inner
+        .ingest_batch_drvs
+        .observe(req.drvs.len() as f64);
     if req.drvs.is_empty() {
         return Ok(Json(IngestBatchResponse {
             new_drvs: 0,

@@ -29,6 +29,10 @@ pub struct Submission {
     /// `None` = no cap. When `active_claims >= max_workers`, the
     /// fleet scheduler skips this submission until one completes.
     pub max_workers: Option<u32>,
+    /// Caller-supplied override of the server's default claim deadline
+    /// (in seconds). `None` = use the server default from
+    /// `ServerConfig::claim_deadline_secs`. Read by `issue_claim`.
+    pub claim_deadline_secs: Option<u64>,
     /// Live counter of in-flight claims for this submission. Bumped
     /// by `issue_claim`, decremented by `complete` / `evict_claims_for`.
     pub active_claims: AtomicU32,
@@ -70,7 +74,7 @@ pub struct Submission {
 
 impl Submission {
     pub fn new(id: JobId, event_capacity: usize) -> Arc<Self> {
-        Self::with_options(id, event_capacity, 0, None)
+        Self::with_options(id, event_capacity, 0, None, None)
     }
 
     pub fn with_options(
@@ -78,6 +82,7 @@ impl Submission {
         event_capacity: usize,
         priority: i32,
         max_workers: Option<u32>,
+        claim_deadline_secs: Option<u64>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(event_capacity);
         Arc::new(Self {
@@ -85,6 +90,7 @@ impl Submission {
             created_at: Instant::now(),
             priority,
             max_workers,
+            claim_deadline_secs,
             active_claims: AtomicU32::new(0),
             sealed: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
@@ -437,20 +443,22 @@ impl Submissions {
     }
 
     pub fn get_or_insert(&self, id: JobId, event_capacity: usize) -> Arc<Submission> {
-        self.get_or_insert_with_options(id, event_capacity, 0, None)
+        self.get_or_insert_with_options(id, event_capacity, 0, None, None)
     }
 
     /// Insert with explicit scheduling options. Used by the POST /jobs
-    /// handler to attach priority + max_workers at the authoritative
-    /// creation point. On dedup hit, returns the existing submission —
-    /// the options are **not** applied retroactively (an already-live
-    /// submission keeps its original priority).
+    /// handler to attach priority + max_workers + claim_deadline_secs
+    /// at the authoritative creation point. On dedup hit, returns the
+    /// existing submission — the options are **not** applied
+    /// retroactively (an already-live submission keeps its original
+    /// params).
     pub fn get_or_insert_with_options(
         &self,
         id: JobId,
         event_capacity: usize,
         priority: i32,
         max_workers: Option<u32>,
+        claim_deadline_secs: Option<u64>,
     ) -> Arc<Submission> {
         if let Some(existing) = self.inner.read().by_id.get(&id).cloned() {
             return existing;
@@ -459,7 +467,13 @@ impl Submissions {
         if let Some(existing) = guard.by_id.get(&id).cloned() {
             return existing;
         }
-        let sub = Submission::with_options(id, event_capacity, priority, max_workers);
+        let sub = Submission::with_options(
+            id,
+            event_capacity,
+            priority,
+            max_workers,
+            claim_deadline_secs,
+        );
         let key = schedule_key(&sub);
         guard.by_id.insert(id, sub.clone());
         guard.by_schedule.insert(key, sub.clone());

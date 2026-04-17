@@ -36,6 +36,7 @@ pub async fn create(
                 state.cfg.submission_event_capacity,
                 req.priority,
                 req.max_workers,
+                req.claim_deadline_secs,
             );
             tracing::debug!(%existing, external_ref = ext, "job create: external_ref hit");
             return Ok(Json(CreateJobResponse { id: existing }));
@@ -48,6 +49,7 @@ pub async fn create(
         state.cfg.submission_event_capacity,
         req.priority,
         req.max_workers,
+        req.claim_deadline_secs,
     );
     state.metrics.inner.jobs_created.inc();
     tracing::info!(%job_id, "job created");
