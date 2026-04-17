@@ -112,3 +112,23 @@ pub async fn spawn_server_with_cfg(
 pub fn drv_path(hash: &str, name: &str) -> String {
     format!("/nix/store/{hash}-{name}.drv")
 }
+
+/// Shared ingest-request builder. Individual test files add their own
+/// drv/name/deps; this keeps the boilerplate out of every site.
+#[allow(dead_code)]
+pub fn ingest(
+    drv: &str,
+    name: &str,
+    deps: &[&str],
+    is_root: bool,
+) -> nix_ci_core::types::IngestDrvRequest {
+    nix_ci_core::types::IngestDrvRequest {
+        drv_path: drv.to_string(),
+        drv_name: name.to_string(),
+        system: "x86_64-linux".into(),
+        required_features: vec![],
+        input_drvs: deps.iter().map(|s| s.to_string()).collect(),
+        is_root,
+        attr: None,
+    }
+}
