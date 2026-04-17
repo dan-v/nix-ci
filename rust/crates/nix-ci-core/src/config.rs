@@ -101,6 +101,13 @@ pub struct ServerConfig {
     /// sooner; higher = avoid thrashing on a known-broken drv. Only
     /// affects new inserts; existing rows keep their original TTL.
     pub failed_outputs_ttl_secs: u64,
+    /// Per-connection `statement_timeout` (milliseconds). Set on every
+    /// Postgres connection the pool hands out so a runaway query (the
+    /// cleanup DELETE on a very large jobs table, a pathological
+    /// ingest lookup) can't hold heap locks indefinitely. Default 60s —
+    /// generous enough for the cold-cache paths, tight enough to
+    /// bound blast radius. Set to 0 to disable (not recommended).
+    pub pg_statement_timeout_ms: u64,
     /// Optional bearer token. When set, every mutating endpoint
     /// (POST / DELETE / claim / complete / events) rejects requests
     /// without a matching `Authorization: Bearer <token>` header with
@@ -142,6 +149,7 @@ impl Default for ServerConfig {
             submission_warn_threshold: 200_000,
             max_drvs_per_job: Some(2_000_000),
             failed_outputs_ttl_secs: 60 * 60, // 1h
+            pg_statement_timeout_ms: 60_000,
             auth_bearer: None,
         }
     }

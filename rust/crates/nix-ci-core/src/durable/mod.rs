@@ -14,8 +14,16 @@ use sqlx::{ConnectOptions, Connection as _, PgConnection};
 
 use crate::error::Result;
 
-/// Open the Postgres pool and run pending migrations.
-pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool> {
+/// Open the Postgres pool and run pending migrations. Every connection
+/// the pool hands out has `statement_timeout` set to
+/// `pg_statement_timeout_ms` — a safety net so a runaway query can't
+/// hold locks indefinitely. Migrations are run with the timeout in
+/// place too (migrations are small; if one exceeds 60s something is
+/// seriously wrong and failing loudly at boot is correct).
+pub async fn connect_and_migrate(
+    database_url: &str,
+    pg_statement_timeout_ms: u64,
+) -> Result<PgPool> {
     let opts: PgConnectOptions = database_url
         .parse::<PgConnectOptions>()
         .map_err(|e| crate::Error::Config(format!("bad DATABASE_URL: {e}")))?
@@ -25,6 +33,23 @@ pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool> {
         .max_connections(16)
         .min_connections(2)
         .acquire_timeout(Duration::from_secs(10))
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                if pg_statement_timeout_ms > 0 {
+                    // `SET` applies to the session (i.e. this pooled
+                    // connection for its lifetime). Integer parameter
+                    // is milliseconds when quoted; `0` means disabled
+                    // in Postgres. We already guard with `> 0` so we
+                    // never issue the degenerate disable case here.
+                    sqlx::query(&format!(
+                        "SET statement_timeout = {pg_statement_timeout_ms}"
+                    ))
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(())
+            })
+        })
         .connect_with(opts)
         .await?;
 

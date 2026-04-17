@@ -30,7 +30,7 @@ use crate::observability::metrics::Metrics;
 
 /// Run the coordinator until shutdown is signalled.
 pub async fn run(cfg: ServerConfig) -> Result<()> {
-    let pool = durable::connect_and_migrate(&cfg.database_url).await?;
+    let pool = durable::connect_and_migrate(&cfg.database_url, cfg.pg_statement_timeout_ms).await?;
 
     // Single-writer: block until we hold the advisory lock. Uses a
     // dedicated connection so Drop reliably releases the lock.
