@@ -46,3 +46,6 @@ load-test = []
 # Disabled by default so normal `cargo test` and tools like
 # cargo-mutants don't re-run it for every mutation.
 chaos-test = []
+
+[lints]
+workspace = true

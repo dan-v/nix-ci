@@ -8,6 +8,20 @@ license = "MIT OR Apache-2.0"
 version = "0.2.0"
 publish = false
 
+# Workspace-wide lints. Crates inherit via `[lints] workspace = true`.
+# The clippy gates here are load-bearing for the 8 dispatcher
+# invariants (esp. "no .await under a parking_lot lock") so keeping
+# them as `deny` rather than `warn` means regressions hit CI, not
+# production.
+[workspace.lints.clippy]
+# Invariant 5 in dispatch/mod.rs: no async code path may hold a
+# parking_lot guard across an `.await`. The lint catches both
+# std::sync::Mutex/RwLock and parking_lot's equivalents.
+await_holding_lock = "deny"
+# Cheap extra safety: catches borrowing a RefCell across an await.
+# Same class of bug, different primitive.
+await_holding_refcell_ref = "deny"
+
 [workspace.dependencies]
 nix-ci-core = { path = "crates/nix-ci-core" }
 

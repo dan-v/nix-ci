@@ -186,7 +186,7 @@ impl Submission {
                 continue;
             }
             if guard.len() >= EVAL_ERRORS_CAP {
-                if !guard.last().is_some_and(|last| last.attr == "<truncated>") {
+                if guard.last().is_none_or(|last| last.attr != "<truncated>") {
                     guard.push(EvalError {
                         attr: "<truncated>".into(),
                         error: format!("cap of {EVAL_ERRORS_CAP} eval errors reached"),
