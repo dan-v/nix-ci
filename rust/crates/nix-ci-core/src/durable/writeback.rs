@@ -8,8 +8,8 @@
 
 use sqlx::PgPool;
 
-use crate::error::Result;
-use crate::types::{DrvHash, JobId};
+use crate::error::{Error, Result};
+use crate::types::{DrvHash, JobId, JobStatusResponse};
 
 /// Insert the job row. Idempotent on `id`: concurrent retries of a
 /// lost POST /jobs response will no-op rather than double-insert.
@@ -73,6 +73,21 @@ pub async fn seal_job(pool: &PgPool, job_id: JobId) -> Result<bool> {
 /// Idempotent via the `done_at IS NULL` guard; a losing race skips the
 /// write entirely — the caller uses the return value to decide whether
 /// to publish `JobEvent::JobDone`.
+/// Convenience wrapper: serialize a [`JobStatusResponse`] and persist it
+/// via [`transition_job_terminal`]. Every coordinator path that forces
+/// a terminal state (seal-fail, user-initiated fail, cancel, oversized
+/// ingest rejection, and the graceful all-roots-finished path) funnels
+/// through this so the serialize-then-write contract stays in one place.
+pub async fn persist_terminal_snapshot(
+    pool: &PgPool,
+    job_id: JobId,
+    snapshot: &JobStatusResponse,
+) -> Result<bool> {
+    let json = serde_json::to_value(snapshot)
+        .map_err(|e| Error::Internal(format!("serialize terminal snapshot: {e}")))?;
+    transition_job_terminal(pool, job_id, snapshot.status.as_str(), &json).await
+}
+
 pub async fn transition_job_terminal(
     pool: &PgPool,
     job_id: JobId,

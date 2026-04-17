@@ -475,15 +475,7 @@ pub(super) async fn check_and_publish_terminal(
         eval_error: None,
         eval_errors: eval_errors_snapshot,
     };
-    let snapshot_json = serde_json::to_value(&snapshot)
-        .map_err(|e| Error::Internal(format!("serialize terminal result: {e}")))?;
-    let _ = writeback::transition_job_terminal(
-        &state.pool,
-        sub.id,
-        final_status.as_str(),
-        &snapshot_json,
-    )
-    .await?;
+    let _ = writeback::persist_terminal_snapshot(&state.pool, sub.id, &snapshot).await?;
 
     if !sub.mark_terminal() {
         return Ok(());

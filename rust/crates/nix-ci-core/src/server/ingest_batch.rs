@@ -381,18 +381,10 @@ async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Resul
         eval_error: Some(reason.to_string()),
         eval_errors,
     };
-    let snapshot_json = serde_json::to_value(&snapshot)
-        .map_err(|e| crate::Error::Internal(format!("serialize oversized snapshot: {e}")))?;
     // Terminal write is idempotent (done_at IS NULL guard). If the job
     // was already forced terminal by a concurrent oversized batch, we
     // still return PayloadTooLarge to the caller — same outcome.
-    let _ = writeback::transition_job_terminal(
-        &state.pool,
-        id,
-        JobStatus::Failed.as_str(),
-        &snapshot_json,
-    )
-    .await?;
+    let _ = writeback::persist_terminal_snapshot(&state.pool, id, &snapshot).await?;
 
     if let Some(sub) = state.dispatcher.submissions.remove(id) {
         state.dispatcher.evict_claims_for(id);

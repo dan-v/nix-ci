@@ -152,15 +152,7 @@ async fn auto_fail_on_seal(state: &AppState, id: JobId, reason: &str) -> Result<
         eval_error: Some(reason.to_string()),
         eval_errors,
     };
-    let snapshot_json = serde_json::to_value(&snapshot)
-        .map_err(|e| Error::Internal(format!("serialize seal-fail snapshot: {e}")))?;
-    let _ = writeback::transition_job_terminal(
-        &state.pool,
-        id,
-        JobStatus::Failed.as_str(),
-        &snapshot_json,
-    )
-    .await?;
+    let _ = writeback::persist_terminal_snapshot(&state.pool, id, &snapshot).await?;
     finish_in_memory(state, id, JobStatus::Failed, Vec::new());
     Ok(())
 }
@@ -172,15 +164,7 @@ pub async fn fail(
 ) -> Result<Json<SealJobResponse>> {
     let snapshot =
         build_terminal_snapshot(&state, id, JobStatus::Failed, Some(req.message.clone()));
-    let snapshot_json = serde_json::to_value(&snapshot)
-        .map_err(|e| Error::Internal(format!("serialize fail result: {e}")))?;
-    let _ = writeback::transition_job_terminal(
-        &state.pool,
-        id,
-        JobStatus::Failed.as_str(),
-        &snapshot_json,
-    )
-    .await?;
+    let _ = writeback::persist_terminal_snapshot(&state.pool, id, &snapshot).await?;
     finish_in_memory(&state, id, JobStatus::Failed, Vec::new());
     Ok(Json(SealJobResponse {
         status: JobStatus::Failed,
@@ -192,15 +176,7 @@ pub async fn cancel(
     Path(id): Path<JobId>,
 ) -> Result<Json<SealJobResponse>> {
     let snapshot = build_terminal_snapshot(&state, id, JobStatus::Cancelled, None);
-    let snapshot_json = serde_json::to_value(&snapshot)
-        .map_err(|e| Error::Internal(format!("serialize cancel result: {e}")))?;
-    let _ = writeback::transition_job_terminal(
-        &state.pool,
-        id,
-        JobStatus::Cancelled.as_str(),
-        &snapshot_json,
-    )
-    .await?;
+    let _ = writeback::persist_terminal_snapshot(&state.pool, id, &snapshot).await?;
     finish_in_memory(&state, id, JobStatus::Cancelled, Vec::new());
     Ok(Json(SealJobResponse {
         status: JobStatus::Cancelled,
