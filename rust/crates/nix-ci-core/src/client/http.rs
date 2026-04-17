@@ -199,7 +199,8 @@ impl CoordinatorClient {
         worker_id: Option<&str>,
     ) -> Result<Option<ClaimResponse>> {
         let url = format!("{}/jobs/{}/claim", self.base, job_id);
-        self.send_claim(&url, system, features, wait_secs, worker_id).await
+        self.send_claim(&url, system, features, wait_secs, worker_id)
+            .await
     }
 
     /// Fleet claim: ask the coordinator for ANY runnable drv across
@@ -224,7 +225,8 @@ impl CoordinatorClient {
         worker_id: Option<&str>,
     ) -> Result<Option<ClaimResponse>> {
         let url = format!("{}/claim", self.base);
-        self.send_claim(&url, system, features, wait_secs, worker_id).await
+        self.send_claim(&url, system, features, wait_secs, worker_id)
+            .await
     }
 
     /// Shared GET implementation for both per-job and fleet claim

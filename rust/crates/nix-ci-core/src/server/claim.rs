@@ -153,40 +153,12 @@ pub async fn claim_any(
         ));
     }
 
-    'outer: loop {
-        let now_ms = Utc::now().timestamp_millis();
-        // Priority-first, then FIFO across submissions — dual-indexed
-        // Submissions returns pre-sorted by (Reverse(priority),
-        // created_at, id); no per-call O(N log N) sort, critical under
-        // 1000+ workers racing on a single `notify_waiters()` edge.
-        let subs = state.dispatcher.submissions.sorted_by_created_at();
-        for sub in &subs {
-            // Skip submissions already moving toward terminal — their
-            // ready queues may still hold weak refs but their workers
-            // are exiting.
-            if sub.is_terminal() {
-                continue;
-            }
-            // Per-job concurrency cap: already at the caller-configured
-            // limit, let other submissions have this worker slot.
-            if sub.at_worker_cap() {
-                continue;
-            }
-            if let Some(step) = sub.pop_runnable(&systems_vec, &features_vec, now_ms) {
-                if step_exhausted(&step) {
-                    drop(subs);
-                    terminal_fail_exhausted(&state, &step).await?;
-                    // Re-scan from the top: terminalizing this step
-                    // may have propagated failures to other submissions
-                    // and we want a consistent view before the next
-                    // pop.
-                    continue 'outer;
-                }
-                let job_id = sub.id;
-                return issue_claim(&state, sub, job_id, step, start, q.worker.clone());
-            }
+    loop {
+        match scan_fleet_once(&state, &systems_vec, &features_vec, start, &q.worker).await? {
+            FleetScan::Issued(r) => return Ok(r),
+            FleetScan::RestartScan => continue,
+            FleetScan::Nothing => {}
         }
-        drop(subs);
 
         if Instant::now() >= deadline {
             return Ok(StatusCode::NO_CONTENT.into_response());
@@ -198,30 +170,77 @@ pub async fn claim_any(
             () = notified => continue,
             () = wait => {
                 // One last sweep before 204 — a step may have just
-                // become runnable.
-                let now_ms = Utc::now().timestamp_millis();
-                let subs = state.dispatcher.submissions.sorted_by_created_at();
-                for sub in &subs {
-                    if sub.is_terminal() {
-                        continue;
-                    }
-                    if sub.at_worker_cap() {
-                        continue;
-                    }
-                    if let Some(step) = sub.pop_runnable(&systems_vec, &features_vec, now_ms) {
-                        if step_exhausted(&step) {
-                            drop(subs);
-                            terminal_fail_exhausted(&state, &step).await?;
-                            return Ok(StatusCode::NO_CONTENT.into_response());
-                        }
-                        let job_id = sub.id;
-                        return issue_claim(&state, sub, job_id, step, start, q.worker.clone());
-                    }
+                // become runnable. Any exhausted-step terminalization
+                // raised here is observed by the next caller; we don't
+                // re-scan a second time in the timeout arm.
+                match scan_fleet_once(&state, &systems_vec, &features_vec, start, &q.worker).await? {
+                    FleetScan::Issued(r) => return Ok(r),
+                    FleetScan::RestartScan | FleetScan::Nothing =>
+                        return Ok(StatusCode::NO_CONTENT.into_response()),
                 }
-                return Ok(StatusCode::NO_CONTENT.into_response());
             }
         }
     }
+}
+
+/// Outcome of one fleet-scan pass.
+enum FleetScan {
+    /// A step was popped + claimed. Caller should return this `Response`.
+    Issued(Response),
+    /// An exhausted step was terminalized (it had already consumed its
+    /// retry budget before we reached it). Caller in a retry loop should
+    /// restart from the top; propagated failures may have changed the
+    /// state of other submissions. A terminal caller (timeout arm) can
+    /// just return 204 — we've already done the right thing on the
+    /// exhausted step.
+    RestartScan,
+    /// Nothing claimable under the current (systems, features).
+    Nothing,
+}
+
+/// Walk every live submission once in schedule order and try to claim.
+/// Extracted so the main long-poll loop and the post-timeout rescan can
+/// share the code. Dropping the `subs` snapshot before the `await` on
+/// `terminal_fail_exhausted` keeps invariant 5 honest (no `.await` under
+/// a lock — `subs` is a Vec<Arc<Submission>> clone, not a guard, but
+/// keeping it tight avoids pinning extra Arcs across a suspension).
+async fn scan_fleet_once(
+    state: &AppState,
+    systems: &[String],
+    features: &[String],
+    start: Instant,
+    worker_id: &Option<String>,
+) -> Result<FleetScan> {
+    let now_ms = Utc::now().timestamp_millis();
+    // Priority-first, then FIFO — dual-indexed Submissions returns
+    // pre-sorted by (Reverse(priority), created_at, id); no per-call
+    // O(N log N) sort, critical under 1000+ workers racing on a single
+    // `notify_waiters()` edge.
+    let subs = state.dispatcher.submissions.sorted_by_created_at();
+    for sub in &subs {
+        // Skip submissions already moving toward terminal — their ready
+        // queues may still hold weak refs but their workers are exiting.
+        if sub.is_terminal() {
+            continue;
+        }
+        // Per-job concurrency cap: already at the caller-configured
+        // limit, let other submissions have this worker slot.
+        if sub.at_worker_cap() {
+            continue;
+        }
+        let Some(step) = sub.pop_runnable(systems, features, now_ms) else {
+            continue;
+        };
+        if step_exhausted(&step) {
+            drop(subs);
+            terminal_fail_exhausted(state, &step).await?;
+            return Ok(FleetScan::RestartScan);
+        }
+        let job_id = sub.id;
+        return issue_claim(state, sub, job_id, step, start, worker_id.clone())
+            .map(FleetScan::Issued);
+    }
+    Ok(FleetScan::Nothing)
 }
 
 /// `DELETE /admin/claims/{claim_id}` — operator lever for unsticking
