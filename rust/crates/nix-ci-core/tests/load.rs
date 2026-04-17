@@ -51,19 +51,33 @@ impl Latencies {
     fn record_complete(&self, d: Duration) {
         self.complete.lock().push(d.as_secs_f64() * 1000.0);
     }
-    fn percentiles(&self, label: &str) {
+    /// Summarize and return the claim-latency percentiles so the
+    /// caller can SPEC-assert against them. Returns (p50_ms, p99_ms);
+    /// printing the full breakdown as a side effect for CI logs.
+    fn summarize(&self, label: &str) -> ClaimPercentiles {
         let mut v = std::mem::take(&mut *self.claim.lock());
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        if !v.is_empty() {
+        let claim_pctiles = if v.is_empty() {
+            ClaimPercentiles::default()
+        } else {
+            let p50 = pct(&v, 0.50);
+            let p95 = pct(&v, 0.95);
+            let p99 = pct(&v, 0.99);
+            let max = v.last().copied().unwrap_or(0.0);
             eprintln!(
                 "{label} claim    n={:6} p50={:7.2}ms p95={:7.2}ms p99={:7.2}ms max={:7.2}ms",
                 v.len(),
-                pct(&v, 0.50),
-                pct(&v, 0.95),
-                pct(&v, 0.99),
-                v.last().copied().unwrap_or(0.0)
+                p50,
+                p95,
+                p99,
+                max
             );
-        }
+            ClaimPercentiles {
+                n: v.len(),
+                p50_ms: p50,
+                p99_ms: p99,
+            }
+        };
         let mut v = std::mem::take(&mut *self.complete.lock());
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         if !v.is_empty() {
@@ -76,7 +90,15 @@ impl Latencies {
                 v.last().copied().unwrap_or(0.0)
             );
         }
+        claim_pctiles
     }
+}
+
+#[derive(Default, Debug)]
+struct ClaimPercentiles {
+    n: usize,
+    p50_ms: f64,
+    p99_ms: f64,
 }
 
 fn pct(sorted: &[f64], q: f64) -> f64 {
@@ -252,7 +274,7 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
         build_elapsed.as_secs_f64(),
         (status.counts.total as f64) / build_elapsed.as_secs_f64(),
     );
-    lat.percentiles("LOAD");
+    let claim_pctiles = lat.summarize("LOAD");
 
     // Assertions: the job terminated, nearly-all drvs reached terminal
     // state, no one's starving.
@@ -277,4 +299,77 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
         "build phase took too long: {}s",
         build_elapsed.as_secs()
     );
+
+    // H13 / SPEC S-CLAIM-P99: p99 claim latency must be < 200ms under
+    // this exact load shape. Catches dispatcher regressions that would
+    // inflate tail wait times (new lock contention, added PG calls on
+    // the claim hot path, etc.).
+    assert!(
+        claim_pctiles.p99_ms < 200.0,
+        "S-CLAIM-P99 regression: p99={:.2}ms must be < 200ms (n={})",
+        claim_pctiles.p99_ms,
+        claim_pctiles.n
+    );
+    // H13 / SPEC S-CLAIM-P50: the median — a good signal for baseline
+    // dispatch overhead. 20ms is comfortably above the expected <1ms
+    // for a warm claim and safely below what a real production tail
+    // regression would look like.
+    assert!(
+        claim_pctiles.p50_ms < 20.0,
+        "S-CLAIM-P50 regression: p50={:.2}ms must be < 20ms",
+        claim_pctiles.p50_ms
+    );
+
+    // H13 / SPEC S-INGEST-THR: at least 10K drvs/sec. This setup uses
+    // `ingest_drv` (single-drv per request) rather than batching, so
+    // the measured throughput is the per-drv latency * request rate,
+    // not the peak batch ingest rate. We assert a generous 2K/sec
+    // floor here and track the actual number in log output — raising
+    // the bar toward 10K requires switching ingest to batch mode
+    // (separate test; see spec_report.sh H14).
+    let ingest_throughput =
+        (LAYERS * WIDTH) as f64 / ingest_elapsed.as_secs_f64();
+    eprintln!("ingest throughput: {ingest_throughput:.0} drvs/sec");
+    assert!(
+        ingest_throughput > 2_000.0,
+        "ingest throughput too low: {ingest_throughput:.0} drvs/sec (expected > 2000 with single-drv ingest)"
+    );
+
+    // H13 / SPEC S-MEM-10K: coordinator RSS after 10K drvs must be
+    // bounded. 2 GiB is the SPEC bar; assert a conservative 1 GiB
+    // here as a leading indicator — a real memory leak typically
+    // shows as 10-50x growth, not a small percentage increase.
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(rss_kb) = read_rss_kb() {
+            eprintln!("coordinator RSS after 10K drvs: {rss_kb} KiB");
+            assert!(
+                rss_kb < 1_000_000,
+                "S-MEM-10K regression risk: RSS={rss_kb} KiB exceeds 1 GiB early-warning threshold (SPEC bar is 2 GiB)"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_rss_kb() -> std::io::Result<u64> {
+    // /proc/self/status contains `VmRSS:\t    <kb> kB` — cheap parse,
+    // no allocations beyond the read. On non-Linux the test just
+    // skips this measurement; CI runs on ubuntu-latest so we get it
+    // in the pipeline that matters.
+    let s = std::fs::read_to_string("/proc/self/status")?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let parts: Vec<_> = rest.split_whitespace().collect();
+            if let Some(kb_str) = parts.first() {
+                return kb_str.parse::<u64>().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                });
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "VmRSS not in /proc/self/status",
+    ))
 }
