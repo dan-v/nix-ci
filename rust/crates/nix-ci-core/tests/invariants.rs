@@ -67,14 +67,13 @@ fn invariant_3_dedup_returns_same_arc() {
 
 // ─── Invariant 1: runnable precondition ───────────────────────────────
 
-#[test]
-fn invariant_1_leaf_can_be_armed() {
-    let leaf = mk_step("leaf", &[]);
-    arm(&leaf);
-    assert!(leaf.runnable.load(Ordering::Acquire));
-    assert!(leaf.created.load(Ordering::Acquire));
-    assert!(leaf.state.read().deps.is_empty());
-}
+// NOTE: `invariant_1_leaf_can_be_armed` was removed — it only exercised
+// the test-local `arm()` helper and asserted the flags the helper just
+// set, which was tautological. The non_leaf variant below still covers
+// the actual state-machine transition through `make_rdeps_runnable`.
+// The cross-surface guard for the "runnable ⟹ deps-empty" contract
+// lives in `dispatcher_invariants_obs.rs` and watches it through the
+// HTTP claim path.
 
 #[test]
 fn invariant_1_non_leaf_is_not_runnable_until_deps_drain() {
