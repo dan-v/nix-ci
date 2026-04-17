@@ -111,16 +111,19 @@ pub async fn run(
         }
 
         let needed_set = build_needed_set(&line, &root_drv);
-        let walked = match walk_off_runtime(parsed_cache.clone(), root_drv.clone(), needed_set)
+        let walked = walk_off_runtime(parsed_cache.clone(), root_drv.clone(), needed_set)
             .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, drv = %root_drv, "walk_filtered failed; skipping root");
-                stats.errors += 1;
-                continue;
-            }
-        };
+            .map_err(|e| {
+                // Closure walk is CCI infrastructure, not user input.
+                // A missing / unparseable .drv means the submission
+                // cannot be honored — fail the whole run with a clear
+                // cause rather than silently dropping an attr (which
+                // would seal the job as Done with incomplete ingest
+                // and the user would never know).
+                Error::Internal(format!(
+                    "drv closure walk failed for root {root_drv}: {e}"
+                ))
+            })?;
 
         let mut drvs: Vec<_> = walked
             .into_iter()

@@ -198,14 +198,15 @@ in
 
       serviceConfig = {
         Type = "simple";
-        # Bearer token (if any) comes in via systemd credential. The
-        # EnvironmentFile syntax below expects a `NIX_CI_AUTH_BEARER=...`
-        # style file; the wrapper script reads the raw-token file and
-        # exports the env var before execing nix-ci.
+        # Load bearer tokens via systemd credential store so they never
+        # appear in `/proc/*/environ`. The wrapper script resolves the
+        # token from the credential file at exec time.
+        LoadCredential = lib.optional (cfg.authBearer != null)
+          "auth_bearer:${cfg.authBearer}";
         ExecStart = pkgs.writeShellScript "nix-ci-worker-start" (''
           set -euo pipefail
         '' + (if cfg.authBearer != null then ''
-          export NIX_CI_AUTH_BEARER="$(cat ${lib.escapeShellArg cfg.authBearer})"
+          export NIX_CI_AUTH_BEARER="$(cat "''${CREDENTIALS_DIRECTORY}/auth_bearer")"
         '' else "") + ''
           exec ${cfg.package}/bin/nix-ci worker \
             --coordinator ${lib.escapeShellArg cfg.coordinatorUrl} \
@@ -238,11 +239,25 @@ in
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
+        ProtectKernelTunables = true;
+        ProtectKernelLogs = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectControlGroups = true;
         NoNewPrivileges = true;
         LockPersonality = true;
         RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        # Network surface: the worker talks HTTP/HTTPS to the
+        # coordinator and to the nix daemon over a unix socket. Allow
+        # only those families; deny AF_NETLINK / AF_PACKET / AF_BLUETOOTH
+        # etc. Netlink in particular is the common escape route for a
+        # compromised build helper.
+        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
         # NOT RestrictNamespaces — nix sandbox uses user + mount
-        # namespaces; restricting them breaks builds.
+        # namespaces; restricting them breaks builds. Same for
+        # ProtectKernelModules (nix sandbox mounts overlayfs) and
+        # MemoryDenyWriteExecute (some fixed-output derivations JIT).
       };
     };
 

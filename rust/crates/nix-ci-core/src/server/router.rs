@@ -40,10 +40,37 @@ fn is_public_route(path: &str) -> bool {
     )
 }
 
+/// Routes whose blast radius (force-cancel, force-fail, force-evict
+/// a claim, read the full dispatcher dump) justifies requiring the
+/// separate admin bearer when one is configured. A leaked worker
+/// token then can't silently kill a production job or inspect live
+/// per-step state. When `admin_bearer` is not set, these routes fall
+/// back to the worker token like everything else.
+///
+/// Note: we compare against the MATCHED path (with `{id}` placeholders)
+/// not the rendered URL — cardinality is bounded and predictable.
+fn is_admin_route(path: &str) -> bool {
+    path.starts_with("/admin/")
+        || matches!(
+            path,
+            "/jobs/{id}/fail"
+                | "/jobs/{id}/cancel"
+                | "/admin/claims/{claim_id}"
+                | "/admin/fence"
+                | "/admin/drain"
+                | "/admin/snapshot"
+                | "/admin/debug/dispatcher-dump"
+        )
+}
+
 pub fn build_router(state: AppState) -> Router {
     let max_body = state.cfg.max_request_body_bytes;
     let metrics_for_layer = state.metrics.clone();
-    let auth_token = state.cfg.auth_bearer.clone();
+    let auth_tokens = AuthTokens {
+        worker: state.cfg.auth_bearer.clone(),
+        admin: state.cfg.admin_bearer.clone(),
+    };
+    let request_timeout = state.cfg.request_timeout_secs;
     Router::new()
         // Jobs
         .route("/jobs", post(jobs::create))
@@ -127,40 +154,141 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::from_fn_with_state(
+            request_timeout,
+            request_timeout_layer,
+        ))
+        .layer(middleware::from_fn_with_state(
             metrics_for_layer,
             http_metrics_layer,
         ))
         .layer(middleware::from_fn_with_state(
-            auth_token,
+            auth_tokens,
             bearer_auth_layer,
         ))
         .layer(middleware::from_fn(request_id_layer))
         .with_state(state)
 }
 
-/// Bearer-token gate. Only takes effect when `auth_bearer` is set in
-/// config; otherwise a no-op pass-through. Uses a constant-time
-/// comparison so an attacker can't time-probe the correct prefix.
-async fn bearer_auth_layer(
-    axum::extract::State(expected): axum::extract::State<Option<String>>,
+/// Per-handler request timeout. Bounds the wall-clock any single
+/// non-long-poll handler can consume — a pathologically slow DB
+/// query or an unresponsive downstream won't wedge a tokio task
+/// forever (which would break graceful shutdown and slowly starve
+/// the pool). Long-poll routes are exempt because they have their
+/// own `wait` semantics; pushing them through here would produce
+/// spurious 503s at the poll boundary.
+///
+/// Disabled when `request_timeout_secs == 0` (operators can turn it
+/// off for debugging, but the production default is 30s).
+async fn request_timeout_layer(
+    axum::extract::State(timeout_secs): axum::extract::State<u64>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(expected) = expected.as_deref() else {
-        return next.run(req).await;
-    };
-    let path = req.uri().path();
-    if is_public_route(path) {
+    if timeout_secs == 0 {
         return next.run(req).await;
     }
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    if is_long_poll_route(&route) {
+        return next.run(req).await;
+    }
+    let fut = next.run(req);
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
+        Ok(resp) => resp,
+        Err(_) => crate::Error::ServiceUnavailable(format!(
+            "handler exceeded {timeout_secs}s timeout"
+        ))
+        .into_response(),
+    }
+}
+
+/// Token pair handed to the auth middleware. `admin` is only honored
+/// when `worker` is also set (otherwise auth is disabled for the
+/// whole router).
+#[derive(Clone)]
+struct AuthTokens {
+    worker: Option<String>,
+    admin: Option<String>,
+}
+
+/// Bearer-token gate. When `auth_bearer` is unset, all traffic passes
+/// through regardless (the operator has explicitly opted out of auth,
+/// typically because there's a mesh / VPN in front). When set, every
+/// non-public request must carry `Authorization: Bearer <token>`.
+///
+/// Admin routes additionally require the `admin_bearer` if it's
+/// configured, so a leaked worker token can't escalate to
+/// `/jobs/{id}/cancel` or the dispatcher dump. Workers presenting the
+/// worker token on an admin route get 403 (not 401) to distinguish
+/// "you authenticated, but not for this" from "no credentials."
+///
+/// Comparison is constant-time so an attacker can't prefix-probe.
+async fn bearer_auth_layer(
+    axum::extract::State(tokens): axum::extract::State<AuthTokens>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(worker_tok) = tokens.worker.as_deref() else {
+        // No auth configured at all: everyone passes.
+        return next.run(req).await;
+    };
+    let raw_path = req.uri().path().to_string();
+    if is_public_route(&raw_path) {
+        return next.run(req).await;
+    }
+    // Prefer the matched-route pattern for admin-route detection so
+    // `/jobs/abc/fail` (with a real id) checks the same way as the
+    // route definition `/jobs/{id}/fail`.
+    let route_for_match = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| raw_path.clone());
+    let is_admin = is_admin_route(&route_for_match);
     let presented = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
-    match presented {
-        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => next.run(req).await,
-        _ => crate::Error::Unauthorized("invalid or missing bearer token".into()).into_response(),
+    let Some(presented) = presented else {
+        return crate::Error::Unauthorized("missing bearer token".into()).into_response();
+    };
+
+    let matches_worker = constant_time_eq(presented.as_bytes(), worker_tok.as_bytes());
+    let matches_admin = tokens
+        .admin
+        .as_deref()
+        .map(|t| constant_time_eq(presented.as_bytes(), t.as_bytes()))
+        .unwrap_or(false);
+
+    if is_admin {
+        // Admin routes: accept the admin bearer when configured,
+        // otherwise fall back to the worker bearer (backwards-compat
+        // for single-token deployments).
+        if matches_admin || (tokens.admin.is_none() && matches_worker) {
+            return next.run(req).await;
+        }
+        if matches_worker {
+            // Authenticated but not privileged: 403 is more accurate
+            // than 401 and tells operators exactly what went wrong.
+            return crate::Error::Forbidden(
+                "admin bearer required for this endpoint".into(),
+            )
+            .into_response();
+        }
+        return crate::Error::Unauthorized("invalid bearer token".into()).into_response();
+    }
+
+    // Non-admin route: either token works. Accepting the admin token
+    // on worker routes is harmless (admin is strictly more-privileged)
+    // and avoids accidentally locking out operator tooling.
+    if matches_worker || matches_admin {
+        next.run(req).await
+    } else {
+        crate::Error::Unauthorized("invalid bearer token".into()).into_response()
     }
 }
 

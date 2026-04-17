@@ -5,7 +5,25 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Process-global panic counter. Cloned into every coordinator's
+/// metrics registry so a single `/metrics` scrape surfaces panics
+/// from any thread (including panics that happen before `AppState`
+/// exists or inside tasks that don't carry a handle). Counter is a
+/// thin Arc-wrapped atomic, so clones share state.
+static PANIC_COUNTER: OnceLock<Counter> = OnceLock::new();
+
+fn panic_counter() -> &'static Counter {
+    PANIC_COUNTER.get_or_init(Counter::default)
+}
+
+/// Called from the global panic hook. Increments `process_panics_total`.
+/// Safe to call before the registry is built — the counter is
+/// initialized lazily on first access.
+pub fn panic_observed() {
+    panic_counter().inc();
+}
 
 #[derive(Clone)]
 pub struct Metrics {
@@ -341,6 +359,17 @@ impl Metrics {
             "nix_ci_claim_lease_extensions",
             "Claim leases extended by worker refresh (POST .../claims/{id}/extend)",
             claim_lease_extensions.clone(),
+        );
+
+        // Process-global panic counter. Cloned into the per-instance
+        // registry so `/metrics` surfaces any panic in this process,
+        // including panics in background tasks that aren't part of the
+        // AppState lifetime. Install the panic hook via
+        // `observability::install_panic_hook()` at binary startup.
+        registry.register(
+            "nix_ci_process_panics",
+            "Panics observed by the global panic hook since process start",
+            panic_counter().clone(),
         );
 
         Self {

@@ -28,6 +28,9 @@ pub enum Error {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
@@ -59,6 +62,7 @@ impl Error {
             Error::Gone(_) => StatusCode::GONE,
             Error::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Error::Forbidden(_) => StatusCode::FORBIDDEN,
             Error::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }

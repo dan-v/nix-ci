@@ -108,6 +108,16 @@ pub struct ServerConfig {
     /// generous enough for the cold-cache paths, tight enough to
     /// bound blast radius. Set to 0 to disable (not recommended).
     pub pg_statement_timeout_ms: u64,
+    /// Per-handler request timeout (seconds). Bounds the wall-clock a
+    /// single non-long-poll HTTP handler can run before the server
+    /// gives up on it and returns 503. Prevents a slow DB query or
+    /// hung downstream from wedging a tokio task indefinitely and
+    /// breaking graceful shutdown. Long-poll routes (`/jobs/{id}/claim`,
+    /// `/claim`, `/jobs/{id}/events`) are exempt — they have their
+    /// own explicit wait semantics bounded by `max_claim_wait_secs`.
+    /// Default 30s; set to 0 to disable (not recommended in
+    /// production — a single stuck handler can block shutdown).
+    pub request_timeout_secs: u64,
     /// Optional bearer token. When set, every mutating endpoint
     /// (POST / DELETE / claim / complete / events) rejects requests
     /// without a matching `Authorization: Bearer <token>` header with
@@ -117,6 +127,14 @@ pub struct ServerConfig {
     /// process listings). Leave unset for deployments behind a trusted
     /// mesh / VPN.
     pub auth_bearer: Option<String>,
+    /// Optional secondary bearer token, distinct from `auth_bearer`,
+    /// required on admin-scoped endpoints (`/admin/*`, `/jobs/{id}/fail`,
+    /// `/jobs/{id}/cancel`). Only takes effect when `auth_bearer` is
+    /// also set. Lets operators issue a narrow "workers only" token
+    /// for the fleet while keeping the break-glass admin surface
+    /// behind a separate secret. When `None`, admin endpoints accept
+    /// the worker `auth_bearer` (current behavior).
+    pub admin_bearer: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -129,7 +147,7 @@ impl Default for ServerConfig {
             job_heartbeat_timeout_secs: 30,
             reaper_interval_secs: 15,
             cleanup_interval_secs: 5 * 60,
-            retention_days: 7,
+            retention_days: 14,
             submission_event_capacity: 4096,
             progress_tick_secs: 10,
             sse_keepalive_secs: 15,
@@ -145,12 +163,14 @@ impl Default for ServerConfig {
             max_identifier_bytes: 512,
             max_failures_in_result: 500,
             graceful_shutdown_secs: 30,
-            build_log_retention_days: 14,
+            build_log_retention_days: 7,
             submission_warn_threshold: 200_000,
             max_drvs_per_job: Some(2_000_000),
             failed_outputs_ttl_secs: 60 * 60, // 1h
             pg_statement_timeout_ms: 60_000,
+            request_timeout_secs: 30,
             auth_bearer: None,
+            admin_bearer: None,
         }
     }
 }
@@ -280,6 +300,20 @@ impl ServerConfig {
             errors.push("failed_outputs_ttl_secs must be > 0".into());
         }
 
+        // Log retention must not outlive job retention: the
+        // `build_logs_job_fk` cascade deletes logs whenever a job is
+        // pruned. If `build_log_retention_days > retention_days`, the
+        // cascade would fire before the log cleanup loop's cutoff,
+        // defeating the separate retention knob. Keeping them ordered
+        // here surfaces the misconfiguration at boot rather than as
+        // unexplained missing logs in production.
+        if self.build_log_retention_days > self.retention_days {
+            errors.push(format!(
+                "build_log_retention_days ({}) must be <= retention_days ({}) — job deletion cascades to build_logs",
+                self.build_log_retention_days, self.retention_days
+            ));
+        }
+
         // Ordering invariants: a reaper that fires faster than its
         // own timeout window will reap claims that were just issued.
         if self.reaper_interval_secs >= self.claim_deadline_secs {
@@ -304,13 +338,64 @@ impl ServerConfig {
 
     /// Pretty JSON dump of the merged effective config, for
     /// `nix-ci server --print-config`. Operators paste this into bug
-    /// reports.
+    /// reports. Bearer tokens are redacted so the dump is safe to
+    /// paste into a ticket.
     pub fn to_json_pretty(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|e| {
+        let mut redacted = self.clone();
+        if redacted.auth_bearer.is_some() {
+            redacted.auth_bearer = Some("<redacted>".to_string());
+        }
+        if redacted.admin_bearer.is_some() {
+            redacted.admin_bearer = Some("<redacted>".to_string());
+        }
+        serde_json::to_string_pretty(&redacted).unwrap_or_else(|e| {
             // Should be infallible for this struct shape; fall back to
             // Debug if it ever isn't, rather than panicking.
-            format!("/* serialization error: {e} */\n{self:#?}")
+            format!("/* serialization error: {e} */\n{redacted:#?}")
         })
+    }
+
+    /// Resolve a bearer token: prefer the `*_FILE` env var (points at
+    /// a credential file written by systemd's `LoadCredential` — the
+    /// token stays off `/proc/*/environ` and out of the config JSON),
+    /// then fall back to the inline field. Trims trailing whitespace
+    /// so operators can `echo token > file` without breaking the
+    /// comparison. Empty contents become `None`.
+    fn load_bearer_from_file_env(env_key: &str) -> Option<String> {
+        let path = std::env::var(env_key).ok().filter(|s| !s.trim().is_empty())?;
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                let trimmed = s.trim_end_matches(['\n', '\r', ' ', '\t']).to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    env = env_key,
+                    path = %path,
+                    error = %e,
+                    "bearer token file unreadable; falling back to inline config"
+                );
+                None
+            }
+        }
+    }
+
+    /// Apply `*_FILE` env overrides to the bearer fields. Called by
+    /// `nix-ci server` after config load + CLI / env overlay so that
+    /// systemd `LoadCredential` paths (set as `NIX_CI_AUTH_BEARER_FILE`
+    /// / `NIX_CI_ADMIN_BEARER_FILE`) take precedence over whatever
+    /// the JSON file or inline env var said.
+    pub fn apply_bearer_files(&mut self) {
+        if let Some(tok) = Self::load_bearer_from_file_env("NIX_CI_AUTH_BEARER_FILE") {
+            self.auth_bearer = Some(tok);
+        }
+        if let Some(tok) = Self::load_bearer_from_file_env("NIX_CI_ADMIN_BEARER_FILE") {
+            self.admin_bearer = Some(tok);
+        }
     }
 }
 

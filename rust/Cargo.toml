@@ -22,6 +22,16 @@ await_holding_lock = "deny"
 # Same class of bug, different primitive.
 await_holding_refcell_ref = "deny"
 
+[workspace.lints.rust]
+# Catches types/functions/fields that aren't actually wired up.
+# `warn` not `deny` so intermediate WIP can still compile, but CI
+# should run `cargo clippy -- -D warnings` to block merges that drift.
+dead_code = "warn"
+unused_imports = "warn"
+# Ignoring a Result / MustUse in a mutating handler is almost always
+# a real bug (writeback dropped on the floor, claim eviction missed).
+unused_must_use = "deny"
+
 [workspace.dependencies]
 nix-ci-core = { path = "crates/nix-ci-core" }
 

@@ -240,6 +240,10 @@ async fn list_drv_logs_orders_attempts_newest_first(pool: PgPool) {
     let store = PgLogStore::new(pool.clone());
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let job_id = nix_ci_core::types::JobId::new();
+    // FK build_logs_job_fk requires a real jobs row.
+    nix_ci_core::durable::writeback::upsert_job(&pool, job_id, None)
+        .await
+        .unwrap();
     let drv_hash = DrvHash::new("zzz-multi.drv".to_string());
     let cid_old = ClaimId::new();
     let cid_new = ClaimId::new();
@@ -296,6 +300,10 @@ async fn prune_older_than_drops_old_rows(pool: PgPool) {
     use nix_ci_core::durable::logs::LogPutRequest;
     let drv_hash = DrvHash::new("ddd-prune.drv".to_string());
     let job_id = nix_ci_core::types::JobId::new();
+    // FK build_logs_job_fk requires a real jobs row.
+    nix_ci_core::durable::writeback::upsert_job(&pool, job_id, None)
+        .await
+        .unwrap();
     let old_cid = ClaimId::new();
     let new_cid = ClaimId::new();
     store

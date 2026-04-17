@@ -137,7 +137,29 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
         }
     });
 
-    let submit_stats = submitter::run(client.clone(), job_id, eval_rx, shutdown_rx.clone()).await?;
+    let submit_stats = match submitter::run(client.clone(), job_id, eval_rx, shutdown_rx.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            // The submitter bailed. Tell the coordinator explicitly so
+            // the job lands a terminal `Failed` row with a real cause
+            // (rather than timing out on heartbeat, which looks like
+            // an opaque infra hiccup to the operator). We then abort
+            // the run with the original error so the exit status
+            // reflects the failure.
+            let reason = format!("{e}");
+            tracing::error!(error = %reason, %job_id, "submitter failed; failing job");
+            if let Err(fail_err) = client.fail(job_id, &reason).await {
+                tracing::warn!(error = %fail_err, %job_id, "fail-on-submit-error call itself failed");
+            }
+            // Wind everything down cleanly before returning.
+            let _ = shutdown_tx.send(true);
+            eval_kill_guard.abort();
+            let _ = worker_handle.await;
+            let _ = heartbeat_handle.await;
+            let _ = sse_handle.await;
+            return Err(e);
+        }
+    };
     tracing::info!(
         new = submit_stats.new_drvs,
         deduped = submit_stats.dedup_skipped,

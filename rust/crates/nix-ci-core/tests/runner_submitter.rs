@@ -5,7 +5,6 @@
 
 mod common;
 
-use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -360,11 +359,15 @@ async fn submitter_records_server_errored_in_stats(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn submitter_reports_errors_for_unreadable_root(pool: PgPool) {
-    // drv_path points at a nonexistent file — walk_filtered returns
-    // an empty list silently (logged warn), the submitter records no
-    // new drvs. This is a minimal guard against the walker panicking
-    // on missing .drv files; the observable outcome is "no ingest".
+async fn submitter_fails_fast_on_unreadable_root(pool: PgPool) {
+    // Regression guard: a closure walk that can't read the root .drv
+    // MUST fail the whole submission, not silently succeed with zero
+    // ingested drvs. The "giant nixpkgs overlay" contract is that
+    // nix-ci is never the reason a build doesn't happen — if we can't
+    // honor the submission, the caller has to see that clearly. The
+    // prior behavior (warn + skip) would seal the job as Done with no
+    // drvs, which looks identical to "everything was cached" and is
+    // unrecoverable without log archaeology.
     let handle = spawn_server(pool).await;
     let client = Arc::new(CoordinatorClient::new(&handle.base_url));
     let job = client
@@ -386,12 +389,14 @@ async fn submitter_reports_errors_for_unreadable_root(pool: PgPool) {
     tx.send(line).await.unwrap();
     drop(tx);
 
-    let stats = submitter::run(client.clone(), job.id, rx, srx)
-        .await
-        .unwrap();
-    assert_eq!(stats.new_drvs, 0);
-    // The walker returns an empty list when the root can't be read;
-    // the submitter loop correctly handles that by simply not
-    // ingesting anything (no panic, no wedge).
-    let _unused: HashSet<u8> = HashSet::new();
+    let result = submitter::run(client.clone(), job.id, rx, srx).await;
+    let err = match result {
+        Ok(_) => panic!("walk failure must propagate as a submitter error"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("walk") || msg.contains(".drv") || msg.contains("nope-xyz"),
+        "error must name the walk cause: {msg}"
+    );
 }

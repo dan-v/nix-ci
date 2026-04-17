@@ -228,6 +228,13 @@ async fn main() -> anyhow::Result<()> {
         _ => observability::service::RUNNER,
     };
     observability::init_tracing(service_name);
+    // Install AFTER tracing so panic records go through the real
+    // subscriber. Hook logs a structured record + bumps
+    // `nix_ci_process_panics_total` before chaining to the default
+    // hook (which aborts on panic). An operator alert on
+    // `process_panics_total > 0` catches any coordinator / worker
+    // panic in production.
+    observability::install_panic_hook();
 
     match cli.cmd {
         Cmd::Run(cmd) => run_cmd(cmd).await,
@@ -643,6 +650,11 @@ async fn server_cmd(cmd: ServerCmd) -> anyhow::Result<()> {
     if let Some(k) = cmd.lock_key {
         cfg.lock_key = k;
     }
+    // Load bearer tokens from file paths supplied via env (typically
+    // systemd's `LoadCredential`). Must run after the JSON+CLI overlay
+    // so an explicit file override wins; redaction in --print-config
+    // then hides the plaintext.
+    cfg.apply_bearer_files();
 
     if cmd.print_config {
         // No validation here — operator wants to see exactly what

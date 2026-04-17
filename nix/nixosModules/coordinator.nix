@@ -53,8 +53,47 @@ in
 
     bind = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:8080";
-      description = "Address the coordinator HTTP server binds to.";
+      default = "127.0.0.1:8080";
+      example = "0.0.0.0:8080";
+      description = ''
+        Address the coordinator HTTP server binds to.
+
+        Defaults to localhost-only so a fresh deployment isn't
+        accidentally exposed to the network. Set explicitly to
+        `0.0.0.0:PORT` (or a specific interface IP) when you want
+        remote workers to reach it — typically alongside
+        `services.nix-ci-coordinator.authBearer` or a mesh / VPN
+        that terminates authn for you.
+      '';
+    };
+
+    authBearer = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/keys/nix-ci-bearer";
+      description = ''
+        Optional path to a file containing a bearer token. When set,
+        every mutating endpoint rejects requests without a matching
+        `Authorization: Bearer <token>` header. Monitoring probes
+        (`/healthz`, `/readyz`, `/metrics`) stay public regardless.
+
+        The file is read by systemd via `LoadCredential` so the token
+        never appears in `/proc/*/environ`. Keep the file
+        root-readable only.
+      '';
+    };
+
+    adminBearer = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/keys/nix-ci-admin-bearer";
+      description = ''
+        Optional separate bearer for admin-scoped endpoints
+        (`/admin/*`, `/jobs/{id}/fail`, `/jobs/{id}/cancel`). When
+        set, worker traffic uses `authBearer` and operators use this
+        token; a leaked worker token then can't force-cancel jobs or
+        read the admin snapshot. Ignored if `authBearer` is null.
+      '';
     };
 
     lockKey = lib.mkOption {
@@ -102,7 +141,17 @@ in
       environment = {
         RUST_LOG = cfg.logLevel;
         NIX_CI_LOG_JSON = if cfg.logJson then "1" else "0";
-      };
+      }
+        # Point the coordinator at the systemd credential store for
+        # the bearer tokens. The server reads the file path at boot
+        # and dereferences the contents, never holding the token
+        # string in an env var visible to /proc/*/environ.
+        // lib.optionalAttrs (cfg.authBearer != null) {
+          NIX_CI_AUTH_BEARER_FILE = "%d/auth_bearer";
+        }
+        // lib.optionalAttrs (cfg.adminBearer != null) {
+          NIX_CI_ADMIN_BEARER_FILE = "%d/admin_bearer";
+        };
 
       serviceConfig = {
         Type = "simple";
@@ -126,17 +175,39 @@ in
         # the pool) before systemd SIGKILLs it.
         TimeoutStopSec = cfg.gracefulShutdownSecs + 5;
 
+        # LoadCredential exposes bearer token files under
+        # $CREDENTIALS_DIRECTORY, readable only to the service user.
+        # Files are NOT copied into /proc/*/environ — the systemd
+        # credential store is a read-only tmpfs overlay scoped to the
+        # unit.
+        LoadCredential =
+          lib.optional (cfg.authBearer != null) "auth_bearer:${cfg.authBearer}"
+          ++ lib.optional (cfg.adminBearer != null) "admin_bearer:${cfg.adminBearer}";
+
         # DynamicUser allocates an ephemeral UID per service invocation.
         # It implies many of the hardening flags below for free, but we
         # set them explicitly for clarity.
         DynamicUser = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
+        ProtectKernelLogs = true;
         ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
         RestrictNamespaces = true;
+        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+        RestrictSUIDSGID = true;
         LockPersonality = true;
         RestrictRealtime = true;
         NoNewPrivileges = true;
+        MemoryDenyWriteExecute = true;
+        SystemCallArchitectures = "native";
+        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
       };
     };
   };

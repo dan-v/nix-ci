@@ -126,6 +126,24 @@ impl CoordinatorClient {
         decode(resp).await
     }
 
+    /// Mark a job failed with a caller-supplied reason. Used by the
+    /// runner when it cannot honor the submission at all (e.g. the
+    /// closure walk couldn't read a .drv file) — we'd rather the
+    /// coordinator land a real terminal `Failed` row with a cause than
+    /// leave the submission to the heartbeat reaper (which shows up as
+    /// an opaque timeout).
+    pub async fn fail(&self, job_id: JobId, message: &str) -> Result<SealJobResponse> {
+        let url = format!("{}/jobs/{}/fail", self.base, job_id);
+        let resp = self
+            .post(&url)
+            .json(&crate::types::FailJobRequest {
+                message: message.to_string(),
+            })
+            .send()
+            .await?;
+        decode(resp).await
+    }
+
     /// Cancel a job. Idempotent: cancelling an already-terminal job
     /// succeeds silently. Used by tests and by external orchestrators
     /// (e.g. a CI system dropping a cancelled PR's CI job).

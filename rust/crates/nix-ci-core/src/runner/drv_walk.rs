@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::drv_parser::{self, ParsedDrv};
 use crate::types::IngestDrvRequest;
@@ -49,30 +49,19 @@ pub fn walk_filtered(
             continue;
         }
         if !parsed_cache.contains_key(&drv_path) {
-            let bytes = match std::fs::read(&drv_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        drv = %drv_path,
-                        error = %e,
-                        "cannot read .drv file; skipping"
-                    );
-                    continue;
-                }
-            };
-            match drv_parser::parse(&bytes) {
-                Ok(parsed) => {
-                    parsed_cache.insert(drv_path.clone(), parsed);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        drv = %drv_path,
-                        error = %e,
-                        "cannot parse .drv file; skipping"
-                    );
-                    continue;
-                }
-            }
+            // Fail fast on any per-drv read/parse failure. Silently
+            // continuing would leave dependent drvs referencing this
+            // path in their `input_drvs` list, and the coordinator
+            // would then wait forever on a placeholder step that is
+            // never ingested. A giant nixpkgs overlay cannot afford
+            // a silent partial-closure submission — if a single .drv
+            // can't be read, the build graph is not trustworthy and
+            // the caller needs to know so they can retry or diagnose.
+            let bytes = std::fs::read(&drv_path)
+                .with_context(|| format!("read .drv file {drv_path}"))?;
+            let parsed = drv_parser::parse(&bytes)
+                .with_context(|| format!("parse .drv file {drv_path}"))?;
+            parsed_cache.insert(drv_path.clone(), parsed);
         }
         let parsed = &parsed_cache[&drv_path];
         if parsed.is_fod() {

@@ -125,6 +125,40 @@ pub mod service {
     pub const WORKER: &str = "nix-ci-worker";
 }
 
+/// Install a panic hook that logs a structured record before the
+/// default behavior runs. Without this, a panic in a handler task or
+/// background task ends up as a bare `thread 'X' panicked at …` line
+/// on stderr, invisible to the JSON log pipeline. The default hook
+/// still runs (so the process still aborts after the panic bubbles
+/// up), but the operator sees a correlated log line first.
+///
+/// Also increments the `process_panics_total` counter the server
+/// exposes on `/metrics` so an alert can page on any panic (they
+/// should never happen in steady state; one panic per month is a
+/// bug worth investigating).
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload: &str = info
+            .payload()
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        tracing::error!(
+            panic_location = %location,
+            panic_payload = %payload,
+            "process panic"
+        );
+        metrics::panic_observed();
+        default(info);
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
