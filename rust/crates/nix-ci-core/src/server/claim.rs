@@ -112,11 +112,11 @@ pub async fn claim_any(
 
     loop {
         let now_ms = Utc::now().timestamp_millis();
-        // FIFO across submissions. `all()` snapshots the map under a
-        // brief read lock; we then sort + iterate without holding any
-        // dispatcher locks.
-        let mut subs = state.dispatcher.submissions.all();
-        subs.sort_by_key(|s| s.created_at);
+        // FIFO across submissions — dual-indexed Submissions now
+        // returns pre-sorted; no per-call O(N log N) sort, critical
+        // under 1000+ workers racing on a single `notify_waiters()`
+        // edge.
+        let subs = state.dispatcher.submissions.sorted_by_created_at();
         for sub in &subs {
             // Skip submissions already moving toward terminal — their
             // ready queues may still hold weak refs but their workers
@@ -143,8 +143,7 @@ pub async fn claim_any(
                 // One last sweep before 204 — a step may have just
                 // become runnable.
                 let now_ms = Utc::now().timestamp_millis();
-                let mut subs = state.dispatcher.submissions.all();
-                subs.sort_by_key(|s| s.created_at);
+                let subs = state.dispatcher.submissions.sorted_by_created_at();
                 for sub in &subs {
                     if sub.is_terminal() {
                         continue;

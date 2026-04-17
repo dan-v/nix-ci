@@ -345,8 +345,27 @@ fn features_subset(required: &[String], supported: &[String]) -> bool {
     required.iter().all(|r| supported.iter().any(|s| s == r))
 }
 
+/// Dual index over live submissions: a HashMap for O(1) lookup by id,
+/// and a BTreeMap keyed on `(created_at, id)` for O(N) sorted iteration
+/// without a per-call sort. The fleet claim endpoint hot-paths the
+/// sorted snapshot; a prior implementation re-sorted `all()` on every
+/// wake-up which was O(N log N) per claim attempt across thousands of
+/// workers on a single `notify_waiters()` edge.
+///
+/// Both structures mirror each other. `insert` and `remove` maintain
+/// the pair atomically under a single write lock; readers always hit
+/// a consistent view.
 pub struct Submissions {
-    inner: RwLock<HashMap<JobId, Arc<Submission>>>,
+    inner: RwLock<SubmissionsInner>,
+}
+
+struct SubmissionsInner {
+    by_id: HashMap<JobId, Arc<Submission>>,
+    /// Secondary index: `(created_at, id)` → `Arc<Submission>`. The
+    /// tuple key makes equal `created_at` values well-ordered by id,
+    /// keeping the iteration deterministic even if two submissions
+    /// land on the same `Instant` tick (possible on fast hardware).
+    by_created_at: std::collections::BTreeMap<(Instant, JobId), Arc<Submission>>,
 }
 
 impl Default for Submissions {
@@ -358,45 +377,65 @@ impl Default for Submissions {
 impl Submissions {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(SubmissionsInner {
+                by_id: HashMap::new(),
+                by_created_at: std::collections::BTreeMap::new(),
+            }),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().len()
+        self.inner.read().by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().is_empty()
+        self.inner.read().by_id.is_empty()
     }
 
     pub fn get(&self, id: JobId) -> Option<Arc<Submission>> {
-        self.inner.read().get(&id).cloned()
+        self.inner.read().by_id.get(&id).cloned()
     }
 
     pub fn get_or_insert(&self, id: JobId, event_capacity: usize) -> Arc<Submission> {
-        if let Some(existing) = self.inner.read().get(&id).cloned() {
+        if let Some(existing) = self.inner.read().by_id.get(&id).cloned() {
             return existing;
         }
         let mut guard = self.inner.write();
-        if let Some(existing) = guard.get(&id).cloned() {
+        if let Some(existing) = guard.by_id.get(&id).cloned() {
             return existing;
         }
         let sub = Submission::new(id, event_capacity);
-        guard.insert(id, sub.clone());
+        let key = (sub.created_at, id);
+        guard.by_id.insert(id, sub.clone());
+        guard.by_created_at.insert(key, sub.clone());
         sub
     }
 
     pub fn remove(&self, id: JobId) -> Option<Arc<Submission>> {
-        self.inner.write().remove(&id)
+        let mut guard = self.inner.write();
+        let removed = guard.by_id.remove(&id)?;
+        guard.by_created_at.remove(&(removed.created_at, id));
+        Some(removed)
     }
 
-    /// Snapshot every live submission. Used by the fleet `/claim`
-    /// endpoint to FIFO-sort by `created_at` and drain. Cloning the
-    /// `Arc`s is cheap; the read lock is released before the caller
-    /// touches submission state.
+    /// Snapshot every live submission in unspecified order. Callers
+    /// that need FIFO order use `sorted_by_created_at` instead.
     pub fn all(&self) -> Vec<Arc<Submission>> {
-        self.inner.read().values().cloned().collect()
+        self.inner.read().by_id.values().cloned().collect()
+    }
+
+    /// Snapshot every live submission in FIFO order (oldest first).
+    /// Used by the fleet `/claim` endpoint: walking the oldest jobs
+    /// first gives predictable fairness and naturally drains
+    /// over-saturated jobs onto the next one. O(N) Arc-clones, no
+    /// sort.
+    pub fn sorted_by_created_at(&self) -> Vec<Arc<Submission>> {
+        self.inner
+            .read()
+            .by_created_at
+            .values()
+            .cloned()
+            .collect()
     }
 }
 
@@ -429,6 +468,62 @@ mod tests {
         assert_eq!(subs.len(), 1);
         subs.remove(id);
         assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn sorted_by_created_at_returns_fifo_order() {
+        // Three submissions inserted at increasing Instant ticks. The
+        // sorted snapshot must preserve FIFO order — load-bearing for
+        // fleet claim fairness.
+        let subs = Submissions::new();
+        let id1 = JobId::new();
+        let s1 = subs.get_or_insert(id1, 8);
+        // Force a detectable gap between Instants so BTreeMap can
+        // order them; Instant::now() resolution is machine-dependent.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id2 = JobId::new();
+        let s2 = subs.get_or_insert(id2, 8);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id3 = JobId::new();
+        let s3 = subs.get_or_insert(id3, 8);
+
+        let sorted = subs.sorted_by_created_at();
+        let ids: Vec<_> = sorted.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![id1, id2, id3], "FIFO order must be preserved");
+        // Arc identity preserved end-to-end.
+        assert!(Arc::ptr_eq(&sorted[0], &s1));
+        assert!(Arc::ptr_eq(&sorted[1], &s2));
+        assert!(Arc::ptr_eq(&sorted[2], &s3));
+    }
+
+    #[test]
+    fn remove_prunes_both_indexes() {
+        // A dangling entry in the secondary BTreeMap after a remove()
+        // would return a zombie Arc to callers of sorted_by_created_at.
+        // Guard by asserting len() (read from by_id) matches the
+        // sorted snapshot length after a remove.
+        let subs = Submissions::new();
+        let ids: Vec<_> = (0..5)
+            .map(|_| {
+                let id = JobId::new();
+                let _ = subs.get_or_insert(id, 8);
+                id
+            })
+            .collect();
+        assert_eq!(subs.len(), 5);
+        assert_eq!(subs.sorted_by_created_at().len(), 5);
+        subs.remove(ids[2]);
+        assert_eq!(subs.len(), 4);
+        assert_eq!(
+            subs.sorted_by_created_at().len(),
+            4,
+            "secondary index must drop in lockstep"
+        );
+        // The removed id must not appear in the sorted snapshot.
+        assert!(subs
+            .sorted_by_created_at()
+            .iter()
+            .all(|s| s.id != ids[2]));
     }
 
     #[test]
