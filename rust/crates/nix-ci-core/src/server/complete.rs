@@ -447,7 +447,13 @@ pub(super) async fn check_and_publish_terminal(
     let any_failed = tops
         .iter()
         .any(|t| t.previous_failure.load(Ordering::Acquire));
-    let final_status = if any_failed {
+    // Per-attr eval errors (from the runner) count as a job-level
+    // failure even when every successfully-evaluated attr built
+    // cleanly. A user running N attrs expected all of them to work;
+    // a broken attr must surface as Failed so the CCI signal is red.
+    let eval_errors_snapshot = sub.eval_errors.read().clone();
+    let any_eval_error = !eval_errors_snapshot.is_empty();
+    let final_status = if any_failed || any_eval_error {
         JobStatus::Failed
     } else {
         JobStatus::Done
@@ -463,6 +469,7 @@ pub(super) async fn check_and_publish_terminal(
         counts,
         failures: failures.clone(),
         eval_error: None,
+        eval_errors: eval_errors_snapshot,
     };
     let snapshot_json = serde_json::to_value(&snapshot)
         .map_err(|e| Error::Internal(format!("serialize terminal result: {e}")))?;

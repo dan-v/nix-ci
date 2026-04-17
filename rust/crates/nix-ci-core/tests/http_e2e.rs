@@ -417,7 +417,8 @@ async fn batch_ingest_full_dag_sequences_builds(pool: PgPool) {
             ingest(&mid, "mid", &[&leaf], false),
             ingest(&root, "root", &[&mid], true),
         ],
-    };
+    eval_errors: Vec::new(),
+        };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.new_drvs, 3);
     assert_eq!(resp.dedup_skipped, 0);
@@ -489,14 +490,16 @@ async fn batch_ingest_cross_job_transitive_dedup(pool: PgPool) {
             ingest(&shared_leaf, "shared-stdenv", &[], false),
             ingest(&leaf_a, "a-specific", &[&shared_leaf], true),
         ],
-    };
+    eval_errors: Vec::new(),
+        };
     client.ingest_batch(job_a.id, &batch_a).await.unwrap();
     let batch_b = IngestBatchRequest {
         drvs: vec![
             ingest(&shared_leaf, "shared-stdenv", &[], false),
             ingest(&leaf_b, "b-specific", &[&shared_leaf], true),
         ],
-    };
+    eval_errors: Vec::new(),
+        };
     let resp_b = client.ingest_batch(job_b.id, &batch_b).await.unwrap();
     // B submitted 2 drvs; shared-stdenv should dedup.
     assert_eq!(resp_b.new_drvs, 1);

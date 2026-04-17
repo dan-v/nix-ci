@@ -117,7 +117,8 @@ async fn ingest_batch_partial_validation_counts_errors(pool: PgPool) {
     };
     let batch = IngestBatchRequest {
         drvs: vec![ingest(&good, "pkg", &[], true), bad_empty, bad_nohyphen],
-    };
+    eval_errors: Vec::new(),
+        };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.new_drvs, 1);
     assert_eq!(resp.errored, 2);
@@ -749,7 +750,8 @@ async fn overlong_drv_path_rejected(pool: PgPool) {
     let huge = format!("/nix/store/abcd-{}.drv", "x".repeat(5000));
     let batch = IngestBatchRequest {
         drvs: vec![ingest(&huge, "huge", &[], true)],
-    };
+    eval_errors: Vec::new(),
+        };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.errored, 1);
     assert_eq!(resp.new_drvs, 0);
@@ -770,7 +772,7 @@ async fn overlong_drv_name_rejected(pool: PgPool) {
     let p = drv_path("hhn", "ok");
     let mut req = ingest(&p, "ok", &[], true);
     req.drv_name = name;
-    let batch = IngestBatchRequest { drvs: vec![req] };
+    let batch = IngestBatchRequest { drvs: vec![req], eval_errors: Vec::new() };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.errored, 1);
     assert_eq!(resp.new_drvs, 0);
@@ -1244,7 +1246,7 @@ async fn ingest_length_boundaries_accept_at_max_reject_above(pool: PgPool) {
         attr: None,
     };
     let resp = client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: vec![at_cap] })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: vec![at_cap], eval_errors: Vec::new() })
         .await
         .unwrap();
     assert_eq!(resp.errored, 0, "drv at exactly cap must be accepted");
@@ -1265,7 +1267,8 @@ async fn ingest_length_boundaries_accept_at_max_reject_above(pool: PgPool) {
             job.id,
             &IngestBatchRequest {
                 drvs: vec![over_cap],
-            },
+            eval_errors: Vec::new(),
+        },
         )
         .await
         .unwrap();
@@ -1295,7 +1298,8 @@ async fn ingest_batch_counts_wire_dep_errors(pool: PgPool) {
             job.id,
             &IngestBatchRequest {
                 drvs: vec![good_parent],
-            },
+            eval_errors: Vec::new(),
+        },
         )
         .await
         .unwrap();
@@ -1429,7 +1433,7 @@ async fn ingest_batch_rejects_empty_drv_name(pool: PgPool) {
         .unwrap();
     let mut bad = ingest(&drv_path("ok", "ignored"), "ignored", &[], true);
     bad.drv_name = "".into();
-    let batch = IngestBatchRequest { drvs: vec![bad] };
+    let batch = IngestBatchRequest { drvs: vec![bad], eval_errors: Vec::new() };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.errored, 1);
     assert_eq!(resp.new_drvs, 0);
@@ -1448,7 +1452,7 @@ async fn ingest_batch_rejects_empty_system(pool: PgPool) {
         .unwrap();
     let mut bad = ingest(&drv_path("ok", "ignored"), "ignored", &[], true);
     bad.system = "".into();
-    let batch = IngestBatchRequest { drvs: vec![bad] };
+    let batch = IngestBatchRequest { drvs: vec![bad], eval_errors: Vec::new() };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.errored, 1);
     assert_eq!(resp.new_drvs, 0);
@@ -1747,7 +1751,7 @@ async fn reaper_rearms_many_concurrent_expired_claims(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();
@@ -2643,7 +2647,7 @@ async fn propagated_failures_count_matches_rdep_closure(pool: PgPool) {
         ingest(&root, "root", &[&mid], true),
     ];
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();
@@ -2739,7 +2743,7 @@ async fn admin_snapshot_counts_scale_linearly_with_members(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();
@@ -2866,7 +2870,8 @@ async fn fleet_claim_respects_max_workers(pool: PgPool) {
                     ingest(&d1, "first", &[], true),
                     ingest(&d2, "second", &[], true),
                 ],
-            },
+            eval_errors: Vec::new(),
+        },
         )
         .await
         .unwrap();
@@ -2924,7 +2929,8 @@ async fn seal_rejects_dep_cycle(pool: PgPool) {
     // the same batch to wire the back-edge.
     let batch = IngestBatchRequest {
         drvs: vec![ingest(&a, "a", &[&b], true), ingest(&b, "b", &[&a], false)],
-    };
+    eval_errors: Vec::new(),
+        };
     client.ingest_batch(job.id, &batch).await.unwrap();
 
     // Seal must fail the job immediately (without stalling) with
@@ -2969,7 +2975,8 @@ async fn ingest_strips_self_loop(pool: PgPool) {
             job.id,
             &IngestBatchRequest {
                 drvs: vec![ingest(&a, "a", &[&a], true)],
-            },
+            eval_errors: Vec::new(),
+        },
         )
         .await
         .unwrap();
@@ -3009,7 +3016,8 @@ async fn seal_accepts_clean_dag(pool: PgPool) {
             ingest(&b, "b", &[&c], false),
             ingest(&c, "c", &[], false),
         ],
-    };
+    eval_errors: Vec::new(),
+        };
     client.ingest_batch(job.id, &batch).await.unwrap();
     // Seal must NOT force-fail; progress semantics take over from here.
     let seal_resp = client.seal(job.id).await.unwrap();
@@ -3055,7 +3063,7 @@ async fn ingest_drv_cap_auto_fails_job(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: batch1 })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: batch1, eval_errors: Vec::new() })
         .await
         .unwrap();
 
@@ -3071,7 +3079,7 @@ async fn ingest_drv_cap_auto_fails_job(pool: PgPool) {
         })
         .collect();
     let err = client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: batch2 })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: batch2, eval_errors: Vec::new() })
         .await
         .unwrap_err();
     match err {
@@ -3111,7 +3119,7 @@ async fn ingest_drv_cap_auto_fails_job(pool: PgPool) {
         })
         .collect();
     match client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: retry })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: retry, eval_errors: Vec::new() })
         .await
         .unwrap_err()
     {
@@ -3150,7 +3158,7 @@ async fn ingest_drv_cap_disabled_allows_large_batch(pool: PgPool) {
         })
         .collect();
     let resp = client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: big })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: big, eval_errors: Vec::new() })
         .await
         .unwrap();
     assert_eq!(resp.new_drvs, 50);
@@ -3440,7 +3448,8 @@ async fn ingest_rejects_oversized_attr(pool: PgPool) {
             job.id,
             &IngestBatchRequest {
                 drvs: vec![good, bad],
-            },
+            eval_errors: Vec::new(),
+        },
         )
         .await
         .unwrap();

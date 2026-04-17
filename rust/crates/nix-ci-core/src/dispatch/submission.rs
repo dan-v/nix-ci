@@ -10,9 +10,16 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::broadcast;
 
-use crate::types::{DrvFailure, DrvHash, JobEvent, JobId};
+use crate::types::{DrvFailure, DrvHash, EvalError, JobEvent, JobId};
 
 use super::step::Step;
+
+/// Upper bound on per-job eval errors surfaced to callers. Eval errors
+/// are inherently user-triggered (broken expressions in an overlay);
+/// a pathological tree could produce tens of thousands. Cap at a size
+/// that still lets ops see the dominant failure modes without bloating
+/// the terminal JSONB snapshot.
+pub const EVAL_ERRORS_CAP: usize = 500;
 
 pub struct Submission {
     pub id: JobId,
@@ -58,6 +65,13 @@ pub struct Submission {
     /// complete handler on terminal failure (originating + propagated).
     /// Replaces the previous durable `derivations.error_*` columns.
     pub failures: RwLock<Vec<DrvFailure>>,
+    /// Per-attribute eval errors reported by the runner's submitter
+    /// (nix-eval-jobs emitted `{"attr":..., "error":...}` lines).
+    /// Surfaced in `JobStatusResponse.eval_errors` so the caller sees
+    /// broken attrs even when every successfully-evaluated attr built
+    /// cleanly. Capped at `EVAL_ERRORS_CAP` to keep the terminal JSONB
+    /// snapshot bounded.
+    pub eval_errors: RwLock<Vec<EvalError>>,
     pub events: broadcast::Sender<JobEvent>,
     /// Cumulative count of drvs marked propagated_failure in this
     /// submission. Surfaced in `Progress` events for the runner UI.
@@ -108,6 +122,7 @@ impl Submission {
             ready: RwLock::new(HashMap::new()),
             members: RwLock::new(HashMap::new()),
             failures: RwLock::new(Vec::new()),
+            eval_errors: RwLock::new(Vec::new()),
             events: tx,
             propagated_failed: AtomicU32::new(0),
             transient_retries: AtomicU32::new(0),
@@ -157,6 +172,32 @@ impl Submission {
             return;
         }
         guard.push(failure);
+    }
+
+    /// Record eval errors reported by the submitter. Caps total stored
+    /// at `EVAL_ERRORS_CAP`; further errors are dropped with a single
+    /// synthetic `<truncated>` entry so the caller knows more exist.
+    /// Dedup on `attr` — repeat reports for the same attr collapse.
+    pub fn append_eval_errors(&self, errors: impl IntoIterator<Item = EvalError>) -> u32 {
+        let mut guard = self.eval_errors.write();
+        let mut added: u32 = 0;
+        for e in errors {
+            if guard.iter().any(|existing| existing.attr == e.attr) {
+                continue;
+            }
+            if guard.len() >= EVAL_ERRORS_CAP {
+                if !guard.last().is_some_and(|last| last.attr == "<truncated>") {
+                    guard.push(EvalError {
+                        attr: "<truncated>".into(),
+                        error: format!("cap of {EVAL_ERRORS_CAP} eval errors reached"),
+                    });
+                }
+                break;
+            }
+            guard.push(e);
+            added += 1;
+        }
+        added
     }
 
     /// Add a step to this submission's membership (strong ref).

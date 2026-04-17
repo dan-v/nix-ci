@@ -300,6 +300,7 @@ async fn drv_failed_event_carries_used_by_attrs(pool: PgPool) {
                         r
                     },
                 ],
+                eval_errors: Vec::new(),
             },
         )
         .await
@@ -482,7 +483,7 @@ async fn regression_fleet_worker_still_drains_jobs(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();

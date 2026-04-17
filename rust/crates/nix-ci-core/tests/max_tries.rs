@@ -62,6 +62,7 @@ async fn exhausted_step_terminal_fails_on_next_claim(pool: PgPool) {
                     is_root: true,
                     attr: None,
                 }],
+                eval_errors: Vec::new(),
             },
         )
         .await
@@ -186,6 +187,7 @@ async fn exhausted_step_terminal_fails_on_fleet_claim(pool: PgPool) {
                     is_root: true,
                     attr: None,
                 }],
+                eval_errors: Vec::new(),
             },
         )
         .await
@@ -241,6 +243,7 @@ async fn fresh_step_with_zero_tries_still_claimable(pool: PgPool) {
                     is_root: true,
                     attr: None,
                 }],
+                eval_errors: Vec::new(),
             },
         )
         .await

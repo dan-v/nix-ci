@@ -515,7 +515,8 @@ async fn drvs_per_job_histogram_records_at_terminal(pool: PgPool) {
             ingest(&drv_path("s2", "b"), "b", &[], true),
             ingest(&drv_path("s3", "c"), "c", &[], true),
         ],
-    };
+    eval_errors: Vec::new(),
+        };
     client.ingest_batch(job.id, &batch).await.unwrap();
     client.cancel(job.id).await.unwrap();
 
@@ -566,6 +567,7 @@ async fn submission_warn_fires_once_when_threshold_crossed(pool: PgPool) {
         drvs: (0..3)
             .map(|i| ingest(&drv_path(&format!("w{i}"), "x"), "x", &[], true))
             .collect(),
+        eval_errors: Vec::new(),
     };
     client.ingest_batch(job.id, &b1).await.unwrap();
     // Second batch of 3 — pushes total to 6 (crosses 5).
@@ -573,6 +575,7 @@ async fn submission_warn_fires_once_when_threshold_crossed(pool: PgPool) {
         drvs: (3..6)
             .map(|i| ingest(&drv_path(&format!("w{i}"), "x"), "x", &[], true))
             .collect(),
+        eval_errors: Vec::new(),
     };
     client.ingest_batch(job.id, &b2).await.unwrap();
     // Third batch of 3 — already warned; counter must NOT bump again.
@@ -580,6 +583,7 @@ async fn submission_warn_fires_once_when_threshold_crossed(pool: PgPool) {
         drvs: (6..9)
             .map(|i| ingest(&drv_path(&format!("w{i}"), "x"), "x", &[], true))
             .collect(),
+        eval_errors: Vec::new(),
     };
     client.ingest_batch(job.id, &b3).await.unwrap();
 

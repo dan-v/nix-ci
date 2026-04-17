@@ -100,6 +100,7 @@ impl CoordinatorClient {
             .ok_or_else(|| Error::BadRequest(format!("bad drv_path: {}", req.drv_path)))?;
         let batch = IngestBatchRequest {
             drvs: vec![req.clone()],
+            eval_errors: Vec::new(),
         };
         let resp = self.ingest_batch(job_id, &batch).await?;
         Ok(IngestDrvResponse {

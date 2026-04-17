@@ -40,7 +40,7 @@ pub async fn submit_batch(
         .inner
         .ingest_batch_drvs
         .observe(req.drvs.len() as f64);
-    if req.drvs.is_empty() {
+    if req.drvs.is_empty() && req.eval_errors.is_empty() {
         return Ok(Json(IngestBatchResponse {
             new_drvs: 0,
             dedup_skipped: 0,
@@ -52,6 +52,14 @@ pub async fn submit_batch(
         .dispatcher
         .submissions
         .get_or_insert(id, state.cfg.submission_event_capacity);
+
+    // Eval errors are independent of drv batching: record them before
+    // any drv-related work so a batch carrying only eval errors (no
+    // drvs — possible when nix-eval-jobs's remaining input is all
+    // broken attrs) still delivers them.
+    if !req.eval_errors.is_empty() {
+        sub.append_eval_errors(req.eval_errors.iter().cloned());
+    }
 
     // Secondary seal-check against the in-memory flag. `reject_if_terminal`
     // reads the DB; a seal call that already flipped the in-memory flag
@@ -242,6 +250,12 @@ pub async fn submit_batch(
 /// outside the submission's normal path (no worker ever claimed a drv
 /// on this job) so we build the snapshot from scratch.
 async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Result<()> {
+    let eval_errors = state
+        .dispatcher
+        .submissions
+        .get(id)
+        .map(|sub| sub.eval_errors.read().clone())
+        .unwrap_or_default();
     let snapshot = JobStatusResponse {
         id,
         status: JobStatus::Failed,
@@ -249,6 +263,7 @@ async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Resul
         counts: crate::types::JobCounts::default(),
         failures: Vec::new(),
         eval_error: Some(reason.to_string()),
+        eval_errors,
     };
     let snapshot_json = serde_json::to_value(&snapshot)
         .map_err(|e| crate::Error::Internal(format!("serialize oversized snapshot: {e}")))?;

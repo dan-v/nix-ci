@@ -53,6 +53,7 @@ async fn extend_keeps_claim_alive_past_original_deadline(pool: PgPool) {
                     is_root: true,
                     attr: None,
                 }],
+                eval_errors: Vec::new(),
             },
         )
         .await
@@ -155,6 +156,7 @@ async fn without_extend_reaper_evicts_long_running_claim(pool: PgPool) {
                     is_root: true,
                     attr: None,
                 }],
+                eval_errors: Vec::new(),
             },
         )
         .await
@@ -256,6 +258,7 @@ async fn extend_after_complete_returns_gone(pool: PgPool) {
                     is_root: true,
                     attr: None,
                 }],
+                eval_errors: Vec::new(),
             },
         )
         .await
@@ -322,6 +325,7 @@ async fn extend_counter_increments_per_success(pool: PgPool) {
                     is_root: true,
                     attr: None,
                 }],
+                eval_errors: Vec::new(),
             },
         )
         .await

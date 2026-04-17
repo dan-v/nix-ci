@@ -236,9 +236,28 @@ pub struct IngestDrvResponse {
     pub dedup_skipped: bool,
 }
 
+/// One broken attribute reported by the runner. nix-eval-jobs emits
+/// `{"attr": "x", "error": "..."}` for attrs that fail to evaluate;
+/// the submitter forwards these to the coordinator so they surface in
+/// the terminal `JobStatusResponse.eval_errors` rather than being
+/// visible only in the runner's stderr. Distinct from the singular
+/// `eval_error: Option<String>` field which carries coordinator-
+/// originated causes (cycle detection, per-job drv cap exceeded).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvalError {
+    pub attr: String,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestBatchRequest {
     pub drvs: Vec<IngestDrvRequest>,
+    /// Per-attribute eval errors from nix-eval-jobs. Optional;
+    /// submitters that don't forward them (or older clients) leave
+    /// this empty. Recorded on the submission; surfaced in the
+    /// terminal `eval_errors` field.
+    #[serde(default)]
+    pub eval_errors: Vec<EvalError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,7 +383,16 @@ pub struct JobStatusResponse {
     pub sealed: bool,
     pub counts: JobCounts,
     pub failures: Vec<DrvFailure>,
+    /// Coordinator-originated evaluation failure (e.g. `eval_too_large`
+    /// ingest cap violation, cycle-at-seal detection). Mutually
+    /// exclusive with successful eval: at most one is set.
     pub eval_error: Option<String>,
+    /// Per-attribute eval errors reported by the runner's submitter.
+    /// Bounded by `EVAL_ERRORS_CAP` on the coordinator with a synthetic
+    /// `<truncated>` marker appended if exceeded. Default-empty for
+    /// backward compatibility with older clients / test fixtures.
+    #[serde(default)]
+    pub eval_errors: Vec<EvalError>,
 }
 
 /// One in-flight build, included in `Progress` events so clients can

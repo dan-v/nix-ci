@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::runner::drv_parser::ParsedDrv;
 use crate::runner::drv_walk;
 use crate::runner::eval_jobs::EvalLine;
-use crate::types::{IngestBatchRequest, JobId};
+use crate::types::{EvalError, IngestBatchRequest, JobId};
 
 pub struct SubmitStats {
     pub new_drvs: u64,
@@ -62,6 +62,11 @@ pub async fn run(
     // Dedup what we've already ingested so overlapping closures don't
     // re-POST to the coordinator.
     let mut submitted: HashSet<String> = HashSet::new();
+    // Buffered eval errors: piggyback on the next ingest_batch call so
+    // the coordinator records them alongside regular drv traffic. On
+    // end-of-eval with leftover buffer (no more drvs coming), flush
+    // via a final drv-less batch.
+    let mut eval_error_buf: Vec<EvalError> = Vec::new();
 
     loop {
         let line = tokio::select! {
@@ -88,6 +93,10 @@ pub async fn run(
                 .or(line.name.as_deref())
                 .unwrap_or("<unknown>");
             tracing::warn!(%attr, eval_error = %err, "nix-eval-jobs: attr failed; continuing");
+            eval_error_buf.push(EvalError {
+                attr: attr.to_string(),
+                error: err.clone(),
+            });
             continue;
         }
         let Some(root_drv) = line.drv_path.clone() else {
@@ -135,8 +144,12 @@ pub async fn run(
         }
 
         let count = drvs.len();
+        let eval_errors = std::mem::take(&mut eval_error_buf);
         match client
-            .ingest_batch(job_id, &IngestBatchRequest { drvs })
+            .ingest_batch(
+                job_id,
+                &IngestBatchRequest { drvs, eval_errors },
+            )
             .await
         {
             Ok(resp) => {
@@ -155,6 +168,27 @@ pub async fn run(
                 tracing::warn!(error = %e, root = %root_drv, drvs = count, "batch ingest failed");
                 stats.errors += count as u64;
             }
+        }
+    }
+    // End-of-stream: if eval emitted errors in its final stretch after
+    // the last drv-bearing line (or emitted nothing but errors), those
+    // are still sitting in the buffer. Flush with a drv-less ingest
+    // batch so the coordinator records them on the submission before
+    // seal.
+    if !eval_error_buf.is_empty() {
+        let errs = std::mem::take(&mut eval_error_buf);
+        if let Err(e) = client
+            .ingest_batch(
+                job_id,
+                &IngestBatchRequest {
+                    drvs: Vec::new(),
+                    eval_errors: errs,
+                },
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "eval-errors flush failed");
+            stats.errors += 1;
         }
     }
     Ok(stats)

@@ -193,7 +193,7 @@ async fn fleet_worker_drains_multiple_jobs_concurrently(pool: PgPool) {
             })
             .collect();
         client
-            .ingest_batch(job.id, &IngestBatchRequest { drvs })
+            .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
             .await
             .unwrap();
         client.seal(job.id).await.unwrap();
@@ -338,7 +338,7 @@ async fn many_fleet_workers_one_job_exactly_once_each(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs })
+        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();

@@ -119,6 +119,12 @@ pub async fn seal(
 /// with `eval_error` set, removes the submission, and publishes
 /// `JobDone` so any subscribers (SSE, long-poll claims) wake up.
 async fn auto_fail_on_seal(state: &AppState, id: JobId, reason: &str) -> Result<()> {
+    let eval_errors = state
+        .dispatcher
+        .submissions
+        .get(id)
+        .map(|sub| sub.eval_errors.read().clone())
+        .unwrap_or_default();
     let snapshot = JobStatusResponse {
         id,
         status: JobStatus::Failed,
@@ -126,6 +132,7 @@ async fn auto_fail_on_seal(state: &AppState, id: JobId, reason: &str) -> Result<
         counts: JobCounts::default(),
         failures: Vec::new(),
         eval_error: Some(reason.to_string()),
+        eval_errors,
     };
     let snapshot_json = serde_json::to_value(&snapshot)
         .map_err(|e| Error::Internal(format!("serialize seal-fail snapshot: {e}")))?;
@@ -191,7 +198,7 @@ fn build_terminal_snapshot(
     status: JobStatus,
     eval_error: Option<String>,
 ) -> JobStatusResponse {
-    let (counts, failures, sealed) = match state.dispatcher.submissions.get(id) {
+    let (counts, failures, sealed, eval_errors) = match state.dispatcher.submissions.get(id) {
         Some(sub) => (
             sub.live_counts(),
             crate::server::complete::cap_failures(
@@ -199,8 +206,9 @@ fn build_terminal_snapshot(
                 state.cfg.max_failures_in_result,
             ),
             sub.is_sealed(),
+            sub.eval_errors.read().clone(),
         ),
-        None => (JobCounts::default(), Vec::new(), false),
+        None => (JobCounts::default(), Vec::new(), false, Vec::new()),
     };
     JobStatusResponse {
         id,
@@ -209,6 +217,7 @@ fn build_terminal_snapshot(
         counts,
         failures,
         eval_error,
+        eval_errors,
     }
 }
 
@@ -281,6 +290,7 @@ fn response_from_live(sub: &Arc<Submission>) -> JobStatusResponse {
         counts: sub.live_counts(),
         failures: sub.failures.read().clone(),
         eval_error: None,
+        eval_errors: sub.eval_errors.read().clone(),
     }
 }
 

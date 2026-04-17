@@ -306,7 +306,7 @@ async fn chaos_single_iter(pool: PgPool) {
                 .unwrap();
             let drvs = random_dag(&mut rng, i);
             client
-                .ingest_batch(j.id, &IngestBatchRequest { drvs })
+                .ingest_batch(j.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
                 .await
                 .unwrap();
             client.seal(j.id).await.unwrap();
