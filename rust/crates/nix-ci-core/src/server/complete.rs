@@ -269,6 +269,27 @@ async fn handle_flaky_retry(
     Ok(())
 }
 
+/// Bench-only wrapper for [`compute_used_by_attrs`]. Not part of the
+/// public API; exposed so `benches/dispatcher.rs` can measure the BFS
+/// without going through the HTTP layer.
+#[doc(hidden)]
+pub fn compute_used_by_attrs_for_bench(
+    sub: &Arc<Submission>,
+    s: &Arc<crate::dispatch::Step>,
+) -> Vec<String> {
+    compute_used_by_attrs(sub, s)
+}
+
+/// Bench-only wrapper for [`propagate_failure_inmem`]. See
+/// [`compute_used_by_attrs_for_bench`].
+#[doc(hidden)]
+pub fn propagate_failure_inmem_for_bench(
+    root: &Arc<crate::dispatch::Step>,
+    origin: &DrvHash,
+) -> u64 {
+    propagate_failure_inmem(root, origin)
+}
+
 pub(super) fn collect_submissions(step: &Arc<crate::dispatch::Step>) -> Vec<Arc<Submission>> {
     let st = step.state.read();
     st.submissions.iter().filter_map(|w| w.upgrade()).collect()
@@ -443,7 +464,7 @@ pub(super) async fn check_and_publish_terminal(
     if sub.terminal.load(Ordering::Acquire) {
         return Ok(());
     }
-    let tops = sub.toplevels.read().clone();
+    let tops = sub.toplevels.read().snapshot();
     let all_finished = tops.iter().all(|t| t.finished.load(Ordering::Acquire));
     if !all_finished {
         return Ok(());

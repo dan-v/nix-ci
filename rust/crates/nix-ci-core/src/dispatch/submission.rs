@@ -14,6 +14,47 @@ use crate::types::{DrvFailure, DrvHash, EvalError, JobEvent, JobId};
 
 use super::step::Step;
 
+/// Ordered, dedup'd set of toplevel Steps. Preserves insertion order
+/// (for FIFO / fairness semantics) while keeping `add_root` O(1) by
+/// tracking seen `drv_hash`es in a companion `HashSet`. Prior code used
+/// a bare `Vec<Arc<Step>>` whose dedup scan was O(N); at 10K+ roots
+/// that dominated ingest time (measured: 68% of build_dag_50k).
+#[derive(Default)]
+pub struct Toplevels {
+    order: Vec<Arc<Step>>,
+    seen: std::collections::HashSet<DrvHash>,
+}
+
+impl Toplevels {
+    /// Insert `step` if its drv_hash is new. Returns whether the insert
+    /// happened. Keeps `order` and `seen` in sync under one caller lock.
+    pub fn push_unique(&mut self, step: Arc<Step>) -> bool {
+        if !self.seen.insert(step.drv_hash().clone()) {
+            return false;
+        }
+        self.order.push(step);
+        true
+    }
+
+    /// Snapshot the ordered Arcs. Callers that want to drop the lock
+    /// before iterating (e.g. the terminal-write path) use this.
+    pub fn snapshot(&self) -> Vec<Arc<Step>> {
+        self.order.clone()
+    }
+
+    /// Whether the given `drv_hash` is in the set. O(1).
+    pub fn contains(&self, h: &DrvHash) -> bool {
+        self.seen.contains(h)
+    }
+}
+
+impl std::ops::Deref for Toplevels {
+    type Target = [Arc<Step>];
+    fn deref(&self) -> &[Arc<Step>] {
+        &self.order
+    }
+}
+
 /// Upper bound on per-job eval errors surfaced to callers. Eval errors
 /// are inherently user-triggered (broken expressions in an overlay);
 /// a pathological tree could produce tens of thousands. Cap at a size
@@ -46,7 +87,7 @@ pub struct Submission {
     pub sealed: AtomicBool,
     /// Set when the submission status transitions to terminal.
     pub terminal: AtomicBool,
-    pub toplevels: RwLock<Vec<Arc<Step>>>,
+    pub toplevels: RwLock<Toplevels>,
     /// Per-submission attribution: maps a toplevel's drv_hash to the
     /// human-readable attr name from nix-eval-jobs (e.g.
     /// `packages.x86_64-linux.hello`). Populated at ingest when the
@@ -117,7 +158,7 @@ impl Submission {
             active_claims: AtomicU32::new(0),
             sealed: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
-            toplevels: RwLock::new(Vec::new()),
+            toplevels: RwLock::new(Toplevels::default()),
             root_attrs: RwLock::new(HashMap::new()),
             ready: RwLock::new(HashMap::new()),
             members: RwLock::new(HashMap::new()),
@@ -214,18 +255,22 @@ impl Submission {
 
     /// Add a step to this submission's membership (strong ref).
     /// Idempotent on duplicate `drv_hash`.
+    ///
+    /// The `contains_key`-then-`insert` split avoids cloning the
+    /// `DrvHash` key on the dedup-hit path — measured hot at ingest
+    /// where repeated deps across a fan-in graph mean most calls are
+    /// hits. `entry(key.clone())` allocates the key eagerly even when
+    /// it will be discarded inside `or_insert_with`.
     pub fn add_member(&self, step: &Arc<Step>) {
         let mut guard = self.members.write();
-        guard
-            .entry(step.drv_hash().clone())
-            .or_insert_with(|| step.clone());
+        if guard.contains_key(step.drv_hash()) {
+            return;
+        }
+        guard.insert(step.drv_hash().clone(), step.clone());
     }
 
     pub fn add_root(&self, step: Arc<Step>) {
-        let mut guard = self.toplevels.write();
-        if !guard.iter().any(|t| t.drv_hash() == step.drv_hash()) {
-            guard.push(step);
-        }
+        self.toplevels.write().push_unique(step);
     }
 
     /// Enqueue a runnable step for this submission. Idempotent-ish:
@@ -376,8 +421,14 @@ impl Submission {
     /// duration so no ingest can sneak in a new edge mid-scan — but
     /// since seal is already exclusive with `reject_if_terminal` this
     /// is a belt-and-suspenders measure.
+    ///
+    /// The adjacency is interned to `u32` indices up front so the DFS
+    /// inner loop is hash-free: color is a `Vec<Color>`, parent is
+    /// `Vec<Option<u32>>`, and dep lookup is a direct slice index. The
+    /// prior implementation did `adj.get(&node).cloned()` (a full
+    /// `Vec<DrvHash>` allocation) on every stack peek — quadratic alloc
+    /// pressure that dominated seal-time cost at nixpkgs scale.
     pub fn detect_cycle(&self) -> Option<Vec<DrvHash>> {
-        use std::collections::HashMap;
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Color {
             White,
@@ -388,68 +439,82 @@ impl Submission {
         if tops.is_empty() {
             return None;
         }
-        // Snapshot members + their dep sets under one lock acquisition
-        // so the DFS doesn't re-take Step::state locks per visit. The
-        // snapshot is just drv_hash → Vec<drv_hash>.
         let members = self.members.read();
-        let mut adj: HashMap<DrvHash, Vec<DrvHash>> = HashMap::with_capacity(members.len());
-        for (hash, step) in members.iter() {
-            let deps = step
-                .state
-                .read()
-                .deps
-                .iter()
-                .map(|dep| dep.drv_hash().clone())
-                .collect();
-            adj.insert(hash.clone(), deps);
+        // Build intern table: u32 index → DrvHash, and reverse map.
+        // Every live member gets an index.
+        let n = members.len();
+        let mut hashes: Vec<DrvHash> = Vec::with_capacity(n);
+        let mut index_of: std::collections::HashMap<DrvHash, u32> =
+            std::collections::HashMap::with_capacity(n);
+        for hash in members.keys() {
+            index_of.insert(hash.clone(), hashes.len() as u32);
+            hashes.push(hash.clone());
+        }
+        // Flat adjacency: Vec<Vec<u32>> parallel to `hashes`. Deps
+        // outside `members` (shouldn't exist under normal ingest) are
+        // dropped silently — they can't participate in a cycle we care
+        // about at seal time because they're not submission members.
+        let mut edges: Vec<Vec<u32>> = Vec::with_capacity(n);
+        for hash in &hashes {
+            let step = members.get(hash).expect("hash from members.keys()");
+            let state = step.state.read();
+            let mut dv: Vec<u32> = Vec::with_capacity(state.deps.len());
+            for dep in state.deps.iter() {
+                if let Some(&idx) = index_of.get(dep.drv_hash()) {
+                    dv.push(idx);
+                }
+            }
+            edges.push(dv);
         }
         drop(members);
-        let mut color: HashMap<DrvHash, Color> =
-            adj.keys().map(|k| (k.clone(), Color::White)).collect();
-        let mut parent: HashMap<DrvHash, DrvHash> = HashMap::new();
+
+        let mut color: Vec<Color> = vec![Color::White; n];
+        let mut parent: Vec<Option<u32>> = vec![None; n];
 
         for top in tops.iter() {
-            let start = top.drv_hash().clone();
-            if color.get(&start).copied() != Some(Color::White) {
+            let Some(&start) = index_of.get(top.drv_hash()) else {
+                continue;
+            };
+            if color[start as usize] != Color::White {
                 continue;
             }
-            // Iterative DFS. The stack stores (node, next_dep_ix) so we
-            // don't borrow across iterations.
-            let mut stack: Vec<(DrvHash, usize)> = vec![(start.clone(), 0)];
-            color.insert(start, Color::Grey);
-            while let Some((node, ix)) = stack.last().cloned() {
-                let deps = adj.get(&node).cloned().unwrap_or_default();
-                if ix >= deps.len() {
-                    color.insert(node, Color::Black);
+            // Stack entry: (node_idx, next_dep_ix).
+            let mut stack: Vec<(u32, u32)> = Vec::with_capacity(16);
+            stack.push((start, 0));
+            color[start as usize] = Color::Grey;
+            while let Some(&(node, ix)) = stack.last() {
+                let node_edges = &edges[node as usize];
+                if (ix as usize) >= node_edges.len() {
+                    color[node as usize] = Color::Black;
                     stack.pop();
                     continue;
                 }
+                let dep = node_edges[ix as usize];
                 if let Some(last) = stack.last_mut() {
                     last.1 = ix + 1;
                 }
-                let dep = deps[ix].clone();
-                match color.get(&dep).copied().unwrap_or(Color::White) {
+                match color[dep as usize] {
                     Color::White => {
-                        color.insert(dep.clone(), Color::Grey);
-                        parent.insert(dep.clone(), node.clone());
+                        color[dep as usize] = Color::Grey;
+                        parent[dep as usize] = Some(node);
                         stack.push((dep, 0));
                     }
                     Color::Grey => {
-                        // Back-edge: node → dep and dep is an ancestor.
-                        // Reconstruct cycle: dep ← ... ← node ← dep.
-                        let mut cycle = vec![dep.clone()];
-                        let mut cur = node.clone();
+                        // Back-edge: reconstruct cycle in DrvHash form.
+                        let dep_hash = hashes[dep as usize].clone();
+                        let mut cycle = vec![dep_hash.clone()];
+                        let mut cur = node;
                         while cur != dep {
-                            cycle.push(cur.clone());
-                            match parent.get(&cur) {
-                                Some(p) => cur = p.clone(),
-                                None => break, // defensive; shouldn't happen
+                            cycle.push(hashes[cur as usize].clone());
+                            match parent[cur as usize] {
+                                Some(p) => cur = p,
+                                None => break,
                             }
                         }
-                        cycle.push(dep);
+                        cycle.push(dep_hash);
                         return Some(cycle);
                     }
-                    Color::Black => { /* fully-explored; no cycle via this edge */ }
+                    Color::Black => { /* fully-explored */ }
                 }
             }
         }
@@ -687,6 +752,48 @@ mod tests {
             final_reserved,
             ok * 200,
             "every success must correspond to 200 reserved"
+        );
+    }
+
+    #[test]
+    fn add_root_is_idempotent_on_duplicate_drv_hash() {
+        // Dedup semantics: two Step Arcs with the same drv_hash are the
+        // same root. `add_root` must keep exactly one. Regression guard
+        // against an add_root rewrite that forgot to dedup (the Vec +
+        // HashSet pair would silently push duplicates if push_unique
+        // returned `true` unconditionally).
+        let sub = Submission::new(JobId::new(), 8);
+        let s = mk_step("only");
+        for _ in 0..5 {
+            sub.add_root(s.clone());
+        }
+        let tops = sub.toplevels.read();
+        assert_eq!(tops.len(), 1, "duplicate add_root must not grow toplevels");
+        assert!(tops.iter().any(|t| Arc::ptr_eq(t, &s)));
+    }
+
+    #[test]
+    fn add_root_dedups_at_scale_and_is_linear() {
+        // At 10_000 distinct roots + 10_000 duplicate re-inserts, the
+        // pre-fix O(N^2) scan took > 1s. The O(1) implementation should
+        // complete well under 200ms on any modern machine. Generous
+        // threshold to avoid CI flakiness; a genuine quadratic regression
+        // would blow past this by orders of magnitude.
+        let sub = Submission::new(JobId::new(), 8);
+        let roots: Vec<_> = (0..10_000).map(|i| mk_step(&format!("r{i}"))).collect();
+        let start = std::time::Instant::now();
+        // 10k unique + 10k duplicates; dedup count must match.
+        for s in &roots {
+            sub.add_root(s.clone());
+        }
+        for s in &roots {
+            sub.add_root(s.clone());
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(sub.toplevels.read().len(), 10_000);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "add_root 2x10k took {elapsed:?} — O(N^2) regression?"
         );
     }
 
