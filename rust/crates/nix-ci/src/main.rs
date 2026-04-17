@@ -533,6 +533,7 @@ async fn worker_cmd(cmd: WorkerCmd) -> anyhow::Result<()> {
         max_parallel: cmd.max_parallel,
         dry_run: cmd.dry_run,
         worker_id: Some(worker::default_worker_id()),
+        tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
     };
 
     // Wire SIGTERM / Ctrl-C to the worker's shutdown watch.

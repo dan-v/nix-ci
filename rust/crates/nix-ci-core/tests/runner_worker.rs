@@ -60,6 +60,7 @@ async fn worker_dryrun_drains_all_drvs_to_done(pool: PgPool) {
             max_parallel: 4,
             dry_run: true,
             worker_id: None,
+            tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
         };
         tokio::spawn(async move { worker::run(client, cfg, rx).await })
     };
@@ -107,6 +108,7 @@ async fn worker_shutdown_mid_longpoll_returns_quickly(pool: PgPool) {
             max_parallel: 1,
             dry_run: true,
             worker_id: None,
+            tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
         };
         tokio::spawn(async move { worker::run(client, cfg, rx).await })
     };
@@ -151,6 +153,7 @@ async fn worker_exits_on_410_gone(pool: PgPool) {
                 max_parallel: 1,
                 dry_run: true,
                 worker_id: None,
+                tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
             },
             rx,
         )

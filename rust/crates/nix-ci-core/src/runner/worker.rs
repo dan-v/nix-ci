@@ -18,24 +18,48 @@ use crate::types::{
     MAX_LOG_TAIL_BYTES,
 };
 
-/// Seconds the server-side claim long-poll holds open.
-const CLAIM_LONG_POLL_SECS: u64 = 30;
-/// Initial backoff after a transient HTTP failure.
-const TRANSIENT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
-/// Cap on the backoff — we keep retrying forever but never slower than this.
-const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// How many times the worker retries a completion POST before giving up.
-const COMPLETE_MAX_ATTEMPTS: u32 = 5;
-/// Initial sleep between completion-POST retries.
-const COMPLETE_RETRY_DELAY_INITIAL: Duration = Duration::from_secs(2);
-/// Cap on the completion retry backoff.
-const COMPLETE_RETRY_DELAY_MAX: Duration = Duration::from_secs(30);
-/// Stderr read chunk.
+/// Stderr read chunk. Not exposed in WorkerConfig — a fixed 4 KiB is
+/// the correct pipe read size and tuning it would be cargo-culty.
 const STDERR_READ_CHUNK: usize = 4096;
-/// How long we wait for in-flight builds to respond to a shutdown kill
-/// before aborting the JoinSet task. A well-behaved child should exit
-/// within a second of SIGKILL; this gives it headroom for stderr drain.
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tunable deadlines and backoffs for the worker loop. Defaults match
+/// what this file used to hardcode; operators can override via
+/// `WorkerConfig::tuning` to run tighter polls on fast clusters or
+/// looser ones on flaky WANs.
+#[derive(Clone, Debug)]
+pub struct WorkerTuning {
+    /// Seconds the server-side claim long-poll holds open.
+    pub claim_long_poll_secs: u64,
+    /// Initial backoff after a transient HTTP failure.
+    pub transient_backoff_initial: Duration,
+    /// Cap on the backoff — we keep retrying forever but never slower
+    /// than this.
+    pub transient_backoff_max: Duration,
+    /// How many times the worker retries a completion POST before
+    /// giving up.
+    pub complete_max_attempts: u32,
+    /// Initial sleep between completion-POST retries.
+    pub complete_retry_delay_initial: Duration,
+    /// Cap on the completion retry backoff.
+    pub complete_retry_delay_max: Duration,
+    /// How long we wait for in-flight builds to respond to a shutdown
+    /// kill before aborting the JoinSet task.
+    pub shutdown_drain_timeout: Duration,
+}
+
+impl Default for WorkerTuning {
+    fn default() -> Self {
+        Self {
+            claim_long_poll_secs: 30,
+            transient_backoff_initial: Duration::from_secs(1),
+            transient_backoff_max: Duration::from_secs(30),
+            complete_max_attempts: 5,
+            complete_retry_delay_initial: Duration::from_secs(2),
+            complete_retry_delay_max: Duration::from_secs(30),
+            shutdown_drain_timeout: Duration::from_secs(5),
+        }
+    }
+}
 
 /// Jittered exponential backoff. `step` is the 0-indexed attempt
 /// number (0 → initial, 1 → 2×, ...). Caps at `max`. Full jitter
@@ -84,6 +108,8 @@ pub struct WorkerConfig {
     /// operator can map a stuck claim back to a specific host. Empty
     /// is allowed (older workers).
     pub worker_id: Option<String>,
+    /// Polling + retry tunables. Defaults preserve prior behavior.
+    pub tuning: WorkerTuning,
 }
 
 /// Default `worker_id` when the caller doesn't override. Format:
@@ -133,7 +159,7 @@ pub async fn run(
                     *job_id,
                     &cfg.system,
                     &cfg.supported_features,
-                    CLAIM_LONG_POLL_SECS,
+                    cfg.tuning.claim_long_poll_secs,
                     cfg.worker_id.as_deref(),
                 );
                 tokio::select! {
@@ -148,7 +174,7 @@ pub async fn run(
                 let fut = client.claim_any_as_worker(
                     &cfg.system,
                     &cfg.supported_features,
-                    CLAIM_LONG_POLL_SECS,
+                    cfg.tuning.claim_long_poll_secs,
                     cfg.worker_id.as_deref(),
                 );
                 tokio::select! {
@@ -181,8 +207,8 @@ pub async fn run(
                 tracing::warn!(error = %e, "worker: claim failed");
                 let backoff = backoff_with_jitter(
                     transient_failures,
-                    TRANSIENT_BACKOFF_INITIAL,
-                    TRANSIENT_BACKOFF_MAX,
+                    cfg.tuning.transient_backoff_initial,
+                    cfg.tuning.transient_backoff_max,
                 );
                 transient_failures = transient_failures.saturating_add(1);
                 tokio::select! {
@@ -201,10 +227,18 @@ pub async fn run(
         // any cfg-level binding so the same code path serves both modes.
         let job_id = claim.job_id;
         let task_shutdown = shutdown.clone();
+        let tuning = cfg.tuning.clone();
 
         join_set.spawn(async move {
-            let outcome =
-                build_and_report(client_cloned, job_id, claim, dry_run, task_shutdown).await;
+            let outcome = build_and_report(
+                client_cloned,
+                job_id,
+                claim,
+                dry_run,
+                &tuning,
+                task_shutdown,
+            )
+            .await;
             active_cloned.fetch_sub(1, Ordering::AcqRel);
             if let Err(e) = outcome {
                 tracing::warn!(error = %e, "worker: build failed to report");
@@ -222,12 +256,12 @@ pub async fn run(
     // actually exit. Without this, SIGTERM plus a hung build would
     // leave `nix-ci run` wedged indefinitely.
     let drain = async { while join_set.join_next().await.is_some() {} };
-    if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain)
+    if tokio::time::timeout(cfg.tuning.shutdown_drain_timeout, drain)
         .await
         .is_err()
     {
         tracing::warn!(
-            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+            timeout_secs = cfg.tuning.shutdown_drain_timeout.as_secs(),
             remaining = join_set.len(),
             "worker: drain timed out; aborting in-flight builds"
         );
@@ -248,6 +282,7 @@ async fn build_and_report(
     job_id: JobId,
     claim: ClaimResponse,
     dry_run: bool,
+    tuning: &WorkerTuning,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let started_at_wall = chrono::Utc::now();
@@ -313,7 +348,7 @@ async fn build_and_report(
             }
             Err(e) => {
                 attempt += 1;
-                if attempt >= COMPLETE_MAX_ATTEMPTS {
+                if attempt >= tuning.complete_max_attempts {
                     tracing::error!(
                         error = %e,
                         drv = %claim.drv_hash,
@@ -324,13 +359,13 @@ async fn build_and_report(
                 }
                 tracing::warn!(
                     error = %e,
-                    attempts_left = COMPLETE_MAX_ATTEMPTS - attempt,
+                    attempts_left = tuning.complete_max_attempts - attempt,
                     "complete POST failed; retrying"
                 );
                 let delay = backoff_with_jitter(
                     attempt - 1,
-                    COMPLETE_RETRY_DELAY_INITIAL,
-                    COMPLETE_RETRY_DELAY_MAX,
+                    tuning.complete_retry_delay_initial,
+                    tuning.complete_retry_delay_max,
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}

@@ -89,6 +89,7 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
             max_parallel: args.cfg.max_parallel,
             dry_run: args.cfg.dry_run,
             worker_id: Some(worker::default_worker_id()),
+            tuning: crate::runner::worker::WorkerTuning::default(),
         };
         tokio::spawn(async move { worker::run(client, cfg, rx).await })
     };

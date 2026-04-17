@@ -497,6 +497,7 @@ async fn regression_fleet_worker_still_drains_jobs(pool: PgPool) {
                     max_parallel: 2,
                     dry_run: true,
                     worker_id: None,
+                    tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
                 },
                 sd_rx,
             )
