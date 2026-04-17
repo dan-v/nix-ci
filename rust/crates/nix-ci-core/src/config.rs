@@ -94,6 +94,15 @@ pub struct ServerConfig {
     /// sooner; higher = avoid thrashing on a known-broken drv. Only
     /// affects new inserts; existing rows keep their original TTL.
     pub failed_outputs_ttl_secs: u64,
+    /// Optional bearer token. When set, every mutating endpoint
+    /// (POST / DELETE / claim / complete / events) rejects requests
+    /// without a matching `Authorization: Bearer <token>` header with
+    /// 401. Monitoring endpoints (`/healthz`, `/readyz`, `/metrics`)
+    /// remain unauthenticated so probes keep working. Expected to be
+    /// set via env var or JSON config, not a CLI flag (leaks into
+    /// process listings). Leave unset for deployments behind a trusted
+    /// mesh / VPN.
+    pub auth_bearer: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -122,6 +131,7 @@ impl Default for ServerConfig {
             submission_warn_threshold: 200_000,
             max_drvs_per_job: Some(2_000_000),
             failed_outputs_ttl_secs: 60 * 60, // 1h
+            auth_bearer: None,
         }
     }
 }

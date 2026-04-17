@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use opentelemetry::propagation::Extractor;
@@ -26,9 +26,18 @@ fn is_long_poll_route(path: &str) -> bool {
     matches!(path, "/jobs/{id}/claim" | "/claim" | "/jobs/{id}/events")
 }
 
+/// Routes that skip the bearer-token gate when auth is enabled.
+/// Monitoring probes (`/healthz`, `/readyz`, `/metrics`) MUST stay
+/// reachable so Prometheus / kubelet don't lock themselves out of the
+/// coordinator on auth misconfiguration.
+fn is_public_route(path: &str) -> bool {
+    matches!(path, "/healthz" | "/health" | "/readyz" | "/metrics")
+}
+
 pub fn build_router(state: AppState) -> Router {
     let max_body = state.cfg.max_request_body_bytes;
     let metrics_for_layer = state.metrics.clone();
+    let auth_token = state.cfg.auth_bearer.clone();
     Router::new()
         // Jobs
         .route("/jobs", post(jobs::create))
@@ -81,8 +90,52 @@ pub fn build_router(state: AppState) -> Router {
             metrics_for_layer,
             http_metrics_layer,
         ))
+        .layer(middleware::from_fn_with_state(
+            auth_token,
+            bearer_auth_layer,
+        ))
         .layer(middleware::from_fn(request_id_layer))
         .with_state(state)
+}
+
+/// Bearer-token gate. Only takes effect when `auth_bearer` is set in
+/// config; otherwise a no-op pass-through. Uses a constant-time
+/// comparison so an attacker can't time-probe the correct prefix.
+async fn bearer_auth_layer(
+    axum::extract::State(expected): axum::extract::State<Option<String>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(expected) = expected.as_deref() else {
+        return next.run(req).await;
+    };
+    let path = req.uri().path();
+    if is_public_route(path) {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    match presented {
+        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => next.run(req).await,
+        _ => crate::Error::Unauthorized("invalid or missing bearer token".into()).into_response(),
+    }
+}
+
+/// Byte-equal constant-time compare. Prevents timing oracles on the
+/// bearer token prefix. `subtle` crate would be cleaner but avoiding
+/// a new dep for ≤20 lines.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Per-endpoint latency histogram. Records request duration labelled

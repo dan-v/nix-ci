@@ -20,6 +20,10 @@ use crate::types::{
 pub struct CoordinatorClient {
     base: String,
     http: Client,
+    /// Optional bearer token. When set, prepended to every request's
+    /// `Authorization: Bearer <token>` header. Matches
+    /// `ServerConfig::auth_bearer` on the coordinator side.
+    auth_bearer: Option<String>,
 }
 
 /// Metadata for a build-log upload. Borrowed from caller-owned data so
@@ -37,6 +41,12 @@ pub struct BuildLogUploadMeta<'a> {
 
 impl CoordinatorClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_auth(base_url, None)
+    }
+
+    /// Construct a client that sends a bearer token with every request.
+    /// Match against `ServerConfig::auth_bearer` on the coordinator.
+    pub fn with_auth(base_url: impl Into<String>, auth_bearer: Option<String>) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(75))
             .user_agent(concat!("nix-ci/", env!("CARGO_PKG_VERSION")))
@@ -45,6 +55,7 @@ impl CoordinatorClient {
         Self {
             base: normalize(base_url.into()),
             http,
+            auth_bearer,
         }
     }
 
@@ -53,15 +64,23 @@ impl CoordinatorClient {
     /// configured) the global propagator is a no-op and this adds no
     /// headers — pure cost: one stack-allocated `HeaderMap`.
     fn get(&self, url: &str) -> reqwest::RequestBuilder {
-        inject_trace(self.http.get(url))
+        self.auth(inject_trace(self.http.get(url)))
     }
 
     fn post(&self, url: &str) -> reqwest::RequestBuilder {
-        inject_trace(self.http.post(url))
+        self.auth(inject_trace(self.http.post(url)))
     }
 
     fn delete(&self, url: &str) -> reqwest::RequestBuilder {
-        inject_trace(self.http.delete(url))
+        self.auth(inject_trace(self.http.delete(url)))
+    }
+
+    /// Attach `Authorization: Bearer <token>` if configured.
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth_bearer {
+            Some(tok) => rb.bearer_auth(tok),
+            None => rb,
+        }
     }
 
     pub async fn create_job(&self, req: &CreateJobRequest) -> Result<CreateJobResponse> {
@@ -121,6 +140,9 @@ impl CoordinatorClient {
         match resp.status() {
             s if s.is_success() => Ok(()),
             StatusCode::GONE => Err(Error::Gone("job is terminal".into())),
+            StatusCode::UNAUTHORIZED => Err(Error::Unauthorized(
+                resp.text().await.unwrap_or_default(),
+            )),
             s => {
                 let body = resp.text().await.unwrap_or_default();
                 Err(Error::Internal(format!("heartbeat {s}: {body}")))
@@ -420,6 +442,7 @@ async fn decode<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
             StatusCode::GONE => Error::Gone(body),
             StatusCode::BAD_REQUEST => Error::BadRequest(body),
             StatusCode::PAYLOAD_TOO_LARGE => Error::PayloadTooLarge(body),
+            StatusCode::UNAUTHORIZED => Error::Unauthorized(body),
             s if s.is_client_error() => Error::BadRequest(format!("{status}: {body}")),
             _ => Error::Internal(format!("{status}: {body}")),
         })

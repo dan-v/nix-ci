@@ -25,6 +25,9 @@ pub enum Error {
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
 
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -52,6 +55,7 @@ impl Error {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Gone(_) => StatusCode::GONE,
             Error::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Error::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
