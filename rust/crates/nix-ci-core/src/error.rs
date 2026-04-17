@@ -22,6 +22,9 @@ pub enum Error {
     #[error("gone: {0}")]
     Gone(String),
 
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -48,6 +51,7 @@ impl Error {
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Gone(_) => StatusCode::GONE,
+            Error::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

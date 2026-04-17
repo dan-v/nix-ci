@@ -21,7 +21,11 @@ use super::AppState;
 use crate::dispatch::Step;
 use crate::durable::writeback;
 use crate::error::Result;
-use crate::types::{drv_hash_from_path, IngestBatchRequest, IngestBatchResponse};
+use crate::observability::metrics::TerminalLabels;
+use crate::types::{
+    drv_hash_from_path, IngestBatchRequest, IngestBatchResponse, JobEvent, JobId, JobStatus,
+    JobStatusResponse,
+};
 
 #[tracing::instrument(skip_all, fields(job_id = %id, batch_size = req.drvs.len()))]
 pub async fn submit_batch(
@@ -41,6 +45,28 @@ pub async fn submit_batch(
         .dispatcher
         .submissions
         .get_or_insert(id, state.cfg.submission_event_capacity);
+
+    // Hard drv-cap. Runaway evals (10M-drv flake bug, accidental infinite
+    // expansion) would OOM the coordinator long before they complete; a
+    // cheap `members.len()` upper-bound check catches them at the first
+    // batch that crosses the line. We auto-fail the job with a clean
+    // sentinel so the caller sees a meaningful error rather than a
+    // connection reset mid-ingest. Using the optimistic upper bound
+    // (existing + incoming) avoids walking the incoming batch for dedup
+    // first; any rejection is conservative.
+    if let Some(cap) = state.cfg.max_drvs_per_job {
+        let existing = sub.members.read().len() as u64;
+        let incoming = req.drvs.len() as u64;
+        if existing + incoming > u64::from(cap) {
+            let reason = format!(
+                "eval_too_large: job {id} would exceed max_drvs_per_job={cap} \
+                 (existing={existing}, incoming={incoming})"
+            );
+            tracing::warn!(job_id = %id, cap, existing, incoming, "ingest rejected: over cap");
+            auto_fail_oversized(&state, id, &reason).await?;
+            return Err(crate::Error::PayloadTooLarge(reason));
+        }
+    }
 
     // The failed_outputs cache stores the OUTPUT path (drv_path with
     // `.drv` stripped — matches what `nix build` produces). Query in
@@ -162,4 +188,51 @@ pub async fn submit_batch(
         dedup_skipped,
         errored,
     }))
+}
+
+/// Force a job to terminal=Failed with a sentinel `eval_error` when an
+/// ingest batch would push it over the configured drv cap. Runs entirely
+/// outside the submission's normal path (no worker ever claimed a drv
+/// on this job) so we build the snapshot from scratch.
+async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Result<()> {
+    let snapshot = JobStatusResponse {
+        id,
+        status: JobStatus::Failed,
+        sealed: false,
+        counts: crate::types::JobCounts::default(),
+        failures: Vec::new(),
+        eval_error: Some(reason.to_string()),
+    };
+    let snapshot_json = serde_json::to_value(&snapshot)
+        .map_err(|e| crate::Error::Internal(format!("serialize oversized snapshot: {e}")))?;
+    // Terminal write is idempotent (done_at IS NULL guard). If the job
+    // was already forced terminal by a concurrent oversized batch, we
+    // still return PayloadTooLarge to the caller — same outcome.
+    let _ = writeback::transition_job_terminal(
+        &state.pool,
+        id,
+        JobStatus::Failed.as_str(),
+        &snapshot_json,
+    )
+    .await?;
+
+    if let Some(sub) = state.dispatcher.submissions.remove(id) {
+        state.dispatcher.evict_claims_for(id);
+        if sub.mark_terminal() {
+            sub.publish(JobEvent::JobDone {
+                status: JobStatus::Failed,
+                failures: Vec::new(),
+            });
+        }
+    }
+    state
+        .metrics
+        .inner
+        .jobs_terminal
+        .get_or_create(&TerminalLabels {
+            status: JobStatus::Failed.as_str().into(),
+        })
+        .inc();
+    state.dispatcher.wake();
+    Ok(())
 }

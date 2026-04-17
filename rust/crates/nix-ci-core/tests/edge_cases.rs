@@ -2646,6 +2646,108 @@ async fn admin_snapshot_counts_scale_linearly_with_members(pool: PgPool) {
     assert_eq!(status.counts.pending, 3);
 }
 
+// ─── Per-job drv cap (C10) ───────────────────────────────────────────
+
+/// When a batch would push a job's member count over `max_drvs_per_job`,
+/// the coordinator must auto-fail the job with `eval_too_large` and
+/// return 413. This is the runaway-eval guard: nothing else can stop a
+/// 10M-drv accidental closure from OOMing the coordinator.
+#[sqlx::test]
+async fn ingest_drv_cap_auto_fails_job(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.submission_warn_threshold = 4;
+        cfg.max_drvs_per_job = Some(8); // very small cap for test speed
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+
+    // First batch: 6 drvs (under cap).
+    let batch1: Vec<_> = (0..6u32)
+        .map(|i| ingest(&drv_path(&format!("h{i:04}a"), &format!("d{i}")), "d", &[], true))
+        .collect();
+    client
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: batch1 })
+        .await
+        .unwrap();
+
+    // Second batch: 3 more → 6+3=9 > 8 cap → must 413 + auto-fail.
+    let batch2: Vec<_> = (10..13u32)
+        .map(|i| ingest(&drv_path(&format!("h{i:04}b"), &format!("d{i}")), "d", &[], true))
+        .collect();
+    let err = client
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: batch2 })
+        .await
+        .unwrap_err();
+    match err {
+        nix_ci_core::Error::PayloadTooLarge(ref msg) => {
+            assert!(
+                msg.contains("eval_too_large"),
+                "expected eval_too_large, got: {msg}"
+            );
+        }
+        other => panic!("expected PayloadTooLarge, got {other:?}"),
+    }
+
+    // The job must be terminal=Failed with the sentinel eval_error set
+    // (so the caller can distinguish this from a regular build failure).
+    let status = client.status(job.id).await.unwrap();
+    assert_eq!(status.status, JobStatus::Failed);
+    assert!(
+        status
+            .eval_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("eval_too_large"),
+        "expected eval_too_large in eval_error, got: {:?}",
+        status.eval_error
+    );
+
+    // Subsequent ingest must now be rejected with Gone (terminal), not
+    // PayloadTooLarge — proves the terminal write actually happened.
+    let retry: Vec<_> = (20..21u32)
+        .map(|i| ingest(&drv_path(&format!("h{i:04}c"), &format!("d{i}")), "d", &[], true))
+        .collect();
+    match client
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: retry })
+        .await
+        .unwrap_err()
+    {
+        nix_ci_core::Error::Gone(_) => {}
+        other => panic!("expected Gone after auto-fail, got {other:?}"),
+    }
+}
+
+/// With the cap disabled (None), huge ingests succeed. Guards against
+/// a refactor that accidentally flips the default off-switch.
+#[sqlx::test]
+async fn ingest_drv_cap_disabled_allows_large_batch(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.submission_warn_threshold = 10;
+        cfg.max_drvs_per_job = None;
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+
+    let big: Vec<_> = (0..50u32)
+        .map(|i| ingest(&drv_path(&format!("h{i:04}u"), &format!("d{i}")), "d", &[], true))
+        .collect();
+    let resp = client
+        .ingest_batch(job.id, &IngestBatchRequest { drvs: big })
+        .await
+        .unwrap();
+    assert_eq!(resp.new_drvs, 50);
+}
+
 // ─── Battleproof: request body size limit ────────────────────────────
 
 #[sqlx::test]

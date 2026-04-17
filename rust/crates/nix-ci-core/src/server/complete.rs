@@ -155,8 +155,13 @@ async fn handle_failure(
         // validates), so the stripped result is guaranteed non-empty
         // and distinct from the input.
         let output_path = step.drv_path().trim_end_matches(".drv").to_string();
-        if let Err(e) =
-            writeback::insert_failed_outputs(&state.pool, step.drv_hash(), &[output_path]).await
+        if let Err(e) = writeback::insert_failed_outputs(
+            &state.pool,
+            step.drv_hash(),
+            &[output_path],
+            state.cfg.failed_outputs_ttl_secs,
+        )
+        .await
         {
             tracing::warn!(error = %e, "failed_outputs insert failed; continuing");
         }

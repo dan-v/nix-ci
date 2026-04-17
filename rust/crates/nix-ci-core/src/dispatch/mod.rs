@@ -62,8 +62,10 @@ use crate::observability::metrics::Metrics;
 
 /// The in-memory authoritative dispatcher. One instance per coordinator
 /// process. Owns the steps registry, submission set, ready sets, and
-/// claim tracker. Persists writes through to Postgres at every state
-/// transition.
+/// claim tracker. All in-flight scheduling state is memory-only: only
+/// the durable envelope (`jobs.result` + `failed_outputs`) reaches
+/// Postgres, and only at job-terminal / failure-cache boundaries. On
+/// restart the dispatcher starts empty; callers retry cancelled jobs.
 #[derive(Clone)]
 pub struct Dispatcher {
     pub steps: Arc<StepsRegistry>,

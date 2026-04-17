@@ -80,6 +80,20 @@ pub struct ServerConfig {
     /// emits a `WARN` log line so an operator can spot a runaway job
     /// before it OOMs the coordinator. Not a hard cap.
     pub submission_warn_threshold: u32,
+    /// Hard cap on per-submission member count. Ingest that would cross
+    /// this rejects the entire batch with 413 and fails the job with
+    /// `eval_too_large`. The dispatcher is then drained, so runaway
+    /// evaluations can never OOM the coordinator. Set `None` to disable
+    /// the hard cap (not recommended in production). Defaults to 2M —
+    /// headroom over nixpkgs-scale full evals (~150K drvs today)
+    /// while still catching true bugs.
+    pub max_drvs_per_job: Option<u32>,
+    /// TTL (in seconds) applied to newly-inserted `failed_outputs`
+    /// rows. Concurrent / subsequent jobs that ingest the same output
+    /// path within the TTL skip rebuilding. Lower = retry flaky drvs
+    /// sooner; higher = avoid thrashing on a known-broken drv. Only
+    /// affects new inserts; existing rows keep their original TTL.
+    pub failed_outputs_ttl_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -106,6 +120,8 @@ impl Default for ServerConfig {
             graceful_shutdown_secs: 30,
             build_log_retention_days: 14,
             submission_warn_threshold: 200_000,
+            max_drvs_per_job: Some(2_000_000),
+            failed_outputs_ttl_secs: 60 * 60, // 1h
         }
     }
 }
@@ -216,6 +232,20 @@ impl ServerConfig {
         }
         if self.flaky_retry_backoff_step_ms < 0 {
             errors.push("flaky_retry_backoff_step_ms must be >= 0".into());
+        }
+        if let Some(cap) = self.max_drvs_per_job {
+            if cap == 0 {
+                errors
+                    .push("max_drvs_per_job, when set, must be > 0 (use null to disable)".into());
+            } else if cap < self.submission_warn_threshold {
+                errors.push(format!(
+                    "max_drvs_per_job ({cap}) must be >= submission_warn_threshold ({})",
+                    self.submission_warn_threshold
+                ));
+            }
+        }
+        if self.failed_outputs_ttl_secs == 0 {
+            errors.push("failed_outputs_ttl_secs must be > 0".into());
         }
 
         // Ordering invariants: a reaper that fires faster than its

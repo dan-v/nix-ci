@@ -419,6 +419,7 @@ async fn decode<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
             StatusCode::NOT_FOUND => Error::NotFound(body),
             StatusCode::GONE => Error::Gone(body),
             StatusCode::BAD_REQUEST => Error::BadRequest(body),
+            StatusCode::PAYLOAD_TOO_LARGE => Error::PayloadTooLarge(body),
             s if s.is_client_error() => Error::BadRequest(format!("{status}: {body}")),
             _ => Error::Internal(format!("{status}: {body}")),
         })

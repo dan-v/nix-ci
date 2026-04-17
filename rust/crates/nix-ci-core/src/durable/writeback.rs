@@ -99,10 +99,16 @@ pub async fn transition_job_terminal(
 /// Insert a batch of failed output paths into the TTL cache. Called
 /// once per terminal-failed drv so future ingests of the same output
 /// path can short-circuit without dispatching a worker.
+///
+/// `ttl_secs` sets the row's `expires_at = now() + ttl`. Lets operators
+/// pick per-deployment TTLs (short for flaky overlays, long for stable
+/// channels) without a migration. The column still defaults to 1h for
+/// backwards compatibility with manually-inserted rows.
 pub async fn insert_failed_outputs(
     pool: &PgPool,
     drv_hash: &DrvHash,
     output_paths: &[String],
+    ttl_secs: u64,
 ) -> Result<()> {
     if output_paths.is_empty() {
         return Ok(());
@@ -110,15 +116,18 @@ pub async fn insert_failed_outputs(
     let drv_hash_refs: Vec<&str> =
         std::iter::repeat_n(drv_hash.as_str(), output_paths.len()).collect();
     let path_refs: Vec<&str> = output_paths.iter().map(String::as_str).collect();
+    let ttl: f64 = ttl_secs as f64;
     sqlx::query(
         r#"
-        INSERT INTO failed_outputs (output_path, drv_hash)
-        SELECT * FROM UNNEST($1::text[], $2::text[]) AS t(output_path, drv_hash)
+        INSERT INTO failed_outputs (output_path, drv_hash, expires_at)
+        SELECT output_path, drv_hash, now() + make_interval(secs => $3)
+        FROM UNNEST($1::text[], $2::text[]) AS t(output_path, drv_hash)
         ON CONFLICT (output_path) DO NOTHING
         "#,
     )
     .bind(&path_refs)
     .bind(&drv_hash_refs)
+    .bind(ttl)
     .execute(pool)
     .await?;
     Ok(())
