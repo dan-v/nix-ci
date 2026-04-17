@@ -93,9 +93,67 @@ in
         post-build-hook helpers, or custom wrappers.
       '';
     };
+
+    pushCache = lib.mkOption {
+      type = lib.types.nullOr (lib.types.submodule {
+        options = {
+          name = lib.mkOption {
+            type = lib.types.str;
+            example = "my-org-overlay";
+            description = "Cachix cache name (without the .cachix.org suffix).";
+          };
+          authTokenFile = lib.mkOption {
+            type = lib.types.path;
+            example = lib.literalExpression "/run/keys/cachix-token";
+            description = ''
+              Path to a file containing the Cachix auth token. The file
+              must be readable by the nix-daemon user (not the worker
+              user). Contents are read at daemon start and baked into
+              the cachix push wrapper; consider a secrets provisioning
+              agent that rotates it without restarting the daemon.
+            '';
+          };
+        };
+      });
+      default = null;
+      description = ''
+        If set, every successful build on this host pushes its output
+        paths to the given Cachix cache via a nix daemon
+        post-build-hook. This is the mechanism by which other workers
+        and CCI jobs substitute from the cache rather than rebuilding
+        drvs this worker already finished. Without it, the global
+        dedup value prop collapses to "one builder coordinates but
+        everyone still builds everything."
+
+        The post-build-hook runs under the nix daemon (not the worker
+        process), which is why the auth token is read at daemon start
+        and the file must be daemon-readable.
+
+        If your deployment uses Attic, a self-hosted binary cache, or
+        a bespoke push mechanism, set `pushCache = null` here and
+        configure nix.settings.post-build-hook directly with a custom
+        script.
+      '';
+    };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf cfg.enable (let
+    # When pushCache is set, we install a post-build-hook that pushes
+    # OUT_PATHS to the configured Cachix cache. The hook runs under
+    # the nix daemon so it has access to the built paths; the auth
+    # token is read from disk at hook-invocation time (nix-daemon
+    # re-execs the hook per build).
+    pushHook = lib.optionalAttrs (cfg.pushCache != null) {
+      nix.settings.post-build-hook = pkgs.writeShellScript "nix-ci-post-build-push" ''
+        set -euo pipefail
+        if [ -z "''${OUT_PATHS:-}" ]; then exit 0; fi
+        token=$(cat ${lib.escapeShellArg cfg.pushCache.authTokenFile})
+        exec ${pkgs.cachix}/bin/cachix \
+          --auth-token "$token" \
+          push ${lib.escapeShellArg cfg.pushCache.name} $OUT_PATHS
+      '';
+    };
+  in lib.mkMerge [ pushHook {
     systemd.services.nix-ci-worker = {
       description = "nix-ci fleet worker";
       after = [ "network-online.target" "nix-daemon.service" ];
@@ -172,5 +230,5 @@ in
     # Nix daemon must be running — the worker has no fallback single-
     # user-mode path.
     nix.settings.trusted-users = [ "nix-ci-worker" ];
-  };
+  } ]);
 }
