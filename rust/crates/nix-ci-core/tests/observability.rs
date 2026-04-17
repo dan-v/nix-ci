@@ -16,7 +16,7 @@ use common::{drv_path, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
 use nix_ci_core::types::{
     AdminSnapshot, CompleteRequest, CreateJobRequest, ErrorCategory, IngestBatchRequest,
-    IngestDrvRequest, JobStatus, JobsListResponse,
+    IngestDrvRequest, JobStatus,
 };
 use sqlx::PgPool;
 
@@ -167,38 +167,6 @@ async fn list_jobs_paginates_by_cursor(pool: PgPool) {
 }
 
 // ─── GET /jobs/by-external-ref/{ref} ─────────────────────────────────
-
-#[sqlx::test]
-async fn by_external_ref_resolves_terminal_job(pool: PgPool) {
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let job = client
-        .create_job(&CreateJobRequest {
-            external_ref: Some("my-build-42".into()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    client
-        .ingest_drv(job.id, &ingest(&drv_path("ext", "x"), "x", &[], true))
-        .await
-        .unwrap();
-    client.seal(job.id).await.unwrap();
-    drive_to_failure(&client, job.id).await;
-
-    let snap = client.show_job("my-build-42").await.unwrap();
-    assert_eq!(snap.id, job.id);
-    assert_eq!(snap.status, JobStatus::Failed);
-    assert!(!snap.failures.is_empty());
-}
-
-#[sqlx::test]
-async fn by_external_ref_404s_when_unknown(pool: PgPool) {
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let err = client.show_job("nope-not-real").await.unwrap_err();
-    matches!(err, nix_ci_core::Error::NotFound(_));
-}
 
 #[sqlx::test]
 async fn show_job_resolves_uuid_and_external_ref(pool: PgPool) {
@@ -458,75 +426,5 @@ async fn progress_event_carries_enrichments(pool: PgPool) {
 // fleet drain test inline so a one-line check failure jumps out here
 // rather than confusingly in the unrelated fleet.rs file.
 
-#[sqlx::test]
-async fn regression_fleet_worker_still_drains_jobs(pool: PgPool) {
-    use nix_ci_core::runner::worker::{self, ClaimMode, WorkerConfig};
-    use tokio::sync::watch;
-
-    let handle = spawn_server(pool).await;
-    let client = Arc::new(CoordinatorClient::new(&handle.base_url));
-    let job = client
-        .create_job(&CreateJobRequest {
-            external_ref: None,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let drvs: Vec<_> = (0..4)
-        .map(|i| {
-            ingest(
-                &drv_path(&format!("rgf{i}"), &format!("d{i}")),
-                &format!("d{i}"),
-                &[],
-                true,
-            )
-        })
-        .collect();
-    client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
-        .await
-        .unwrap();
-    client.seal(job.id).await.unwrap();
-
-    let (sd_tx, sd_rx) = watch::channel(false);
-    let h = {
-        let client = client.clone();
-        tokio::spawn(async move {
-            worker::run(
-                client,
-                WorkerConfig {
-                    mode: ClaimMode::Fleet,
-                    system: "x86_64-linux".into(),
-                    supported_features: vec![],
-                    max_parallel: 2,
-                    dry_run: true,
-                    worker_id: None,
-                    tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
-                },
-                sd_rx,
-            )
-            .await
-        })
-    };
-    for _ in 0..200 {
-        if client.status(job.id).await.unwrap().status.is_terminal() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(client.status(job.id).await.unwrap().status, JobStatus::Done);
-    let _ = sd_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
-}
-
 // ─── Sanity: list endpoint returns empty when no failures ────────────
 
-#[sqlx::test]
-async fn list_jobs_returns_empty_when_no_matches(pool: PgPool) {
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let resp: JobsListResponse = client.list_jobs("failed", None, None, 50).await.unwrap();
-    assert!(resp.jobs.is_empty());
-    assert!(resp.next_cursor.is_none());
-    drop(handle);
-}

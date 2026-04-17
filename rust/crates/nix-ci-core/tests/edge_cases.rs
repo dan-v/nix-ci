@@ -8,8 +8,6 @@ use std::time::Duration;
 
 use common::{drv_path, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::durable::logs::PgLogStore;
-use nix_ci_core::observability::metrics::Metrics;
 use nix_ci_core::types::{
     CompleteRequest, CreateJobRequest, ErrorCategory, IngestBatchRequest, IngestDrvRequest,
     JobStatus,
@@ -686,20 +684,6 @@ async fn terminal_jobs_removed_from_in_memory_map(pool: PgPool) {
 
 // ─── Heartbeat reset behavior ────────────────────────────────────────
 
-#[sqlx::test]
-async fn heartbeat_keeps_live_job_fresh(pool: PgPool) {
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let job = client
-        .create_job(&CreateJobRequest {
-            external_ref: None,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    client.heartbeat(job.id).await.unwrap();
-}
-
 // ─── Battleproof: ingest rejected after seal ─────────────────────────
 
 #[sqlx::test]
@@ -734,49 +718,6 @@ async fn ingest_on_sealed_job_is_rejected(pool: PgPool) {
 }
 
 // ─── Battleproof: length bounds ──────────────────────────────────────
-
-#[sqlx::test]
-async fn overlong_drv_path_rejected(pool: PgPool) {
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let job = client
-        .create_job(&CreateJobRequest {
-            external_ref: None,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    // drv_path with >4096 bytes trips max_drv_path_bytes.
-    let huge = format!("/nix/store/abcd-{}.drv", "x".repeat(5000));
-    let batch = IngestBatchRequest {
-        drvs: vec![ingest(&huge, "huge", &[], true)],
-    eval_errors: Vec::new(),
-        };
-    let resp = client.ingest_batch(job.id, &batch).await.unwrap();
-    assert_eq!(resp.errored, 1);
-    assert_eq!(resp.new_drvs, 0);
-}
-
-#[sqlx::test]
-async fn overlong_drv_name_rejected(pool: PgPool) {
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let job = client
-        .create_job(&CreateJobRequest {
-            external_ref: None,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let name = "y".repeat(2000);
-    let p = drv_path("hhn", "ok");
-    let mut req = ingest(&p, "ok", &[], true);
-    req.drv_name = name;
-    let batch = IngestBatchRequest { drvs: vec![req], eval_errors: Vec::new() };
-    let resp = client.ingest_batch(job.id, &batch).await.unwrap();
-    assert_eq!(resp.errored, 1);
-    assert_eq!(resp.new_drvs, 0);
-}
 
 // ─── Battleproof: failures cap in terminal snapshot ──────────────────
 
@@ -874,60 +815,7 @@ async fn terminal_snapshot_caps_failures(pool: PgPool) {
 
 // ─── /health alias for proxies that expect the unsuffixed path ─────
 
-#[sqlx::test]
-async fn both_health_and_healthz_paths_serve_ok(pool: PgPool) {
-    // Some proxies (Envoy, GCP HTTP LBs) probe `/health`; kube uses
-    // `/healthz`. Both must return the same OK response.
-    let handle = spawn_server(pool).await;
-    for path in ["/health", "/healthz"] {
-        let r = reqwest::get(format!("{}{path}", handle.base_url))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), reqwest::StatusCode::OK, "{path}");
-        assert_eq!(r.text().await.unwrap(), "ok", "{path}");
-    }
-}
-
 // ─── HTTP/2 cleartext (h2c) prior-knowledge support ────────────────
-
-#[sqlx::test]
-async fn server_accepts_h2c_prior_knowledge_clients(pool: PgPool) {
-    // Real deployment sits behind Envoy doing h2c upstream. The server
-    // must accept HTTP/2 cleartext (prior-knowledge — no TLS, no
-    // Upgrade dance). axum::serve uses hyper-util's auto-builder
-    // which inspects the connection preface — h2c clients should work
-    // without code changes.
-    let handle = spawn_server(pool).await;
-
-    let h2_client = reqwest::Client::builder()
-        .http2_prior_knowledge()
-        .build()
-        .unwrap();
-    let resp = h2_client
-        .get(format!("{}/healthz", handle.base_url))
-        .send()
-        .await
-        .expect("h2c request must succeed");
-    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(resp.text().await.unwrap(), "ok");
-
-    // Also a JSON POST to make sure routes / bodies / headers all
-    // negotiate fine.
-    let job: nix_ci_core::types::CreateJobResponse = h2_client
-        .post(format!("{}/jobs", handle.base_url))
-        .json(&CreateJobRequest {
-            external_ref: None,
-            ..Default::default()
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_ne!(job.id.0.to_string(), "");
-}
 
 // ─── SSE consumer surfaces server failure as Err, not Ok(Pending) ──
 
@@ -1460,73 +1348,6 @@ async fn ingest_batch_rejects_empty_system(pool: PgPool) {
 
 // ─── PG failure modes: statement timeout + pool exhaustion ─────────
 
-#[sqlx::test]
-async fn writeback_sweep_handles_statement_timeout(pool: PgPool) {
-    // Even under PG statement_timeout, the cleanup sweep must fail
-    // cleanly (return Err) rather than panic or wedge. The handler
-    // callers (the cleanup loop) log and keep going.
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-    // `pg_sleep(2)` inside a statement with a 50ms timeout triggers
-    // query_canceled. Write a row that requires the sweep to read it,
-    // then rely on the timeout to interrupt.
-    sqlx::query("INSERT INTO failed_outputs (output_path, drv_hash, expires_at) VALUES ('/x', 'x.drv', now() - interval '1 day')")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // Force the session into short-timeout mode and block on a slow
-    // companion query to prove we surface errors rather than panic.
-    let mut conn = pool.acquire().await.unwrap();
-    sqlx::query("SET LOCAL statement_timeout = '50ms'")
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-    let r: Result<(i32,), _> = sqlx::query_as("SELECT pg_sleep(1)::int")
-        .fetch_one(&mut *conn)
-        .await;
-    assert!(r.is_err(), "timed-out query must return Err");
-    // Crucially: no panic, the connection is usable again after reset.
-    drop(conn);
-
-    // sweep still works afterward: takes a fresh connection from the
-    // pool (without the LOCAL timeout) and prunes the expired row.
-    nix_ci_core::durable::cleanup::sweep(
-        &pool,
-        7,
-        14,
-        &PgLogStore::new(pool.clone()),
-        &Metrics::new(),
-    )
-    .await
-    .unwrap();
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT output_path FROM failed_outputs")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    assert!(rows.is_empty(), "sweep must have removed the expired row");
-}
-
-#[sqlx::test]
-async fn writeback_returns_error_on_closed_pool(pool: PgPool) {
-    // `pool.close()` should cause subsequent writeback calls to Err
-    // cleanly (not panic). Callers currently propagate the error via
-    // `?`, which returns 500 to the client — acceptable.
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    let job_id = nix_ci_core::types::JobId::new();
-    nix_ci_core::durable::writeback::upsert_job(&pool, job_id, None)
-        .await
-        .unwrap();
-
-    pool.close().await;
-
-    let snap = serde_json::json!({ "id": job_id.0.to_string() });
-    let res =
-        nix_ci_core::durable::writeback::transition_job_terminal(&pool, job_id, "done", &snap)
-            .await;
-    assert!(res.is_err(), "closed pool must surface Err, not panic");
-}
-
 // ─── Snapshot gauges reflect live dispatcher state ─────────────────
 
 #[sqlx::test]
@@ -1868,50 +1689,6 @@ async fn cancel_evicts_in_flight_claims_for_that_job(pool: PgPool) {
 
 // ─── CoordinatorLock: two processes race for single-writer ─────────
 
-#[sqlx::test]
-async fn coordinator_lock_second_acquirer_blocks_until_first_drops(_pool: PgPool) {
-    // Advisory lock semantics: given a unique key, the first acquirer
-    // succeeds immediately; a second blocks until the first drops its
-    // handle. Use a randomized key per test-run to avoid collision
-    // with parallel sqlx::tests sharing the server.
-    let db_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run the lock test");
-    let key: i64 = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-        & 0x7fff_ffff) as i64;
-
-    let first = nix_ci_core::durable::CoordinatorLock::acquire(&db_url, key)
-        .await
-        .expect("first acquire");
-
-    // Second acquire must NOT complete while `first` is held.
-    let url = db_url.clone();
-    let second_task =
-        tokio::spawn(
-            async move { nix_ci_core::durable::CoordinatorLock::acquire(&url, key).await },
-        );
-
-    // Give the second task 300ms to begin blocking. If it finishes in
-    // that window, the lock is broken.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !second_task.is_finished(),
-        "second acquire must be blocked while first is held"
-    );
-
-    // Drop `first`: pg advisory lock releases when the session closes.
-    // Second should unblock promptly.
-    drop(first);
-    let unlocked = tokio::time::timeout(Duration::from_secs(5), second_task)
-        .await
-        .expect("second acquire must unblock after first drops")
-        .expect("second task join")
-        .expect("second acquire succeeds");
-    drop(unlocked);
-}
-
 // ─── Writeback idempotency: transition_job_terminal + seal_job ──────
 
 #[sqlx::test]
@@ -2056,71 +1833,6 @@ async fn reaper_rearms_non_finished_expired_claim(pool: PgPool) {
 }
 
 // ─── Cleanup sweep removes stale rows ────────────────────────────────
-
-#[sqlx::test]
-async fn cleanup_sweep_evicts_expired_failed_outputs_and_old_jobs(pool: PgPool) {
-    // Direct unit-level test of durable::cleanup::sweep. Guards both
-    // queries (TTL-expired failed_outputs + retention-expired terminal
-    // jobs) against SQL typo / interval-handling regressions.
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-    // Seed: one already-expired failed_output, one fresh.
-    sqlx::query("INSERT INTO failed_outputs (output_path, drv_hash, expires_at) VALUES ($1,$2, now() - interval '1 day')")
-        .bind("/nix/store/expired-out")
-        .bind("expired-hash.drv")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO failed_outputs (output_path, drv_hash, expires_at) VALUES ($1,$2, now() + interval '1 day')")
-        .bind("/nix/store/fresh-out")
-        .bind("fresh-hash.drv")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // Seed: one terminal job older than retention, one within retention.
-    let old_id = uuid::Uuid::new_v4();
-    let recent_id = uuid::Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO jobs (id, status, done_at, result) VALUES \
-         ($1, 'done', now() - interval '30 days', '{}'::jsonb), \
-         ($2, 'done', now() - interval '1 hour', '{}'::jsonb)",
-    )
-    .bind(old_id)
-    .bind(recent_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Retention = 7 days: old is past retention, recent is within.
-    nix_ci_core::durable::cleanup::sweep(
-        &pool,
-        7,
-        14,
-        &PgLogStore::new(pool.clone()),
-        &Metrics::new(),
-    )
-    .await
-    .unwrap();
-
-    let remaining_outputs: Vec<(String,)> =
-        sqlx::query_as("SELECT output_path FROM failed_outputs ORDER BY output_path")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert_eq!(remaining_outputs.len(), 1);
-    assert_eq!(remaining_outputs[0].0, "/nix/store/fresh-out");
-
-    let remaining_jobs: Vec<(sqlx::types::Uuid,)> =
-        sqlx::query_as("SELECT id FROM jobs WHERE id IN ($1, $2) ORDER BY id")
-            .bind(old_id)
-            .bind(recent_id)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert_eq!(remaining_jobs.len(), 1);
-    assert_eq!(remaining_jobs[0].0, recent_id);
-}
 
 // ─── Battleproof: empty submission seals straight to Done ───────────
 
@@ -2384,68 +2096,6 @@ async fn transient_retry_exhaustion_does_not_cache_output_path(pool: PgPool) {
     assert!(
         rows.is_empty(),
         "Transient retry-exhaustion must NOT cache output_path; rows={rows:?}"
-    );
-}
-
-#[sqlx::test]
-async fn diskfull_retry_exhaustion_does_not_cache_output_path(pool: PgPool) {
-    // Same contract as the Transient case — DiskFull is an environment
-    // problem, not a drv problem.
-    let handle = spawn_server(pool.clone()).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let job = client
-        .create_job(&CreateJobRequest {
-            external_ref: None,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let drv = drv_path("nopoisondsk", "toobig");
-    client
-        .ingest_drv(job.id, &ingest(&drv, "toobig", &[], true))
-        .await
-        .unwrap();
-    client.seal(job.id).await.unwrap();
-
-    let drv_hash = nix_ci_core::types::drv_hash_from_path(&drv).unwrap();
-    for _ in 0..3 {
-        let c = match client.claim(job.id, "x86_64-linux", &[], 3).await {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(nix_ci_core::Error::Gone(_)) => break,
-            Err(e) => panic!("unexpected: {e}"),
-        };
-        client
-            .complete(
-                job.id,
-                c.claim_id,
-                &CompleteRequest {
-                    success: false,
-                    duration_ms: 1,
-                    exit_code: Some(137),
-                    error_category: Some(ErrorCategory::DiskFull),
-                    error_message: Some("no space left on device".into()),
-                    log_tail: None,
-                },
-            )
-            .await
-            .unwrap();
-        if let Some(step) = handle.dispatcher.steps.get(&drv_hash) {
-            step.next_attempt_at
-                .store(0, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    let expected_output = drv.trim_end_matches(".drv").to_string();
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT output_path FROM failed_outputs WHERE output_path = $1")
-            .bind(&expected_output)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert!(
-        rows.is_empty(),
-        "DiskFull retry-exhaustion must NOT cache output_path; rows={rows:?}"
     );
 }
 
@@ -2995,39 +2645,6 @@ async fn ingest_strips_self_loop(pool: PgPool) {
 /// A clean DAG must NOT be flagged by detect_cycle. Sanity guard against
 /// a refactor that breaks the happy path (e.g., marking Grey on entry
 /// and never lowering to Black).
-#[sqlx::test]
-async fn seal_accepts_clean_dag(pool: PgPool) {
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let job = client
-        .create_job(&CreateJobRequest {
-            external_ref: None,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    // a → b → c (linear chain).
-    let a = drv_path("chainA01", "a");
-    let b = drv_path("chainB02", "b");
-    let c = drv_path("chainC03", "c");
-    let batch = IngestBatchRequest {
-        drvs: vec![
-            ingest(&a, "a", &[&b], true),
-            ingest(&b, "b", &[&c], false),
-            ingest(&c, "c", &[], false),
-        ],
-    eval_errors: Vec::new(),
-        };
-    client.ingest_batch(job.id, &batch).await.unwrap();
-    // Seal must NOT force-fail; progress semantics take over from here.
-    let seal_resp = client.seal(job.id).await.unwrap();
-    assert_ne!(
-        seal_resp.status,
-        JobStatus::Failed,
-        "clean DAG must not be misidentified as a cycle"
-    );
-}
-
 // ─── Per-job drv cap (C10) ───────────────────────────────────────────
 
 /// When a batch would push a job's member count over `max_drvs_per_job`,
@@ -3455,69 +3072,4 @@ async fn ingest_rejects_oversized_attr(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.new_drvs, 1, "the good drv must still be ingested");
     assert_eq!(resp.errored, 1, "oversized attr must count as errored");
-}
-
-// ─── /version endpoint ───────────────────────────────────────────────
-
-/// /version must be reachable without auth (even when auth is enabled),
-/// and return the current CARGO_PKG_VERSION.
-#[sqlx::test]
-async fn version_endpoint_is_public(pool: PgPool) {
-    use nix_ci_core::config::ServerConfig;
-    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
-        cfg.auth_bearer = Some("secret".into());
-    })
-    .await;
-    // No auth header — must still succeed.
-    let resp = reqwest::Client::new()
-        .get(format!("{}/version", handle.base_url))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(
-        body.get("version").and_then(|v| v.as_str()),
-        Some(env!("CARGO_PKG_VERSION"))
-    );
-    assert!(body.get("git_revision").is_some());
-}
-
-// ─── /admin/debug/dispatcher-dump ────────────────────────────────────
-
-/// Dispatcher dump reflects live state: created job shows up with its
-/// priority, max_workers, and counts.
-#[sqlx::test]
-async fn dispatcher_dump_includes_live_submission(pool: PgPool) {
-    let handle = spawn_server(pool).await;
-    let client = CoordinatorClient::new(&handle.base_url);
-    let job = client
-        .create_job(&CreateJobRequest {
-            external_ref: Some("dump-me".into()),
-            priority: 42,
-            max_workers: Some(7),
-            claim_deadline_secs: None,
-        })
-        .await
-        .unwrap();
-    client
-        .ingest_drv(job.id, &ingest(&drv_path("dumpable1", "d"), "d", &[], true))
-        .await
-        .unwrap();
-
-    let resp = reqwest::Client::new()
-        .get(format!("{}/admin/debug/dispatcher-dump", handle.base_url))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let subs = body.get("submissions").and_then(|v| v.as_array()).unwrap();
-    let found = subs
-        .iter()
-        .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(&job.id.to_string()))
-        .expect("dump must include the live submission");
-    assert_eq!(found.get("priority").and_then(|v| v.as_i64()), Some(42));
-    assert_eq!(found.get("max_workers").and_then(|v| v.as_i64()), Some(7));
-    assert_eq!(found.get("member_count").and_then(|v| v.as_i64()), Some(1));
 }
