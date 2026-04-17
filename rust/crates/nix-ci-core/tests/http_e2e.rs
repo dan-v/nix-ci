@@ -250,7 +250,20 @@ async fn failure_propagates_to_dependents(pool: PgPool) {
 
 #[sqlx::test]
 async fn retryable_failure_retries_then_succeeds(pool: PgPool) {
-    let handle = spawn_server(pool).await;
+    // Configure a zero-duration retry backoff so the test observes
+    // the retry via the public API without poking `step.next_attempt_at`
+    // directly. With backoff=0, the second claim is immediately
+    // eligible after the transient failure is recorded.
+    //
+    // The old version mutated the in-memory step's next_attempt_at to
+    // bypass the default 30s backoff — a COMPLIANCE anti-pattern
+    // (audit H15.C): the test was proving "if we reach inside and
+    // flip a field, the retry works" rather than "the retry works as
+    // exposed by the API under a valid config."
+    let handle = common::spawn_server_with_cfg(pool, |cfg| {
+        cfg.flaky_retry_backoff_step_ms = 0;
+    })
+    .await;
     let client = CoordinatorClient::new(&handle.base_url);
 
     let job = client
@@ -289,15 +302,8 @@ async fn retryable_failure_retries_then_succeeds(pool: PgPool) {
         .await
         .unwrap();
 
-    // The drv is now in retry backoff. Bypass it so the test doesn't
-    // wait 30s — backoff lives in-memory only, no DB row to reset.
-    let dispatcher = handle.dispatcher.clone();
-    let drv_hash = nix_ci_core::types::drv_hash_from_path(&drv).unwrap();
-    let step = dispatcher.steps.get(&drv_hash).unwrap();
-    step.next_attempt_at
-        .store(0, std::sync::atomic::Ordering::Release);
-
-    // Next claim → succeed
+    // Next claim → succeed (backoff=0 means the retry is immediately
+    // eligible; no internal poke needed).
     let c = client
         .claim(job.id, "x86_64-linux", &[], 5)
         .await
