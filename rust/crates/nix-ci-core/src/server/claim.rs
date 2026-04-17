@@ -287,8 +287,6 @@ pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<Cla
             // Wall-clock deadline: if the deadline already passed,
             // the reaper hasn't run yet — Utc::now() + 0 is honest.
             let remaining = c.deadline.lock().saturating_duration_since(now);
-            let wall_deadline = Utc::now()
-                + chrono::Duration::from_std(remaining).unwrap_or(chrono::Duration::zero());
             ActiveClaimSummary {
                 claim_id: c.claim_id,
                 job_id: c.job_id,
@@ -297,7 +295,7 @@ pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<Cla
                 worker_id: c.worker_id.clone(),
                 claimed_at: c.started_at_wall,
                 elapsed_ms: elapsed,
-                deadline: wall_deadline,
+                deadline: wall_deadline(remaining),
             }
         })
         .collect();
@@ -430,10 +428,8 @@ pub async fn extend_claim(
     };
     state.metrics.inner.claim_lease_extensions.inc();
     let remaining = new_deadline.saturating_duration_since(now);
-    let wall_deadline = Utc::now()
-        + chrono::Duration::from_std(remaining).unwrap_or(chrono::Duration::zero());
     Ok(Json(crate::types::ExtendClaimResponse {
-        deadline: wall_deadline,
+        deadline: wall_deadline(remaining),
     }))
 }
 
@@ -451,6 +447,15 @@ fn validate_worker_id(worker_id: &Option<String>, max_bytes: usize) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Convert a remaining `Duration` into a wall-clock deadline anchored
+/// at `Utc::now()`. `chrono::Duration::from_std` only fails when the
+/// input overflows ~292 billion years, so the zero fallback is a pure
+/// belt-and-suspenders: in practice this reduces to `Utc::now() +
+/// duration`, just expressed as `chrono::Duration`.
+fn wall_deadline(remaining: Duration) -> chrono::DateTime<Utc> {
+    Utc::now() + chrono::Duration::from_std(remaining).unwrap_or(chrono::Duration::zero())
 }
 
 fn issue_claim(
@@ -471,8 +476,7 @@ fn issue_claim(
         .claim_deadline_secs
         .unwrap_or(state.cfg.claim_deadline_secs);
     let deadline_duration = Duration::from_secs(deadline_secs);
-    let wall_deadline =
-        Utc::now() + chrono::Duration::from_std(deadline_duration).unwrap_or_default();
+    let wall_deadline_dt = wall_deadline(deadline_duration);
 
     let now = Instant::now();
     let now_wall = Utc::now();
@@ -514,7 +518,7 @@ fn issue_claim(
         drv_hash: step.drv_hash().clone(),
         drv_path: step.drv_path().to_string(),
         attempt,
-        deadline: wall_deadline,
+        deadline: wall_deadline_dt,
     })
     .into_response())
 }
