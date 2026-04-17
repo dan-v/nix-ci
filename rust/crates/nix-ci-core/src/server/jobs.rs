@@ -56,6 +56,31 @@ pub async fn seal(
     if !writeback::seal_job(&state.pool, id).await? {
         return Err(Error::NotFound(format!("job {id}")));
     }
+
+    // Cycle detection (C2). The graph is immutable from here on
+    // (ingest rejects post-seal via `reject_if_terminal`) so one pass
+    // is authoritative. A cycle means no progress will ever be made —
+    // every step in the cycle sits runnable=false forever — so we fail
+    // the job with a clear cause rather than silently stalling until
+    // the heartbeat reaper cancels it.
+    if let Some(cycle) = sub.detect_cycle() {
+        let preview: Vec<String> = cycle
+            .iter()
+            .take(5)
+            .map(|h| h.as_str().to_string())
+            .collect();
+        let reason = format!(
+            "dep_cycle: {} drv(s) on the cycle (showing up to 5): [{}]",
+            cycle.len(),
+            preview.join(", ")
+        );
+        tracing::warn!(job_id = %id, cycle_len = cycle.len(), "seal rejected: dep cycle");
+        auto_fail_on_seal(&state, id, &reason).await?;
+        return Ok(Json(SealJobResponse {
+            status: JobStatus::Failed,
+        }));
+    }
+
     // Sealing a submission whose toplevels are already terminal —
     // including the empty-toplevels case — must transition to Done
     // immediately or the client waits forever.
@@ -63,6 +88,32 @@ pub async fn seal(
     Ok(Json(SealJobResponse {
         status: sub.live_status(),
     }))
+}
+
+/// Shared auto-fail path used by seal-time cycle detection (and any
+/// future seal-time validation failure). Persists a terminal snapshot
+/// with `eval_error` set, removes the submission, and publishes
+/// `JobDone` so any subscribers (SSE, long-poll claims) wake up.
+async fn auto_fail_on_seal(state: &AppState, id: JobId, reason: &str) -> Result<()> {
+    let snapshot = JobStatusResponse {
+        id,
+        status: JobStatus::Failed,
+        sealed: true,
+        counts: JobCounts::default(),
+        failures: Vec::new(),
+        eval_error: Some(reason.to_string()),
+    };
+    let snapshot_json = serde_json::to_value(&snapshot)
+        .map_err(|e| Error::Internal(format!("serialize seal-fail snapshot: {e}")))?;
+    let _ = writeback::transition_job_terminal(
+        &state.pool,
+        id,
+        JobStatus::Failed.as_str(),
+        &snapshot_json,
+    )
+    .await?;
+    finish_in_memory(state, id, JobStatus::Failed, Vec::new());
+    Ok(())
 }
 
 pub async fn fail(

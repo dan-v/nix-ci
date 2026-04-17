@@ -231,6 +231,96 @@ impl Submission {
         c
     }
 
+    /// Walk the dep graph rooted at `toplevels` and return a cycle if
+    /// one exists. Iterative DFS with 3-color marking (White / Grey /
+    /// Black). A Grey→Grey edge is a back-edge = cycle. Returns the
+    /// `drv_hash`es on the cycle (closed path) in reverse DFS order, or
+    /// `None` if the graph is acyclic.
+    ///
+    /// Called at seal time. O(V+E). We hold `members.read()` for the
+    /// duration so no ingest can sneak in a new edge mid-scan — but
+    /// since seal is already exclusive with `reject_if_terminal` this
+    /// is a belt-and-suspenders measure.
+    pub fn detect_cycle(&self) -> Option<Vec<DrvHash>> {
+        use std::collections::HashMap;
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Color {
+            White,
+            Grey,
+            Black,
+        }
+        let tops = self.toplevels.read();
+        if tops.is_empty() {
+            return None;
+        }
+        // Snapshot members + their dep sets under one lock acquisition
+        // so the DFS doesn't re-take Step::state locks per visit. The
+        // snapshot is just drv_hash → Vec<drv_hash>.
+        let members = self.members.read();
+        let mut adj: HashMap<DrvHash, Vec<DrvHash>> = HashMap::with_capacity(members.len());
+        for (hash, step) in members.iter() {
+            let deps = step
+                .state
+                .read()
+                .deps
+                .iter()
+                .map(|dep| dep.drv_hash().clone())
+                .collect();
+            adj.insert(hash.clone(), deps);
+        }
+        drop(members);
+        let mut color: HashMap<DrvHash, Color> =
+            adj.keys().map(|k| (k.clone(), Color::White)).collect();
+        let mut parent: HashMap<DrvHash, DrvHash> = HashMap::new();
+
+        for top in tops.iter() {
+            let start = top.drv_hash().clone();
+            if color.get(&start).copied() != Some(Color::White) {
+                continue;
+            }
+            // Iterative DFS. The stack stores (node, next_dep_ix) so we
+            // don't borrow across iterations.
+            let mut stack: Vec<(DrvHash, usize)> = vec![(start.clone(), 0)];
+            color.insert(start, Color::Grey);
+            while let Some((node, ix)) = stack.last().cloned() {
+                let deps = adj.get(&node).cloned().unwrap_or_default();
+                if ix >= deps.len() {
+                    color.insert(node, Color::Black);
+                    stack.pop();
+                    continue;
+                }
+                if let Some(last) = stack.last_mut() {
+                    last.1 = ix + 1;
+                }
+                let dep = deps[ix].clone();
+                match color.get(&dep).copied().unwrap_or(Color::White) {
+                    Color::White => {
+                        color.insert(dep.clone(), Color::Grey);
+                        parent.insert(dep.clone(), node.clone());
+                        stack.push((dep, 0));
+                    }
+                    Color::Grey => {
+                        // Back-edge: node → dep and dep is an ancestor.
+                        // Reconstruct cycle: dep ← ... ← node ← dep.
+                        let mut cycle = vec![dep.clone()];
+                        let mut cur = node.clone();
+                        while cur != dep {
+                            cycle.push(cur.clone());
+                            match parent.get(&cur) {
+                                Some(p) => cur = p.clone(),
+                                None => break, // defensive; shouldn't happen
+                            }
+                        }
+                        cycle.push(dep);
+                        return Some(cycle);
+                    }
+                    Color::Black => { /* fully-explored; no cycle via this edge */ }
+                }
+            }
+        }
+        None
+    }
+
     /// Compute live status from the toplevels. `Done` / `Failed` only
     /// emerge from a sealed submission whose roots are all finished;
     /// an unsealed submission is always Pending / Building regardless
@@ -385,6 +475,120 @@ mod tests {
         assert!(matches!(building[0].observable_state(), DrvState::Building));
         assert!(matches!(done[0].observable_state(), DrvState::Done));
         assert!(matches!(failed[0].observable_state(), DrvState::Failed));
+    }
+
+    // ─── Cycle detection (C2) ───────────────────────────────────
+
+    fn attach_dep_for_test(parent: &Arc<Step>, dep: &Arc<Step>) {
+        parent
+            .state
+            .write()
+            .deps
+            .insert(crate::dispatch::step::StepHandle(dep.clone()));
+    }
+
+    #[test]
+    fn detect_cycle_empty_graph_is_none() {
+        let sub = Submission::new(JobId::new(), 8);
+        assert!(sub.detect_cycle().is_none());
+    }
+
+    #[test]
+    fn detect_cycle_pure_dag_is_none() {
+        // a → b → c (linear), and a → c (direct). No cycle.
+        let sub = Submission::new(JobId::new(), 8);
+        let a = mk_step("a");
+        let b = mk_step("b");
+        let c = mk_step("c");
+        for s in [&a, &b, &c] {
+            sub.add_member(s);
+        }
+        sub.add_root(a.clone());
+        attach_dep_for_test(&a, &b);
+        attach_dep_for_test(&b, &c);
+        attach_dep_for_test(&a, &c);
+        assert!(sub.detect_cycle().is_none());
+    }
+
+    #[test]
+    fn detect_cycle_simple_two_node_cycle() {
+        // a → b → a
+        let sub = Submission::new(JobId::new(), 8);
+        let a = mk_step("a");
+        let b = mk_step("b");
+        sub.add_member(&a);
+        sub.add_member(&b);
+        sub.add_root(a.clone());
+        attach_dep_for_test(&a, &b);
+        attach_dep_for_test(&b, &a);
+        let cycle = sub.detect_cycle().expect("cycle should be detected");
+        // The reported cycle must contain both a and b (exact ordering
+        // depends on DFS traversal but both must be present, at least
+        // one repeat as the closing edge).
+        let hashes: std::collections::HashSet<_> = cycle.iter().collect();
+        assert!(hashes.len() >= 2, "cycle must touch ≥ 2 distinct drvs");
+    }
+
+    #[test]
+    fn detect_cycle_deep_chain_closing() {
+        // a → b → c → d → b (cycle inside the chain)
+        let sub = Submission::new(JobId::new(), 8);
+        let a = mk_step("a");
+        let b = mk_step("b");
+        let c = mk_step("c");
+        let d = mk_step("d");
+        for s in [&a, &b, &c, &d] {
+            sub.add_member(s);
+        }
+        sub.add_root(a.clone());
+        attach_dep_for_test(&a, &b);
+        attach_dep_for_test(&b, &c);
+        attach_dep_for_test(&c, &d);
+        attach_dep_for_test(&d, &b);
+        let cycle = sub.detect_cycle().expect("cycle should be detected");
+        assert!(cycle.len() >= 3, "chain-closing cycle must show ≥ 3 nodes");
+    }
+
+    #[test]
+    fn detect_cycle_disjoint_components() {
+        // Component 1 (a → b): clean. Component 2 (c → d → c): cycle.
+        // Both toplevels; detection must find the cycle.
+        let sub = Submission::new(JobId::new(), 8);
+        let a = mk_step("a");
+        let b = mk_step("b");
+        let c = mk_step("c");
+        let d = mk_step("d");
+        for s in [&a, &b, &c, &d] {
+            sub.add_member(s);
+        }
+        sub.add_root(a.clone());
+        sub.add_root(c.clone());
+        attach_dep_for_test(&a, &b);
+        attach_dep_for_test(&c, &d);
+        attach_dep_for_test(&d, &c);
+        assert!(sub.detect_cycle().is_some());
+    }
+
+    #[test]
+    fn detect_cycle_diamond_is_not_a_cycle() {
+        // Two paths from a to d via b and c. Not a cycle.
+        let sub = Submission::new(JobId::new(), 8);
+        let a = mk_step("a");
+        let b = mk_step("b");
+        let c = mk_step("c");
+        let d = mk_step("d");
+        for s in [&a, &b, &c, &d] {
+            sub.add_member(s);
+        }
+        sub.add_root(a.clone());
+        attach_dep_for_test(&a, &b);
+        attach_dep_for_test(&a, &c);
+        attach_dep_for_test(&b, &d);
+        attach_dep_for_test(&c, &d);
+        assert!(
+            sub.detect_cycle().is_none(),
+            "diamond DAGs must not be flagged as cycles"
+        );
     }
 
     #[test]

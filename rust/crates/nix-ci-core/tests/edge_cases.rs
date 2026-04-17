@@ -2646,6 +2646,120 @@ async fn admin_snapshot_counts_scale_linearly_with_members(pool: PgPool) {
     assert_eq!(status.counts.pending, 3);
 }
 
+// ─── Dep-cycle detection at seal (C2) ────────────────────────────────
+
+/// A cyclic dep graph (a → b → a) must fail the job at seal time with a
+/// clean `dep_cycle` cause. Without this, both steps sit forever with
+/// runnable=false — workers never claim them, the job stalls, eventually
+/// the heartbeat reaper cancels it with an uninformative sentinel.
+#[sqlx::test]
+async fn seal_rejects_dep_cycle(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let a = drv_path("cyclea", "a");
+    let b = drv_path("cycleb", "b");
+    // Ingest A depending on B, and B depending on A. Each ingest phase
+    // creates the placeholder for the other, so we need both rows in
+    // the same batch to wire the back-edge.
+    let batch = IngestBatchRequest {
+        drvs: vec![
+            ingest(&a, "a", &[&b], true),
+            ingest(&b, "b", &[&a], false),
+        ],
+    };
+    client.ingest_batch(job.id, &batch).await.unwrap();
+
+    // Seal must fail the job immediately (without stalling) with
+    // eval_error naming dep_cycle.
+    let seal_resp = client.seal(job.id).await.unwrap();
+    assert_eq!(seal_resp.status, JobStatus::Failed);
+
+    let status = client.status(job.id).await.unwrap();
+    assert_eq!(status.status, JobStatus::Failed);
+    assert!(
+        status
+            .eval_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("dep_cycle"),
+        "expected dep_cycle cause, got: {:?}",
+        status.eval_error
+    );
+}
+
+/// Self-loop (a drv that lists itself as an input) must be stripped at
+/// ingest time — the edge is rejected, the drv itself still enters the
+/// graph with no deps and is thus immediately runnable. The batch
+/// response reports `errored=1` for the rejected edge so the submitter
+/// can log it. Without this guard, `attach_dep(parent, parent)` would
+/// stick the step's own handle into its own deps set, wedging it
+/// forever as unrunnable.
+#[sqlx::test]
+async fn ingest_strips_self_loop(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    let a = drv_path("selfloopX", "a");
+    let resp = client
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: vec![ingest(&a, "a", &[&a], true)],
+            },
+        )
+        .await
+        .unwrap();
+    // The drv itself was accepted (it's still a real drv that can be
+    // built); only the self-loop edge was rejected.
+    assert_eq!(resp.new_drvs, 1);
+    assert_eq!(resp.errored, 1, "self-loop edge must count as an error");
+
+    // And the step is runnable (a worker can claim it) — proving the
+    // bad edge didn't wedge it.
+    client.seal(job.id).await.unwrap();
+    let claim = client.claim(job.id, "x86_64-linux", &[], 2).await.unwrap();
+    assert!(claim.is_some(), "self-loop-stripped drv must be claimable");
+}
+
+/// A clean DAG must NOT be flagged by detect_cycle. Sanity guard against
+/// a refactor that breaks the happy path (e.g., marking Grey on entry
+/// and never lowering to Black).
+#[sqlx::test]
+async fn seal_accepts_clean_dag(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest { external_ref: None })
+        .await
+        .unwrap();
+    // a → b → c (linear chain).
+    let a = drv_path("chainA01", "a");
+    let b = drv_path("chainB02", "b");
+    let c = drv_path("chainC03", "c");
+    let batch = IngestBatchRequest {
+        drvs: vec![
+            ingest(&a, "a", &[&b], true),
+            ingest(&b, "b", &[&c], false),
+            ingest(&c, "c", &[], false),
+        ],
+    };
+    client.ingest_batch(job.id, &batch).await.unwrap();
+    // Seal must NOT force-fail; progress semantics take over from here.
+    let seal_resp = client.seal(job.id).await.unwrap();
+    assert_ne!(
+        seal_resp.status,
+        JobStatus::Failed,
+        "clean DAG must not be misidentified as a cycle"
+    );
+}
+
 // ─── Per-job drv cap (C10) ───────────────────────────────────────────
 
 /// When a batch would push a job's member count over `max_drvs_per_job`,

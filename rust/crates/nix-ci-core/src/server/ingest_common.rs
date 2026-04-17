@@ -36,6 +36,15 @@ pub(super) fn wire_dep(
 ) -> crate::error::Result<()> {
     let dep_hash = drv_hash_from_path(dep_path)
         .ok_or_else(|| crate::Error::BadRequest(format!("bad input drv_path: {dep_path}")))?;
+    // Cheap self-loop guard. The post-seal cycle scan catches longer
+    // cycles (A→B→A etc.); this anchor prevents the simplest bad input
+    // from ever entering the graph and reaching `attach_dep` with
+    // parent == dep (which would wedge a step forever).
+    if parent.drv_hash() == &dep_hash {
+        return Err(crate::Error::BadRequest(format!(
+            "self-loop: drv {dep_path} depends on itself"
+        )));
+    }
     let (dep, _) = state.dispatcher.steps.get_or_create(&dep_hash, || {
         Step::new(
             dep_hash.clone(),

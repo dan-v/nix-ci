@@ -46,6 +46,19 @@ pub async fn submit_batch(
         .submissions
         .get_or_insert(id, state.cfg.submission_event_capacity);
 
+    // Secondary seal-check against the in-memory flag. `reject_if_terminal`
+    // reads the DB; a seal call that already flipped the in-memory flag
+    // but hasn't written to Postgres yet would slip past it. Catching
+    // this narrows (but does not eliminate) the ingest-vs-seal race
+    // around cycle detection — a racing ingest can still land between
+    // seal's check and writeback. That residual race is acceptable:
+    // cycle detection is a safety net, not a hard consistency boundary.
+    if sub.is_sealed() {
+        return Err(crate::Error::Gone(format!(
+            "job {id} is sealed; no further ingest accepted"
+        )));
+    }
+
     // Hard drv-cap. Runaway evals (10M-drv flake bug, accidental infinite
     // expansion) would OOM the coordinator long before they complete; a
     // cheap `members.len()` upper-bound check catches them at the first
