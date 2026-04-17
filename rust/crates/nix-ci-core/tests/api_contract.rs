@@ -190,19 +190,19 @@ async fn concurrent_seal_is_idempotent(pool: PgPool) {
         "4 concurrent seals: all must succeed; got {ok_count} ok / {err_count} err"
     );
 
-    // Exactly one terminal-transition counter tick, not four.
-    let counter = handle
-        .dispatcher
-        .metrics
-        .inner
-        .jobs_terminal
-        .get_or_create(&nix_ci_core::observability::metrics::TerminalLabels {
-            status: "done".into(),
-        })
-        .get();
+    // Exactly one terminal-transition counter tick on /metrics,
+    // not four. Scraped through the observable surface so any
+    // regression in how metrics are EXPOSED (label order, name
+    // suffixing, missing registration) also trips the test.
+    let counter = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_jobs_terminal_total",
+        &[("status", "done")],
+    )
+    .await;
     assert_eq!(
-        counter, 1,
-        "exactly one jobs_terminal{{status=done}} tick; got {counter}"
+        counter, 1.0,
+        "exactly one jobs_terminal{{status=done}} tick on /metrics; got {counter}"
     );
 }
 
@@ -274,16 +274,15 @@ async fn complete_retry_is_idempotent_even_at_metric_level(pool: PgPool) {
         .unwrap()
         .expect("claim");
 
-    // Baseline counter.
-    let counter_before = handle
-        .dispatcher
-        .metrics
-        .inner
-        .builds_completed
-        .get_or_create(&nix_ci_core::observability::metrics::OutcomeLabels {
-            outcome: "success".into(),
-        })
-        .get();
+    // Baseline counter from /metrics (not present == 0 — counters
+    // only emit once incremented).
+    let counter_before = common::scrape_metric(
+        &handle.base_url,
+        "nix_ci_builds_completed_total",
+        &[("outcome", "success")],
+    )
+    .await
+    .unwrap_or(0.0);
 
     for i in 0..3 {
         let resp = client
@@ -311,19 +310,16 @@ async fn complete_retry_is_idempotent_even_at_metric_level(pool: PgPool) {
         }
     }
 
-    let counter_after = handle
-        .dispatcher
-        .metrics
-        .inner
-        .builds_completed
-        .get_or_create(&nix_ci_core::observability::metrics::OutcomeLabels {
-            outcome: "success".into(),
-        })
-        .get();
+    let counter_after = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_builds_completed_total",
+        &[("outcome", "success")],
+    )
+    .await;
     assert_eq!(
         counter_after - counter_before,
-        1,
-        "3 complete retries must produce exactly 1 success increment"
+        1.0,
+        "3 complete retries must produce exactly 1 success increment on /metrics"
     );
 }
 

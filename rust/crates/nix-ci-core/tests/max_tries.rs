@@ -12,7 +12,6 @@
 //! whether the step became ready via initial ingest, handle_failure
 //! retry, or reaper re-arm.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use nix_ci_core::client::CoordinatorClient;
@@ -88,14 +87,6 @@ async fn exhausted_step_terminal_fails_on_next_claim(pool: PgPool) {
         handle.dispatcher.claims.insert(claim);
     }
     nix_ci_core::durable::reaper::reap_expired_claims(&handle.dispatcher);
-    // Verify step.tries == 1 (from the first claim), step not finished yet.
-    let step = handle
-        .dispatcher
-        .steps
-        .get(&nix_ci_core::types::drv_hash_from_path(&drv).unwrap())
-        .expect("step in registry");
-    assert_eq!(step.tries.load(Ordering::Acquire), 1);
-    assert!(!step.finished.load(Ordering::Acquire));
 
     // Attempt 2: next claim pops the re-armed step, sees tries >=
     // max_tries, and terminal-fails rather than issuing. The worker's
@@ -106,26 +97,20 @@ async fn exhausted_step_terminal_fails_on_next_claim(pool: PgPool) {
         // Job may transition terminal between the pop and the next loop
         // iteration — either "nothing to claim" (204 → None) or "job is
         // terminal" (410 → Err::Gone) is acceptable. The invariant we
-        // care about: the step did NOT get another claim issued.
+        // care about: the step did NOT get another claim issued. We
+        // verify that observationally below via the job's terminal
+        // status and failure record — avoiding direct reads of the
+        // dispatcher's in-memory step flags (which would test the
+        // shape instead of the contract).
         Ok(None) | Err(nix_ci_core::Error::Gone(_)) => {}
         Ok(Some(c)) => panic!("exhausted step must not issue another claim; got {:?}", c),
         Err(e) => panic!("unexpected error: {e}"),
     }
 
-    // Step is now finished + previous_failure.
-    assert!(
-        step.finished.load(Ordering::Acquire),
-        "exhausted step must be marked finished after the triggering claim attempt"
-    );
-    assert!(
-        step.previous_failure.load(Ordering::Acquire),
-        "exhausted step must be marked previous_failure"
-    );
-
     // Job converges to Failed with a failure record matching the drv.
-    // The terminal writeback happens inside the claim handler (via
-    // check_and_publish_terminal); polling with a small retry lets us
-    // tolerate scheduler jitter without sleep-based flakiness.
+    // This is the observable proof that the step terminal-failed:
+    // the JobStatus snapshot is how a CCI client actually learns the
+    // outcome, and DrvFailure in `failures` is how it learns WHY.
     let status = poll_until_terminal(&client, job.id).await;
     assert_eq!(status.status, JobStatus::Failed);
     assert_eq!(status.failures.len(), 1);
@@ -140,19 +125,15 @@ async fn exhausted_step_terminal_fails_on_next_claim(pool: PgPool) {
         f.error_message
     );
 
-    // And the ops counter increments.
-    let outcome_label =
-        nix_ci_core::observability::metrics::OutcomeLabels {
-            outcome: "max_retries_exceeded".into(),
-        };
-    let n = handle
-        .dispatcher
-        .metrics
-        .inner
-        .builds_completed
-        .get_or_create(&outcome_label)
-        .get();
-    assert_eq!(n, 1, "exactly one max_retries_exceeded recorded");
+    // And the ops counter increments — scraped via /metrics so we
+    // test the Prometheus contract, not the in-memory shape.
+    let n = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_builds_completed_total",
+        &[("outcome", "max_retries_exceeded")],
+    )
+    .await;
+    assert_eq!(n, 1.0, "exactly one max_retries_exceeded on /metrics");
 }
 
 /// Max_tries enforcement must also fire on the fleet-claim endpoint.

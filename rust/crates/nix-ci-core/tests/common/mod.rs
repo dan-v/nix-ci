@@ -132,3 +132,95 @@ pub fn ingest(
         attr: None,
     }
 }
+
+/// Scrape the coordinator's `/metrics` endpoint and return the value
+/// of a specific metric (with optional label-set match). The value
+/// comes from the wire format Prometheus would see — not from a
+/// direct read of `dispatcher.metrics.inner.*.get()`, which the
+/// H15 audits flagged as COMPLIANCE (testing the internal shape
+/// instead of the observable contract).
+///
+/// - `name` is the wire metric name including any `_total` suffix
+///   OpenMetrics adds (e.g. `nix_ci_jobs_reaped_total`,
+///   `nix_ci_claims_in_flight`).
+/// - `labels` is a Vec of `(key, value)` pairs the metric line must
+///   match. Empty for unlabeled metrics. Order-insensitive.
+///
+/// Returns `None` if the metric isn't present (counter at 0 isn't
+/// written in OpenMetrics text format until incremented).
+#[allow(dead_code)]
+pub async fn scrape_metric(
+    base_url: &str,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<f64> {
+    let body = reqwest::get(format!("{base_url}/metrics"))
+        .await
+        .expect("scrape /metrics")
+        .text()
+        .await
+        .expect("read /metrics body");
+    for line in body.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        // Lines look like:
+        //   nix_ci_claims_in_flight 0
+        //   nix_ci_builds_completed_total{outcome="success"} 3
+        // Split into (metric-with-labels, value).
+        let (head, value) = match line.rsplit_once(' ') {
+            Some(x) => x,
+            None => continue,
+        };
+        let (metric_name, label_part) = match head.find('{') {
+            Some(idx) => {
+                let end = head.rfind('}')?;
+                (&head[..idx], Some(&head[idx + 1..end]))
+            }
+            None => (head, None),
+        };
+        if metric_name != name {
+            continue;
+        }
+        if !labels_match(label_part, labels) {
+            continue;
+        }
+        return value.parse::<f64>().ok();
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn labels_match(label_str: Option<&str>, want: &[(&str, &str)]) -> bool {
+    let have = label_str.unwrap_or("");
+    // Convert "k1=\"v1\",k2=\"v2\"" into a set. For our test use
+    // cases, values are always quoted with double quotes and there
+    // are no escapes inside.
+    let mut parsed: Vec<(&str, &str)> = Vec::new();
+    for part in have.split(',').filter(|s| !s.is_empty()) {
+        let (k, v) = match part.split_once('=') {
+            Some(x) => x,
+            None => return false,
+        };
+        let v = v.trim_matches('"');
+        parsed.push((k, v));
+    }
+    for (k, v) in want {
+        if !parsed.iter().any(|(pk, pv)| pk == k && pv == v) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Same as [`scrape_metric`] but panics with a helpful message when
+/// the metric is missing. Use when a zero-valued counter still has
+/// to be scraped — you'll get `Some(0.0)` on a labelled family once
+/// it's been incremented at least once.
+#[allow(dead_code)]
+pub async fn scrape_metric_expect(base_url: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
+    match scrape_metric(base_url, name, labels).await {
+        Some(v) => v,
+        None => panic!("metric {name}{labels:?} not present in /metrics output"),
+    }
+}

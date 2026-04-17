@@ -6,7 +6,6 @@
 //! worker, and the original worker's `/complete` would be discarded
 //! as `ignored:true` — a production incident attributable to nix-ci.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use nix_ci_core::client::CoordinatorClient;
@@ -114,16 +113,17 @@ async fn extend_keeps_claim_alive_past_original_deadline(pool: PgPool) {
         "after a lease extension the /complete MUST be accepted (ignored=false)"
     );
 
-    // And the lease-extension counter moved: ops dashboards watch this
-    // to distinguish "workers refreshing healthily" from "workers
-    // silently expiring".
-    let extensions = handle
-        .dispatcher
-        .metrics
-        .inner
-        .claim_lease_extensions
-        .get();
-    assert_eq!(extensions, 1, "exactly one extension recorded");
+    // And the lease-extension counter moved (scraped via /metrics so
+    // we test the observable ops-dashboard contract, not the internal
+    // in-memory gauge). The wire name gets `_total` appended by
+    // prometheus-client because it's a Counter.
+    let extensions = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_claim_lease_extensions_total",
+        &[],
+    )
+    .await;
+    assert_eq!(extensions, 1.0, "exactly one extension recorded on /metrics");
 }
 
 /// Without the extension, the reaper evicts the claim and a subsequent
@@ -288,15 +288,17 @@ async fn extend_after_complete_returns_gone(pool: PgPool) {
 
     // And no extension was counted (the Ok(None) branch increments
     // nothing — it's not an extension, it's a "stop refreshing" signal).
-    assert_eq!(
-        handle
-            .dispatcher
-            .metrics
-            .inner
-            .claim_lease_extensions
-            .get(),
-        0
-    );
+    // Counter registered at startup emits `0` on /metrics until its
+    // first increment, so the expected observation is exactly 0.0
+    // (not absent).
+    let counter = common::scrape_metric(
+        &handle.base_url,
+        "nix_ci_claim_lease_extensions_total",
+        &[],
+    )
+    .await
+    .unwrap_or(0.0);
+    assert_eq!(counter, 0.0, "Gone-extend must not increment the counter");
 }
 
 /// Plausibility check on the counter: each successful extend bumps
@@ -342,16 +344,17 @@ async fn extend_counter_increments_per_success(pool: PgPool) {
             .unwrap()
             .expect("still alive");
     }
-    let observed = handle
-        .dispatcher
-        .metrics
-        .inner
-        .claim_lease_extensions
-        .get();
+    // Scrape /metrics rather than reading the in-memory counter.
+    // Prometheus-client suffixes Counter metrics with `_total` on
+    // the wire.
+    let observed = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_claim_lease_extensions_total",
+        &[],
+    )
+    .await;
     assert_eq!(
-        observed, 5,
-        "counter must match the number of successful extends"
+        observed, 5.0,
+        "/metrics counter must match the number of successful extends"
     );
-    // Prevent an unused-import warning if Ordering drifts out of use.
-    let _ = Ordering::Relaxed;
 }

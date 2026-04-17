@@ -3,6 +3,15 @@
 //! its first comment line — so `spec_report.sh` (H14) can parse the
 //! file and prove "this bar has a test."
 //!
+//! All metric assertions go through the `/metrics` HTTP endpoint
+//! (via `common::scrape_metric`) — not direct reads of
+//! `dispatcher.metrics.inner.*.get()`. The audit flagged that as a
+//! COMPLIANCE anti-pattern: it tests the in-memory shape, not the
+//! observable Prometheus contract that alerts / dashboards actually
+//! consume. Regressions in how metrics are EXPORTED (label order,
+//! name suffixing, unregistered counter) would slip by an internal
+//! read and only manifest in production when a dashboard goes blank.
+//!
 //! Scope: the bars the v2-era audit found uncovered.
 //!
 //! - C-CORRECT-3: no drv silently dropped from a sealed, non-terminal
@@ -15,7 +24,6 @@
 use std::time::Duration;
 
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::observability::metrics::TerminalLabels;
 use nix_ci_core::types::{
     CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest, JobStatus,
 };
@@ -140,28 +148,14 @@ async fn drvs_accounted_after_seal(pool: PgPool) {
 }
 
 /// O-METRIC-PARITY: every terminal transition bumps the labelled
-/// counter exactly once. Three transitions in this test (done,
-/// failed, cancelled) produce three increments, one per status.
+/// counter exactly once, as visible on the `/metrics` endpoint.
+/// Three transitions here (done, failed, cancelled) must produce
+/// three increments, one per status — scraped through the same
+/// surface a Prometheus server would see.
 #[sqlx::test]
 async fn jobs_terminal_counter_parity(pool: PgPool) {
     let handle = common::spawn_server(pool).await;
     let client = CoordinatorClient::new(handle.base_url.clone());
-
-    // Baseline counters.
-    let count = |status: &str| {
-        handle
-            .dispatcher
-            .metrics
-            .inner
-            .jobs_terminal
-            .get_or_create(&TerminalLabels {
-                status: status.to_string(),
-            })
-            .get()
-    };
-    assert_eq!(count("done"), 0);
-    assert_eq!(count("failed"), 0);
-    assert_eq!(count("cancelled"), 0);
 
     // 1. Done: trivial sealed job with no toplevels -> Done immediately.
     let done_job = client
@@ -201,52 +195,66 @@ async fn jobs_terminal_counter_parity(pool: PgPool) {
         .unwrap();
     client.cancel(cancel_job.id).await.unwrap();
 
-    assert_eq!(count("done"), 1, "exactly one done transition");
-    assert_eq!(count("failed"), 1, "exactly one failed transition");
-    assert_eq!(count("cancelled"), 1, "exactly one cancelled transition");
+    // Scrape /metrics — the source of truth for observability.
+    // prometheus-client appends `_total` to Counter metric names on
+    // the wire (OpenMetrics requirement); the registered name is
+    // `nix_ci_jobs_terminal`.
+    let name = "nix_ci_jobs_terminal_total";
+    assert_eq!(
+        common::scrape_metric(&handle.base_url, name, &[("status", "done")]).await,
+        Some(1.0),
+        "exactly one done transition must appear on /metrics"
+    );
+    assert_eq!(
+        common::scrape_metric(&handle.base_url, name, &[("status", "failed")]).await,
+        Some(1.0),
+        "exactly one failed transition on /metrics"
+    );
+    assert_eq!(
+        common::scrape_metric(&handle.base_url, name, &[("status", "cancelled")]).await,
+        Some(1.0),
+        "exactly one cancelled transition on /metrics"
+    );
 }
 
 /// Idempotent cancel must not double-count. A second cancel on an
 /// already-cancelled job is a no-op — the counter stays at 1, not 2.
+/// Scraped via /metrics for the same reason as above.
 #[sqlx::test]
 async fn idempotent_cancel_does_not_double_count_terminal(pool: PgPool) {
     let handle = common::spawn_server(pool).await;
     let client = CoordinatorClient::new(handle.base_url.clone());
-    let count = || {
-        handle
-            .dispatcher
-            .metrics
-            .inner
-            .jobs_terminal
-            .get_or_create(&TerminalLabels {
-                status: "cancelled".into(),
-            })
-            .get()
-    };
+    let name = "nix_ci_jobs_terminal_total";
+    let cancel_labels = &[("status", "cancelled")];
+
     let job = client
         .create_job(&CreateJobRequest::default())
         .await
         .unwrap();
     client.cancel(job.id).await.unwrap();
-    let after_first = count();
+    let after_first =
+        common::scrape_metric(&handle.base_url, name, cancel_labels)
+            .await
+            .expect("cancelled counter must be present after first cancel");
     // Second cancel on a job that's already terminal must not emit
     // another terminal event.
     client.cancel(job.id).await.unwrap();
+    let after_second = common::scrape_metric_expect(&handle.base_url, name, cancel_labels).await;
     assert_eq!(
-        count(),
-        after_first,
-        "cancel on already-terminal job must not double-count"
+        after_first, after_second,
+        "cancel on already-terminal job must not double-count on /metrics"
     );
 }
 
 /// O-CLAIMS-INFLIGHT: after all activity ends, the claims_in_flight
-/// gauge converges to 0. If the convergence is slow (because a
-/// handler forgot to decrement) or incorrect (gauge drift), this
+/// gauge (as visible on /metrics) converges to 0. If the convergence
+/// is slow (handler forgot to decrement) or the gauge drifts, this
 /// catches it within the 5s SPEC budget.
 #[sqlx::test]
 async fn claims_in_flight_converges_to_zero_after_quiesce(pool: PgPool) {
     let handle = common::spawn_server(pool).await;
     let client = CoordinatorClient::new(handle.base_url.clone());
+    let gauge_name = "nix_ci_claims_in_flight";
 
     let job = client
         .create_job(&CreateJobRequest::default())
@@ -271,8 +279,7 @@ async fn claims_in_flight_converges_to_zero_after_quiesce(pool: PgPool) {
         .unwrap();
     client.seal(job.id).await.unwrap();
 
-    // Mid-flight sanity: while we're claiming, the gauge should be
-    // non-zero. Claim all ten to prove the increment side.
+    // Claim all ten; gauge on /metrics must be 10.
     let mut claims = Vec::new();
     for _ in 0..10 {
         let c = client
@@ -282,16 +289,13 @@ async fn claims_in_flight_converges_to_zero_after_quiesce(pool: PgPool) {
             .expect("claim");
         claims.push(c);
     }
-    let mid_flight = handle.dispatcher.metrics.inner.claims_in_flight.get();
+    let mid_flight = common::scrape_metric_expect(&handle.base_url, gauge_name, &[]).await;
     assert_eq!(
-        mid_flight, 10,
-        "all 10 claims outstanding must register on the gauge"
+        mid_flight, 10.0,
+        "all 10 outstanding claims must register on /metrics"
     );
 
-    // Complete all of them. Gauge should converge to 0 once the
-    // last complete returns — we don't even need the 5s SPEC budget
-    // in this test (the assertion is < 1s), the 5s bar is for chaos
-    // scenarios with many submissions.
+    // Complete all; the gauge must converge to 0.
     for c in claims {
         client
             .complete(
@@ -312,13 +316,13 @@ async fn claims_in_flight_converges_to_zero_after_quiesce(pool: PgPool) {
     // Bounded poll: must reach 0 well within SPEC's 5s budget.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let g = handle.dispatcher.metrics.inner.claims_in_flight.get();
-        if g == 0 {
+        let g = common::scrape_metric_expect(&handle.base_url, gauge_name, &[]).await;
+        if g == 0.0 {
             return;
         }
         if std::time::Instant::now() > deadline {
             panic!(
-                "O-CLAIMS-INFLIGHT: gauge stuck at {g} after 5s quiesce; \
+                "O-CLAIMS-INFLIGHT: /metrics gauge stuck at {g} after 5s quiesce; \
                  a decrement path is broken"
             );
         }
