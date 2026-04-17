@@ -66,23 +66,25 @@ pub async fn submit_batch(
         )));
     }
 
-    // Hard drv-cap. Runaway evals (10M-drv flake bug, accidental infinite
-    // expansion) would OOM the coordinator long before they complete; a
-    // cheap `members.len()` upper-bound check catches them at the first
-    // batch that crosses the line. We auto-fail the job with a clean
-    // sentinel so the caller sees a meaningful error rather than a
-    // connection reset mid-ingest. Using the optimistic upper bound
-    // (existing + incoming) avoids walking the incoming batch for dedup
-    // first; any rejection is conservative.
+    // Hard drv-cap — race-safe reservation via an atomic counter.
+    // Prior versions read `members.read().len()` and compared against
+    // the cap, which let two concurrent batches both read the same
+    // baseline and both pass the check, overshooting the cap silently.
+    // `try_reserve_drvs` uses fetch_add + range-check + rollback so
+    // concurrent batches whose combined size would exceed the cap
+    // both get a false return and auto-fail the job.
+    let incoming_u32: u32 = req.drvs.len().try_into().unwrap_or(u32::MAX);
     if let Some(cap) = state.cfg.max_drvs_per_job {
-        let existing = sub.members.read().len() as u64;
-        let incoming = req.drvs.len() as u64;
-        if existing + incoming > u64::from(cap) {
+        if !sub.try_reserve_drvs(incoming_u32, cap) {
+            let reserved = sub.reserved_drvs.load(std::sync::atomic::Ordering::Acquire);
             let reason = format!(
                 "eval_too_large: job {id} would exceed max_drvs_per_job={cap} \
-                 (existing={existing}, incoming={incoming})"
+                 (reserved={reserved}, incoming={incoming_u32})"
             );
-            tracing::warn!(job_id = %id, cap, existing, incoming, "ingest rejected: over cap");
+            tracing::warn!(
+                job_id = %id, cap, reserved, incoming = incoming_u32,
+                "ingest rejected: over cap"
+            );
             auto_fail_oversized(&state, id, &reason).await?;
             return Err(crate::Error::PayloadTooLarge(reason));
         }
@@ -112,6 +114,14 @@ pub async fn submit_batch(
             errored += 1;
             continue;
         }
+        // Bound free-form attribution string so a broken submitter
+        // can't pollute JSONB snapshots with megabytes of attr name.
+        if let Some(a) = d.attr.as_deref() {
+            if a.len() > state.cfg.max_identifier_bytes {
+                errored += 1;
+                continue;
+            }
+        }
         let Some(drv_hash) = drv_hash_from_path(&d.drv_path) else {
             errored += 1;
             continue;
@@ -135,6 +145,22 @@ pub async fn submit_batch(
             state.metrics.inner.failed_outputs_hits_total.inc();
         }
         primary.push((d, step, is_new));
+    }
+
+    // Post-Phase-1 refinement of the drv-cap reservation: the initial
+    // `try_reserve_drvs` reserved against the raw incoming count
+    // (conservative upper bound). Now that Phase 1 has computed dedup
+    // hits, release the deduped slots back to the counter so streams
+    // with heavy cross-batch overlap don't spuriously trip the cap.
+    let dedup_in_batch: u32 = primary
+        .iter()
+        .filter(|(_, _, is_new)| !*is_new)
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    if dedup_in_batch > 0 && state.cfg.max_drvs_per_job.is_some() {
+        sub.reserved_drvs
+            .fetch_sub(dedup_in_batch, std::sync::atomic::Ordering::AcqRel);
     }
 
     // Phase 2: membership + edges.

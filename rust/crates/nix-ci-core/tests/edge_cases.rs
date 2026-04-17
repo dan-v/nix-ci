@@ -3363,3 +3363,156 @@ async fn admin_evict_claim_force_expires(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
+
+// ─── Identifier size caps (security hardening) ───────────────────────
+
+/// external_ref above max_identifier_bytes must be rejected with 400.
+/// Prevents a broken / hostile client from bloating DB rows, log lines,
+/// and JSONB snapshots with megabytes of identifier.
+#[sqlx::test]
+async fn create_rejects_oversized_external_ref(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.max_identifier_bytes = 32; // tight for test speed
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let big = "x".repeat(1024);
+    let err = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some(big),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    match err {
+        nix_ci_core::Error::BadRequest(ref msg) => {
+            assert!(
+                msg.contains("external_ref") && msg.contains("max_identifier_bytes"),
+                "expected external_ref size diagnostic, got: {msg}"
+            );
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+/// worker_id above max_identifier_bytes must be rejected with 400 on
+/// /claim endpoints.
+#[sqlx::test]
+async fn claim_rejects_oversized_worker_id(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.max_identifier_bytes = 32;
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let huge_worker = "w".repeat(1024);
+    let err = client
+        .claim_as_worker(job.id, "x86_64-linux", &[], 1, Some(&huge_worker))
+        .await
+        .unwrap_err();
+    match err {
+        nix_ci_core::Error::BadRequest(_) => {}
+        other => panic!("expected BadRequest for oversized worker_id, got {other:?}"),
+    }
+}
+
+/// Oversized `attr` in an ingest batch must be counted as `errored`
+/// (batch continues for the other drvs), not crash the batch.
+#[sqlx::test]
+async fn ingest_rejects_oversized_attr(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.max_identifier_bytes = 32;
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let mut good = ingest(&drv_path("gooddrva1", "g"), "g", &[], true);
+    let mut bad = ingest(&drv_path("baddrvbb1", "b"), "b", &[], true);
+    bad.attr = Some("a".repeat(1024));
+    good.attr = Some("packages.x86_64-linux.hello".into());
+    let resp = client
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: vec![good, bad],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.new_drvs, 1, "the good drv must still be ingested");
+    assert_eq!(resp.errored, 1, "oversized attr must count as errored");
+}
+
+// ─── /version endpoint ───────────────────────────────────────────────
+
+/// /version must be reachable without auth (even when auth is enabled),
+/// and return the current CARGO_PKG_VERSION.
+#[sqlx::test]
+async fn version_endpoint_is_public(pool: PgPool) {
+    use nix_ci_core::config::ServerConfig;
+    let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
+        cfg.auth_bearer = Some("secret".into());
+    })
+    .await;
+    // No auth header — must still succeed.
+    let resp = reqwest::Client::new()
+        .get(format!("{}/version", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.get("version").and_then(|v| v.as_str()),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(body.get("git_revision").is_some());
+}
+
+// ─── /admin/debug/dispatcher-dump ────────────────────────────────────
+
+/// Dispatcher dump reflects live state: created job shows up with its
+/// priority, max_workers, and counts.
+#[sqlx::test]
+async fn dispatcher_dump_includes_live_submission(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some("dump-me".into()),
+            priority: 42,
+            max_workers: Some(7),
+            claim_deadline_secs: None,
+        })
+        .await
+        .unwrap();
+    client
+        .ingest_drv(job.id, &ingest(&drv_path("dumpable1", "d"), "d", &[], true))
+        .await
+        .unwrap();
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/admin/debug/dispatcher-dump", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let subs = body.get("submissions").and_then(|v| v.as_array()).unwrap();
+    let found = subs
+        .iter()
+        .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(&job.id.to_string()))
+        .expect("dump must include the live submission");
+    assert_eq!(found.get("priority").and_then(|v| v.as_i64()), Some(42));
+    assert_eq!(found.get("max_workers").and_then(|v| v.as_i64()), Some(7));
+    assert_eq!(found.get("member_count").and_then(|v| v.as_i64()), Some(1));
+}

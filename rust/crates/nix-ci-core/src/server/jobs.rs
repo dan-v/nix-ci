@@ -24,6 +24,18 @@ pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<Json<CreateJobResponse>> {
+    // Bounded identifier: external_ref propagates into DB text columns,
+    // log lines, and JSONB snapshots. An unbounded value from a broken
+    // or hostile client would bloat every row and line it touches.
+    if let Some(ext) = req.external_ref.as_deref() {
+        if ext.len() > state.cfg.max_identifier_bytes {
+            return Err(Error::BadRequest(format!(
+                "external_ref exceeds max_identifier_bytes ({} > {})",
+                ext.len(),
+                state.cfg.max_identifier_bytes
+            )));
+        }
+    }
     // Idempotent on external_ref: a retry with the same ref resolves
     // to the existing id (whatever its status — client decides what to
     // do with a cancelled / failed result). On hit, the existing

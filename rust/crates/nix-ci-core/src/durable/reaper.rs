@@ -22,6 +22,15 @@ use crate::dispatch::Dispatcher;
 use crate::error::Result;
 use crate::types::{JobId, JobStatus};
 
+/// Upper bound on how long the stale-jobs DB query may run before the
+/// reaper gives up on a tick and moves on. Without this, a stuck
+/// Postgres server would block the reaper indefinitely — stale jobs
+/// pile up in memory and in the pool's acquire queue, even though the
+/// claim-deadline sweep (which has no DB dependency) could still
+/// serve in-flight workers. Keep it well below the reaper interval so
+/// a flaky PG doesn't compound across ticks.
+const REAPER_DB_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn run(
     pool: PgPool,
     dispatcher: Dispatcher,
@@ -39,9 +48,25 @@ pub async fn run(
                 return;
             }
         }
-        if let Err(e) = reap_stale_jobs(&pool, &dispatcher, job_heartbeat_timeout).await {
-            tracing::warn!(error = %e, "reap_stale_jobs failed");
+        match tokio::time::timeout(
+            REAPER_DB_TIMEOUT,
+            reap_stale_jobs(&pool, &dispatcher, job_heartbeat_timeout),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "reap_stale_jobs failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = REAPER_DB_TIMEOUT.as_secs(),
+                    "reap_stale_jobs timed out; will retry on next tick"
+                );
+            }
         }
+        // Claim-deadline sweep is pure in-memory; always run it so
+        // workers don't get stranded when Postgres is slow.
         reap_expired_claims(&dispatcher);
     }
 }
@@ -162,10 +187,13 @@ pub fn reap_expired_claims(dispatcher: &Dispatcher) {
                     .store(true, std::sync::atomic::Ordering::Release);
                 // Race: between the load above and the store, a
                 // concurrent failure-propagation could have set
-                // finished=true. Re-check and undo so we never leave
-                // a step with `finished=true && runnable=true` (which
-                // would orphan a queue entry and violate dispatcher
-                // invariant 4).
+                // finished=true. Re-check and undo so we don't
+                // enqueue a queue entry that's already terminal.
+                // `pop_runnable` skips finished steps regardless, so
+                // even if an enqueue slipped through it would be
+                // silently dropped at claim time; this undo is
+                // belt-and-suspenders cleanup, not a correctness
+                // boundary.
                 if step.finished.load(std::sync::atomic::Ordering::Acquire) {
                     step.runnable
                         .store(false, std::sync::atomic::Ordering::Release);

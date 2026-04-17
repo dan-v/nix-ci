@@ -40,6 +40,7 @@ pub async fn claim(
     Query(mut q): Query<ClaimQuery>,
 ) -> Result<Response> {
     q.wait = q.wait.min(state.cfg.max_claim_wait_secs);
+    validate_worker_id(&q.worker, state.cfg.max_identifier_bytes)?;
 
     let Some(sub) = state.dispatcher.submissions.get(id) else {
         // Submission absent: job is terminal, never existed, or the
@@ -106,6 +107,7 @@ pub async fn claim_any(
     Query(mut q): Query<crate::types::ClaimQuery>,
 ) -> Result<Response> {
     q.wait = q.wait.min(state.cfg.max_claim_wait_secs);
+    validate_worker_id(&q.worker, state.cfg.max_identifier_bytes)?;
     let start = Instant::now();
     let deadline = start + Duration::from_secs(q.wait);
     let features_vec = q.features_vec();
@@ -252,6 +254,22 @@ pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<Cla
     // the question is "what's hung?"
     summaries.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
     Ok(axum::Json(ClaimsListResponse { claims: summaries }))
+}
+
+/// Reject an over-long `worker_id` at the claim entry point so the
+/// value never reaches tracing spans, the ActiveClaim record, or
+/// `/claims` output. An unbounded string from a broken client would
+/// bloat logs and serialized claim snapshots. No-op when `None`.
+fn validate_worker_id(worker_id: &Option<String>, max_bytes: usize) -> Result<()> {
+    if let Some(w) = worker_id.as_deref() {
+        if w.len() > max_bytes {
+            return Err(Error::BadRequest(format!(
+                "worker_id exceeds max_identifier_bytes ({} > {max_bytes})",
+                w.len()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn issue_claim(

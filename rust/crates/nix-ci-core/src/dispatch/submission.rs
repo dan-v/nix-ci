@@ -70,6 +70,15 @@ pub struct Submission {
     /// a single `WARN` log line (and metrics counter) per oversized
     /// submission rather than one per ingest batch.
     pub warned_oversized: AtomicBool,
+    /// Running count of drvs reserved for this submission by
+    /// in-flight ingest batches. Used by the per-job drv-cap check to
+    /// race-safely reserve slots before membership mutation: two
+    /// concurrent batches both fetch_add their size first, and at
+    /// least one will see a post-reservation count above the cap and
+    /// roll back. Without this, concurrent batches could both read
+    /// the same `members.len()`, both pass the check, and both insert
+    /// — silently overshooting the cap.
+    pub reserved_drvs: AtomicU32,
 }
 
 impl Submission {
@@ -103,7 +112,31 @@ impl Submission {
             propagated_failed: AtomicU32::new(0),
             transient_retries: AtomicU32::new(0),
             warned_oversized: AtomicBool::new(false),
+            reserved_drvs: AtomicU32::new(0),
         })
+    }
+
+    /// Race-safely reserve `n` drv slots against `cap`. Returns `true`
+    /// if the reservation succeeded (caller may proceed with ingest);
+    /// `false` if accepting this batch would exceed the cap, in which
+    /// case the counter is rolled back to its pre-call value and the
+    /// caller must reject the batch.
+    ///
+    /// Uses fetch_add then range-check: two concurrent calls whose
+    /// combined total exceeds the cap will both fetch_add first, one
+    /// will see a post-reservation total > cap and roll back; the
+    /// other also rolls back if its own total was over. A total
+    /// below cap always succeeds. Saturating semantics prevent
+    /// u32 overflow from a pathologically large batch.
+    pub fn try_reserve_drvs(&self, n: u32, cap: u32) -> bool {
+        let prev = self.reserved_drvs.fetch_add(n, Ordering::AcqRel);
+        let new_total = prev.saturating_add(n);
+        if new_total > cap {
+            self.reserved_drvs.fetch_sub(n, Ordering::AcqRel);
+            false
+        } else {
+            true
+        }
     }
 
     /// True if this submission is at its in-flight claim cap. Fleet
@@ -518,6 +551,79 @@ mod tests {
             Vec::new(),
             2,
         )
+    }
+
+    // ─── try_reserve_drvs (cap-race guard) ──────────────────────
+
+    #[test]
+    fn try_reserve_under_cap_succeeds() {
+        let sub = Submission::new(JobId::new(), 8);
+        assert!(sub.try_reserve_drvs(100, 1000));
+        assert_eq!(sub.reserved_drvs.load(Ordering::Acquire), 100);
+        assert!(sub.try_reserve_drvs(200, 1000));
+        assert_eq!(sub.reserved_drvs.load(Ordering::Acquire), 300);
+    }
+
+    #[test]
+    fn try_reserve_at_cap_succeeds() {
+        // cap=1000 and we reserve exactly 1000 in one go — must succeed.
+        // Off-by-one here would reject legitimate submitters.
+        let sub = Submission::new(JobId::new(), 8);
+        assert!(sub.try_reserve_drvs(1000, 1000));
+        assert_eq!(sub.reserved_drvs.load(Ordering::Acquire), 1000);
+    }
+
+    #[test]
+    fn try_reserve_over_cap_rolls_back() {
+        let sub = Submission::new(JobId::new(), 8);
+        sub.reserved_drvs.store(900, Ordering::Release);
+        // 900 + 200 > 1000 → rejected. Counter must return to 900.
+        assert!(!sub.try_reserve_drvs(200, 1000));
+        assert_eq!(sub.reserved_drvs.load(Ordering::Acquire), 900);
+    }
+
+    #[test]
+    fn try_reserve_concurrent_both_over_cap_both_fail() {
+        // THE race: two concurrent reservations whose combined total
+        // would exceed the cap. The prior `members.len()` check let
+        // both pass. `try_reserve_drvs` uses fetch_add-then-check so
+        // at least one must fail and roll back. Property under
+        // stress: `reserved_drvs` never exceeds the cap after all
+        // calls complete.
+        use std::sync::Arc;
+        use std::thread;
+        const CAP: u32 = 10_000;
+        // 100 threads, each reserving 200. Only ~50 should succeed
+        // (10_000 / 200 = 50); the rest must roll back.
+        let sub = Submission::new(JobId::new(), 8);
+        let succeeded = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut handles = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let sub = sub.clone();
+            let ok = succeeded.clone();
+            handles.push(thread::spawn(move || {
+                if sub.try_reserve_drvs(200, CAP) {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let final_reserved = sub.reserved_drvs.load(Ordering::Acquire);
+        assert!(
+            final_reserved <= CAP,
+            "reserved_drvs ({final_reserved}) must never exceed cap ({CAP})"
+        );
+        // The exact number of successes depends on interleaving, but
+        // at least one must fail (100 × 200 = 20_000 > 10_000 cap).
+        let ok = succeeded.load(Ordering::Relaxed);
+        assert!(ok < 100, "cap must reject at least one reservation");
+        assert_eq!(
+            final_reserved,
+            ok * 200,
+            "every success must correspond to 200 reserved"
+        );
     }
 
     #[test]

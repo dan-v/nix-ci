@@ -31,7 +31,13 @@ fn is_long_poll_route(path: &str) -> bool {
 /// reachable so Prometheus / kubelet don't lock themselves out of the
 /// coordinator on auth misconfiguration.
 fn is_public_route(path: &str) -> bool {
-    matches!(path, "/healthz" | "/health" | "/readyz" | "/metrics")
+    // `/version` is safe to expose unauthenticated — it only returns
+    // the coordinator's build metadata, and operators need it to
+    // confirm rolling-upgrade state without knowing the bearer token.
+    matches!(
+        path,
+        "/healthz" | "/health" | "/readyz" | "/metrics" | "/version"
+    )
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -89,7 +95,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(ops::healthz))
         .route("/readyz", get(ops::readyz))
         .route("/metrics", get(ops::metrics))
+        .route("/version", get(ops::version))
         .route("/admin/snapshot", get(ops::admin_snapshot))
+        .route(
+            "/admin/debug/dispatcher-dump",
+            get(ops::admin_dispatcher_dump),
+        )
         .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::from_fn_with_state(
             metrics_for_layer,

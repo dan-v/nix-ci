@@ -138,3 +138,110 @@ struct StateCounts {
     done: u32,
     failed: u32,
 }
+
+/// `GET /version` — build metadata, unauthenticated so operators can
+/// confirm which coordinator is running without knowing the bearer
+/// token. Surfaced fields are stable-ish; add new ones rather than
+/// repurposing existing ones so rolling upgrades don't silently
+/// mis-interpret each other.
+pub async fn version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        git_revision: option_env!("NIX_CI_GIT_REVISION").unwrap_or("unknown"),
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct VersionInfo {
+    pub version: &'static str,
+    pub git_revision: &'static str,
+}
+
+/// `GET /admin/debug/dispatcher-dump` — full in-memory snapshot for
+/// post-mortem debugging. NOT for dashboards (cardinality blows up);
+/// operators pull this when a job is stuck and they need to see the
+/// graph. Gated by the bearer-token middleware when auth is enabled.
+///
+/// Intentionally cheap: one read-lock pass over the dispatcher maps,
+/// no DB queries. Safe to call at any scale but the response grows
+/// with in-memory state — expect MB for a 500K-drv registry.
+pub async fn admin_dispatcher_dump(State(state): State<AppState>) -> Json<DispatcherDump> {
+    let submissions: Vec<DispatcherDumpSubmission> = state
+        .dispatcher
+        .submissions
+        .all()
+        .into_iter()
+        .map(|s| {
+            let counts = s.live_counts();
+            DispatcherDumpSubmission {
+                id: s.id,
+                priority: s.priority,
+                max_workers: s.max_workers,
+                sealed: s.is_sealed(),
+                terminal: s.is_terminal(),
+                active_claims: s.active_claims.load(std::sync::atomic::Ordering::Acquire),
+                reserved_drvs: s.reserved_drvs.load(std::sync::atomic::Ordering::Acquire),
+                member_count: s.members.read().len() as u32,
+                toplevel_count: s.toplevels.read().len() as u32,
+                failure_count: s.failures.read().len() as u32,
+                counts,
+            }
+        })
+        .collect();
+
+    let claims: Vec<DispatcherDumpClaim> = state
+        .dispatcher
+        .claims
+        .all()
+        .into_iter()
+        .map(|c| DispatcherDumpClaim {
+            claim_id: c.claim_id,
+            job_id: c.job_id,
+            drv_hash: c.drv_hash.clone(),
+            attempt: c.attempt,
+            worker_id: c.worker_id.clone(),
+            started_at: c.started_at_wall,
+            elapsed_secs: c.started_at.elapsed().as_secs(),
+        })
+        .collect();
+
+    Json(DispatcherDump {
+        submissions,
+        claims,
+        steps_registry_size: state.dispatcher.steps.len() as u32,
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct DispatcherDump {
+    pub submissions: Vec<DispatcherDumpSubmission>,
+    pub claims: Vec<DispatcherDumpClaim>,
+    /// Includes both live and yet-to-be-GC'd Weak entries.
+    pub steps_registry_size: u32,
+}
+
+#[derive(serde::Serialize)]
+pub struct DispatcherDumpSubmission {
+    pub id: crate::types::JobId,
+    pub priority: i32,
+    pub max_workers: Option<u32>,
+    pub sealed: bool,
+    pub terminal: bool,
+    pub active_claims: u32,
+    pub reserved_drvs: u32,
+    pub member_count: u32,
+    pub toplevel_count: u32,
+    pub failure_count: u32,
+    pub counts: crate::types::JobCounts,
+}
+
+#[derive(serde::Serialize)]
+pub struct DispatcherDumpClaim {
+    pub claim_id: crate::types::ClaimId,
+    pub job_id: crate::types::JobId,
+    pub drv_hash: crate::types::DrvHash,
+    pub attempt: i32,
+    pub worker_id: Option<String>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub elapsed_secs: u64,
+}

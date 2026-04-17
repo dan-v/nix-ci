@@ -59,6 +59,13 @@ pub struct ServerConfig {
     pub max_drv_path_bytes: usize,
     /// Max `drv_name` length accepted on ingest.
     pub max_drv_name_bytes: usize,
+    /// Max length of caller-supplied free-form identifiers:
+    /// `external_ref` (CreateJobRequest), `worker_id` (claim query),
+    /// and `attr` (IngestDrvRequest). These end up in log output,
+    /// DB text columns, and JSONB result snapshots, so an unbounded
+    /// string from a hostile or broken client would bloat every row
+    /// and every log line it touches.
+    pub max_identifier_bytes: usize,
     /// Cap on the `failures` vector inside a terminal `jobs.result`
     /// snapshot. Prevents a catastrophic job from producing a multi-MB
     /// JSONB row. A truncated marker is appended if exceeded.
@@ -125,6 +132,10 @@ impl Default for ServerConfig {
             max_request_body_bytes: 64 * 1024 * 1024, // 64 MiB
             max_drv_path_bytes: 4096,
             max_drv_name_bytes: 1024,
+            // 512 bytes: comfortably fits a UUID, a CCI build-URL
+            // + PR number + worker hostname, etc. Far above any
+            // legitimate value for the free-form identifier fields.
+            max_identifier_bytes: 512,
             max_failures_in_result: 500,
             graceful_shutdown_secs: 30,
             build_log_retention_days: 14,
@@ -233,6 +244,10 @@ impl ServerConfig {
         }
         if self.max_drv_name_bytes < 1 {
             errors.push("max_drv_name_bytes must be >= 1".into());
+        }
+        if self.max_identifier_bytes < 16 {
+            errors
+                .push("max_identifier_bytes must be >= 16 (a UUID + separator fits in 36)".into());
         }
         if self.max_failures_in_result < 1 {
             errors.push("max_failures_in_result must be >= 1".into());
