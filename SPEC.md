@@ -108,5 +108,15 @@ days of nightly chaos-scale + property runs without a violation.
 
 ## Scoring
 
-Run `scripts/spec_report.sh` (to be added) to print a green/red table of
-every bar. A single red bar means not-production-ready.
+Run `scripts/spec_report.sh` to print a green/red table of every bar.
+A single red bar means not-production-ready.
+
+```
+./scripts/spec_report.sh          # run every bar's test, color-coded output
+./scripts/spec_report.sh --no-run # dry-run: just show the mapping
+SPEC_REPORT_SKIP=S-MEM-10K,P-NIXOS-WORKER ./scripts/spec_report.sh
+```
+
+Exits 0 when every measured bar is green; 1 if any is red. "Done"
+per the § Exit Criteria requires green for 30 consecutive days of
+the nightly chaos-scale job (`T-NIGHTLY-GREEN`).
