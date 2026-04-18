@@ -4,6 +4,13 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+# MSRV: lowest Rust version the workspace is known to build on.
+# A new language feature in a PR should flip this field (and trigger
+# CI), not land silently.
+#   - 1.82: `Option::is_none_or`, `std::iter::repeat_n` (both used in src).
+# Run `cargo +1.82.0 check --workspace --all-features` on CI to keep
+# this honest.
+rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 version = "0.2.0"
 publish = false
