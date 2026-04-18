@@ -39,6 +39,11 @@ tracing-opentelemetry.workspace = true
 tempfile.workspace = true
 rand = "0.8"
 criterion = { version = "0.5", default-features = false, features = ["html_reports", "cargo_bench_support"] }
+# `test-util` unlocks `tokio::time::{pause, advance, resume}` so tests
+# can exercise reaper / claim-deadline logic in virtual time instead of
+# wall clock. Unions with the lib's `full` tokio features at build
+# time; production binaries don't link test-util.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "dispatcher"

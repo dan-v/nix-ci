@@ -64,7 +64,13 @@ async fn extend_keeps_claim_alive_past_original_deadline(pool: PgPool) {
 
     // Wait past the original 2s deadline, refreshing once at the halfway
     // mark. The refresh pushes the deadline out by another full window.
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    //
+    // Use `tokio::time::pause()` + `advance()` to jump through the waits
+    // in zero wall-clock. Claim deadlines use `tokio::time::Instant`, so
+    // virtual-time advance is honored by the reaper. Saves ~2.5s per run.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(1_000)).await;
+    tokio::time::resume();
     let ext = client
         .extend_claim(job.id, c.claim_id)
         .await
@@ -77,10 +83,12 @@ async fn extend_keeps_claim_alive_past_original_deadline(pool: PgPool) {
         ext.deadline
     );
 
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    // After 2.5s total, the original deadline (2s) has passed. Run the
-    // reaper — it must NOT evict, because the extension moved the
-    // deadline forward.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(1_500)).await;
+    tokio::time::resume();
+    // After 2.5s virtual total, the original deadline (2s) has passed.
+    // Run the reaper — it must NOT evict, because the extension moved
+    // the deadline forward.
     nix_ci_core::durable::reaper::reap_expired_claims(&handle.dispatcher);
     assert_eq!(
         handle.dispatcher.claims.len(),
