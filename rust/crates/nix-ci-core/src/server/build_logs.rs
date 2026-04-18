@@ -13,8 +13,6 @@
 //!   attempt's metadata for a drv on a job. Response is JSON
 //!   ([`BuildLogsResponse`]).
 
-use std::sync::atomic::Ordering;
-
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
@@ -87,8 +85,6 @@ pub async fn upload_log(
     if q.truncated {
         state.metrics.inner.build_logs_truncated_total.inc();
     }
-    // Defensive use of the atomic in case future code paths grow.
-    let _ = Ordering::Relaxed;
     Ok(StatusCode::NO_CONTENT)
 }
 

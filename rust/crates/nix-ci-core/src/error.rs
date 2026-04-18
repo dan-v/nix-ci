@@ -48,9 +48,6 @@ pub enum Error {
 
     #[error("internal error: {0}")]
     Internal(String),
-
-    #[error("subprocess {tool} exited with code {code}")]
-    Subprocess { tool: String, code: i32 },
 }
 
 impl Error {
@@ -226,18 +223,14 @@ mod tests {
     #[test]
     fn all_5xx_variants_classify_into_sanitized_body() {
         // ServiceUnavailable, Internal, Config, and bare wrapped errors
-        // (Io, Serde, Subprocess) must all land as 5xx with a fixed-
-        // shape body. The specific plaintext contents must not echo
-        // the underlying cause.
+        // (Io, Serde) must all land as 5xx with a fixed-shape body.
+        // The specific plaintext contents must not echo the underlying
+        // cause.
         for e in [
             Error::ServiceUnavailable("pool saturated".into()),
             Error::Internal("/var/nix-ci/secret leaked in path".into()),
             Error::Config("bad env".into()),
             Error::Io(std::io::Error::other("rm -rf / was attempted")),
-            Error::Subprocess {
-                tool: "nix-eval-jobs".into(),
-                code: 1,
-            },
         ] {
             let status = e.status_code();
             assert!(
@@ -312,18 +305,5 @@ mod tests {
         let msg = body["error"].as_str().unwrap();
         assert_eq!(msg, "internal server error");
         assert!(!msg.contains("/etc/"), "io error path leaked");
-    }
-
-    #[tokio::test]
-    async fn subprocess_error_maps_to_500_sanitized() {
-        let e = Error::Subprocess {
-            tool: "nix-eval-jobs".into(),
-            code: 101,
-        };
-        let resp = e.into_response();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], "internal server error");
     }
 }

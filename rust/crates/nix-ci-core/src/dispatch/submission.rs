@@ -44,11 +44,6 @@ impl Toplevels {
     pub fn snapshot(&self) -> Vec<Arc<Step>> {
         self.order.clone()
     }
-
-    /// Whether the given `drv_hash` is in the set. O(1).
-    pub fn contains(&self, h: &DrvHash) -> bool {
-        self.seen.contains(h)
-    }
 }
 
 impl std::ops::Deref for Toplevels {
