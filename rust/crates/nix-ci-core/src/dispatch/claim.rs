@@ -95,9 +95,9 @@ impl Claims {
         let mut guard = self.inner.write();
         match guard.get(&claim_id) {
             None => Err(ClaimJobMismatch::NotFound),
-            Some(c) if c.job_id != expected_job_id => Err(ClaimJobMismatch::WrongJob {
-                actual: c.job_id,
-            }),
+            Some(c) if c.job_id != expected_job_id => {
+                Err(ClaimJobMismatch::WrongJob { actual: c.job_id })
+            }
             Some(_) => Ok(guard.remove(&claim_id).expect("just checked present")),
         }
     }

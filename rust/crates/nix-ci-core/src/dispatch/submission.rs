@@ -1038,7 +1038,9 @@ mod tests {
         sub.enqueue_ready(&step);
 
         // now_ms < next_attempt_at: not claimable.
-        assert!(sub.pop_runnable(&["x86_64-linux".into()], &[], 999).is_none());
+        assert!(sub
+            .pop_runnable(&["x86_64-linux".into()], &[], 999)
+            .is_none());
         // now_ms == next_attempt_at: eligible (`>` not `>=`).
         let claimed = sub.pop_runnable(&["x86_64-linux".into()], &[], 1_000);
         assert!(
@@ -1053,6 +1055,8 @@ mod tests {
         let sub2 = Submission::new(JobId::new(), 8);
         sub2.add_member(&fresh);
         sub2.enqueue_ready(&fresh);
-        assert!(sub2.pop_runnable(&["x86_64-linux".into()], &[], 0).is_some());
+        assert!(sub2
+            .pop_runnable(&["x86_64-linux".into()], &[], 0)
+            .is_some());
     }
 }

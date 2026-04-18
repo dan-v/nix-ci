@@ -3,15 +3,10 @@
 
 mod common;
 
-
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest,
-    JobStatus,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, JobStatus};
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn ingest_after_cancel_returns_gone(pool: PgPool) {

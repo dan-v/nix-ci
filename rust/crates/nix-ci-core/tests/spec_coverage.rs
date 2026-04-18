@@ -90,8 +90,7 @@ async fn drvs_accounted_after_seal(pool: PgPool) {
     // At every observable point — before any completion, during
     // completion, after terminal — total must equal the sum of the
     // buckets. Single drops would show up as total > sum.
-    let assert_accounted = |status: &nix_ci_core::types::JobStatusResponse,
-                            where_: &str| {
+    let assert_accounted = |status: &nix_ci_core::types::JobStatusResponse, where_: &str| {
         let c = &status.counts;
         let sum = c.pending + c.building + c.done + c.failed;
         assert_eq!(
@@ -232,10 +231,9 @@ async fn idempotent_cancel_does_not_double_count_terminal(pool: PgPool) {
         .await
         .unwrap();
     client.cancel(job.id).await.unwrap();
-    let after_first =
-        common::scrape_metric(&handle.base_url, name, cancel_labels)
-            .await
-            .expect("cancelled counter must be present after first cancel");
+    let after_first = common::scrape_metric(&handle.base_url, name, cancel_labels)
+        .await
+        .expect("cancelled counter must be present after first cancel");
     // Second cancel on a job that's already terminal must not emit
     // another terminal event.
     client.cancel(job.id).await.unwrap();

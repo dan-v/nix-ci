@@ -1,0 +1,32 @@
+[package]
+name = "nix-ci-loom-checks"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+# L1 concurrency model tests for the 8 dispatcher invariants. These
+# are MODEL tests — each reimplements the relevant invariant's state
+# machine in miniature using loom's drop-in replacements for
+# `Arc`/`AtomicBool`/`RwLock`. Loom then exhaustively explores every
+# interleaving and checks the invariant holds.
+#
+# Why a separate crate: `RUSTFLAGS="--cfg loom"` propagates to every
+# crate in the build. Some transitive deps of nix-ci-core
+# (specifically `concurrent-queue` via tokio/sqlx) have buggy
+# `#[cfg(loom)]` branches that fail to compile. Isolating the loom
+# tests in a crate whose only dep is loom itself keeps the cfg
+# scope clean.
+#
+# Run with:
+#   cd rust && RUSTFLAGS="--cfg loom" cargo test -p nix-ci-loom-checks --release
+
+[lib]
+# Empty lib; the tests are all that matters.
+path = "src/lib.rs"
+
+[dev-dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true

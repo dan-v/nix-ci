@@ -3,15 +3,10 @@
 
 mod common;
 
-
 use common::{drv_path, ingest};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CreateJobRequest, IngestBatchRequest,
-    JobStatus,
-};
+use nix_ci_core::types::{CreateJobRequest, IngestBatchRequest, JobStatus};
 use sqlx::PgPool;
-
 
 /// When a batch would push a job's member count over `max_drvs_per_job`,
 /// the coordinator must auto-fail the job with `eval_too_large` and
@@ -46,7 +41,13 @@ async fn ingest_drv_cap_auto_fails_job(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: batch1, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: batch1,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
 
@@ -62,7 +63,13 @@ async fn ingest_drv_cap_auto_fails_job(pool: PgPool) {
         })
         .collect();
     let err = client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: batch2, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: batch2,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap_err();
     match err {
@@ -102,7 +109,13 @@ async fn ingest_drv_cap_auto_fails_job(pool: PgPool) {
         })
         .collect();
     match client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: retry, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: retry,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap_err()
     {
@@ -141,7 +154,13 @@ async fn ingest_drv_cap_disabled_allows_large_batch(pool: PgPool) {
         })
         .collect();
     let resp = client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: big, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: big,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(resp.new_drvs, 50);
@@ -265,8 +284,8 @@ async fn ingest_rejects_oversized_attr(pool: PgPool) {
             job.id,
             &IngestBatchRequest {
                 drvs: vec![good, bad],
-            eval_errors: Vec::new(),
-        },
+                eval_errors: Vec::new(),
+            },
         )
         .await
         .unwrap();

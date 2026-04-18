@@ -6,9 +6,7 @@
 use std::time::Duration;
 
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest};
 use sqlx::PgPool;
 
 mod common;
@@ -336,10 +334,7 @@ async fn zero_wait_claim_returns_204_immediately(pool: PgPool) {
         .await
         .unwrap();
     let start = std::time::Instant::now();
-    let r = client
-        .claim(job.id, "x86_64-linux", &[], 0)
-        .await
-        .unwrap();
+    let r = client.claim(job.id, "x86_64-linux", &[], 0).await.unwrap();
     assert!(r.is_none(), "empty job must return None on zero-wait claim");
     let elapsed = start.elapsed();
     assert!(

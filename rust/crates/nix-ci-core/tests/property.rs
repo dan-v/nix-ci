@@ -322,7 +322,10 @@ fn cross_submission_cas_exactly_one_winner() {
         let mut winners = 0;
         let now_ms = chrono::Utc::now().timestamp_millis();
         for i in &order {
-            if subs[*i].pop_runnable(&["x86_64-linux".into()], &[], now_ms).is_some() {
+            if subs[*i]
+                .pop_runnable(&["x86_64-linux".into()], &[], now_ms)
+                .is_some()
+            {
                 winners += 1;
             }
         }

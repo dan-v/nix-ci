@@ -56,6 +56,9 @@ pub async fn claim(
     if worker_is_fenced(&state, q.worker.as_deref()) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
+    if let Some(resp) = shed_if_overloaded(&state) {
+        return Ok(resp);
+    }
 
     let Some(sub) = state.dispatcher.submissions.get(id) else {
         // Submission absent: job is terminal, never existed, or the
@@ -143,6 +146,9 @@ pub async fn claim_any(
     if worker_is_fenced(&state, q.worker.as_deref()) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
+    if let Some(resp) = shed_if_overloaded(&state) {
+        return Ok(resp);
+    }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(q.wait);
     let features_vec = q.features_vec();
@@ -211,12 +217,14 @@ async fn scan_fleet_once(
     start: Instant,
     worker_id: &Option<String>,
 ) -> Result<FleetScan> {
+    let scan_start = Instant::now();
     let now_ms = Utc::now().timestamp_millis();
     // Priority-first, then FIFO — dual-indexed Submissions returns
     // pre-sorted by (Reverse(priority), created_at, id); no per-call
     // O(N log N) sort, critical under 1000+ workers racing on a single
     // `notify_waiters()` edge.
     let subs = state.dispatcher.submissions.sorted_by_created_at();
+    let mut outcome: Option<FleetScan> = None;
     for sub in &subs {
         // Skip submissions already moving toward terminal — their ready
         // queues may still hold weak refs but their workers are exiting.
@@ -233,14 +241,27 @@ async fn scan_fleet_once(
         };
         if step_exhausted(&step) {
             drop(subs);
+            state
+                .metrics
+                .inner
+                .fleet_scan_duration_seconds
+                .observe(scan_start.elapsed().as_secs_f64());
             terminal_fail_exhausted(state, &step).await?;
             return Ok(FleetScan::RestartScan);
         }
         let job_id = sub.id;
-        return issue_claim(state, sub, job_id, step, start, worker_id.clone())
-            .map(FleetScan::Issued);
+        outcome = Some(
+            issue_claim(state, sub, job_id, step, start, worker_id.clone())
+                .map(FleetScan::Issued)?,
+        );
+        break;
     }
-    Ok(FleetScan::Nothing)
+    state
+        .metrics
+        .inner
+        .fleet_scan_duration_seconds
+        .observe(scan_start.elapsed().as_secs_f64());
+    Ok(outcome.unwrap_or(FleetScan::Nothing))
 }
 
 /// `DELETE /admin/claims/{claim_id}` — operator lever for unsticking
@@ -323,6 +344,36 @@ fn worker_is_fenced(state: &AppState, worker_id: Option<&str>) -> bool {
     state.fenced_workers.read().contains(w)
 }
 
+/// Degradation contract: if `claims_in_flight >= max_claims_in_flight`,
+/// return a 503 with `Retry-After: 1` so clients back off cleanly.
+/// The `overload_rejections` counter lets operators graph shedding
+/// rate — a non-zero rate is not a bug, it's the contract firing.
+///
+/// Returning the prebuilt `Response` (not an `Error::ServiceUnavailable`)
+/// lets us attach the `Retry-After` header, which `Error` currently
+/// lacks a surface for.
+fn shed_if_overloaded(state: &AppState) -> Option<Response> {
+    let threshold = state.cfg.max_claims_in_flight?;
+    let current = state.metrics.inner.claims_in_flight.get();
+    // Gauge is i64; cap at 0 for the comparison (claims_in_flight should
+    // never be negative but a negative value means "degrade open,"
+    // not "shed everything").
+    if current < 0 || (current as u64) < u64::from(threshold) {
+        return None;
+    }
+    state.metrics.inner.overload_rejections.inc();
+    let mut resp = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "coordinator overloaded; retry after",
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    Some(resp)
+}
+
 /// Returns true when a popped step has already consumed its full
 /// `max_tries` budget — the next claim would be attempt `max_tries + 1`,
 /// violating the retry policy. Checked before `issue_claim` so a step
@@ -401,11 +452,7 @@ async fn terminal_fail_exhausted(state: &AppState, step: &Arc<Step>) -> Result<(
     }
 
     let propagated = propagate_failure_inmem(step, step.drv_hash());
-    state
-        .metrics
-        .inner
-        .propagated_failures
-        .inc_by(propagated);
+    state.metrics.inner.propagated_failures.inc_by(propagated);
 
     for sub in &subs {
         check_and_publish_terminal(state, sub).await?;

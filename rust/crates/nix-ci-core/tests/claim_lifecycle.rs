@@ -7,11 +7,8 @@ use std::time::Duration;
 
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest};
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn worker_without_required_feature_never_claims(pool: PgPool) {
@@ -514,8 +511,8 @@ async fn fleet_claim_respects_max_workers(pool: PgPool) {
                     ingest(&d1, "first", &[], true),
                     ingest(&d2, "second", &[], true),
                 ],
-            eval_errors: Vec::new(),
-        },
+                eval_errors: Vec::new(),
+            },
         )
         .await
         .unwrap();

@@ -45,7 +45,13 @@ async fn worker_dryrun_drains_all_drvs_to_done(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();

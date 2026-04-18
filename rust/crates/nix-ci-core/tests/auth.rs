@@ -3,13 +3,9 @@
 
 mod common;
 
-
 use nix_ci_core::client::{BuildLogUploadMeta, CoordinatorClient};
-use nix_ci_core::types::{
-    ClaimId, CreateJobRequest, DrvHash, JobStatus,
-};
+use nix_ci_core::types::{ClaimId, CreateJobRequest, DrvHash, JobStatus};
 use sqlx::PgPool;
-
 
 /// With `auth_bearer` configured, a request without a matching token
 /// must be rejected with 401 on mutating endpoints.
@@ -78,7 +74,11 @@ async fn all_client_surfaces_attach_bearer_token(pool: PgPool) {
         .await
         .expect("create_job must succeed");
     assert_eq!(
-        client.status(job.id).await.expect("status must succeed").status,
+        client
+            .status(job.id)
+            .await
+            .expect("status must succeed")
+            .status,
         JobStatus::Pending
     );
     client
@@ -169,7 +169,10 @@ async fn admin_bearer_separates_scope(pool: PgPool) {
         .send()
         .await
         .unwrap();
-    assert!(create.status().is_success(), "worker token must create jobs");
+    assert!(
+        create.status().is_success(),
+        "worker token must create jobs"
+    );
     let job: serde_json::Value = create.json().await.unwrap();
     let job_id = job["id"].as_str().unwrap().to_string();
 
@@ -244,8 +247,14 @@ async fn admin_routes_accept_worker_token_when_no_admin_bearer(pool: PgPool) {
     })
     .await;
     let client = CoordinatorClient::with_auth(&handle.base_url, Some("single-tok".into()));
-    let job = client.create_job(&CreateJobRequest::default()).await.unwrap();
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
     // cancel is an admin-scoped route; with no admin_bearer it must
     // still accept the worker token.
-    client.cancel(job.id).await.expect("cancel must accept worker token");
+    client
+        .cancel(job.id)
+        .await
+        .expect("cancel must accept worker token");
 }

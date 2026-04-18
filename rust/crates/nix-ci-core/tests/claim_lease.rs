@@ -10,9 +10,7 @@ use std::time::Duration;
 
 use nix_ci_core::client::CoordinatorClient;
 use nix_ci_core::config::ServerConfig;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest};
 use sqlx::PgPool;
 
 mod common;
@@ -117,13 +115,13 @@ async fn extend_keeps_claim_alive_past_original_deadline(pool: PgPool) {
     // we test the observable ops-dashboard contract, not the internal
     // in-memory gauge). The wire name gets `_total` appended by
     // prometheus-client because it's a Counter.
-    let extensions = common::scrape_metric_expect(
-        &handle.base_url,
-        "nix_ci_claim_lease_extensions_total",
-        &[],
-    )
-    .await;
-    assert_eq!(extensions, 1.0, "exactly one extension recorded on /metrics");
+    let extensions =
+        common::scrape_metric_expect(&handle.base_url, "nix_ci_claim_lease_extensions_total", &[])
+            .await;
+    assert_eq!(
+        extensions, 1.0,
+        "exactly one extension recorded on /metrics"
+    );
 }
 
 /// Without the extension, the reaper evicts the claim and a subsequent
@@ -291,13 +289,10 @@ async fn extend_after_complete_returns_gone(pool: PgPool) {
     // Counter registered at startup emits `0` on /metrics until its
     // first increment, so the expected observation is exactly 0.0
     // (not absent).
-    let counter = common::scrape_metric(
-        &handle.base_url,
-        "nix_ci_claim_lease_extensions_total",
-        &[],
-    )
-    .await
-    .unwrap_or(0.0);
+    let counter =
+        common::scrape_metric(&handle.base_url, "nix_ci_claim_lease_extensions_total", &[])
+            .await
+            .unwrap_or(0.0);
     assert_eq!(counter, 0.0, "Gone-extend must not increment the counter");
 }
 
@@ -347,12 +342,9 @@ async fn extend_counter_increments_per_success(pool: PgPool) {
     // Scrape /metrics rather than reading the in-memory counter.
     // Prometheus-client suffixes Counter metrics with `_total` on
     // the wire.
-    let observed = common::scrape_metric_expect(
-        &handle.base_url,
-        "nix_ci_claim_lease_extensions_total",
-        &[],
-    )
-    .await;
+    let observed =
+        common::scrape_metric_expect(&handle.base_url, "nix_ci_claim_lease_extensions_total", &[])
+            .await;
     assert_eq!(
         observed, 5.0,
         "/metrics counter must match the number of successful extends"

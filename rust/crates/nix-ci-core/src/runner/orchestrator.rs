@@ -137,7 +137,9 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
         }
     });
 
-    let submit_stats = match submitter::run(client.clone(), job_id, eval_rx, shutdown_rx.clone()).await {
+    let submit_stats = match submitter::run(client.clone(), job_id, eval_rx, shutdown_rx.clone())
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             // The submitter bailed. Tell the coordinator explicitly so

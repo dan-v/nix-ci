@@ -206,10 +206,7 @@ fn validate_catches_zero_progress_tick() {
         ..ServerConfig::default()
     };
     let err = cfg.validate().unwrap_err();
-    assert!(err
-        .errors
-        .iter()
-        .any(|e| e.contains("progress_tick_secs")));
+    assert!(err.errors.iter().any(|e| e.contains("progress_tick_secs")));
 }
 
 #[test]
@@ -233,10 +230,7 @@ fn validate_catches_max_drvs_per_job_zero() {
         ..ServerConfig::default()
     };
     let err = cfg.validate().unwrap_err();
-    assert!(err
-        .errors
-        .iter()
-        .any(|e| e.contains("max_drvs_per_job")));
+    assert!(err.errors.iter().any(|e| e.contains("max_drvs_per_job")));
 }
 
 #[test]
@@ -293,10 +287,7 @@ fn validate_catches_short_max_drv_path() {
         ..ServerConfig::default()
     };
     let err = cfg.validate().unwrap_err();
-    assert!(err
-        .errors
-        .iter()
-        .any(|e| e.contains("max_drv_path_bytes")));
+    assert!(err.errors.iter().any(|e| e.contains("max_drv_path_bytes")));
 }
 
 #[test]

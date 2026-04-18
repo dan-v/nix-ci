@@ -523,8 +523,8 @@ async fn drvs_per_job_histogram_records_at_terminal(pool: PgPool) {
             ingest(&drv_path("s2", "b"), "b", &[], true),
             ingest(&drv_path("s3", "c"), "c", &[], true),
         ],
-    eval_errors: Vec::new(),
-        };
+        eval_errors: Vec::new(),
+    };
     client.ingest_batch(job.id, &batch).await.unwrap();
     client.cancel(job.id).await.unwrap();
 

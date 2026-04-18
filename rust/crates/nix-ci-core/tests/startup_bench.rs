@@ -120,11 +120,10 @@ async fn boot_with_10k_jobs_completes_under_5s(pool: PgPool) {
     // Also verify the pool is actually functional post-boot — a boot
     // that "succeeds" but leaves the pool in a bad state would be a
     // regression the elapsed-time check alone can't catch.
-    let (live_count,): (i64,) =
-        sqlx::query_as("SELECT count(*) FROM jobs WHERE status='pending'")
-            .fetch_one(&new_pool)
-            .await
-            .unwrap();
+    let (live_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM jobs WHERE status='pending'")
+        .fetch_one(&new_pool)
+        .await
+        .unwrap();
     assert_eq!(
         live_count, 0,
         "clear_busy must drain non-terminal jobs; {live_count} remain"

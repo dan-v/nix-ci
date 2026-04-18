@@ -52,6 +52,22 @@ load-test = []
 # Disabled by default so normal `cargo test` and tools like
 # cargo-mutants don't re-run it for every mutation.
 chaos-test = []
+# L3 scale-ladder tests. 1K-worker, tall-narrow, wide-flat variants
+# plus memory-bound probes. Gated off normal `cargo test` because they
+# take 60-300s each and saturate CI runners.
+scale-test = []
+# L4 degradation tests. Exercise overload shedding, PG fault
+# injection, memory pressure — validate the "degrades gracefully"
+# contract. Feature-gated because some tests deliberately push the
+# coordinator past its SLO to prove shedding, not because the tests
+# themselves are slow.
+degradation-test = []
+# L2 deterministic simulation harness. Drives the real dispatcher
+# from a single-threaded, seed-replayable event schedule — millions
+# of events per second, no tokio, no PG. Catches invariant
+# violations that only appear in specific interleavings of ingest /
+# complete / cancel / fail.
+sim-test = []
 
 [lints]
 workspace = true

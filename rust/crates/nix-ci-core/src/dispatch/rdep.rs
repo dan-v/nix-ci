@@ -6,9 +6,26 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use super::step::{Step, StepHandle};
 use super::submission::Submission;
+
+/// Observe the wall-clock cost of a single `make_rdeps_runnable` call
+/// into the `rdep_propagation_duration_seconds` histogram. Wrapped so
+/// dispatcher paths without a Metrics handle in scope (pure-graph
+/// tests) can still call the unobserved variant.
+pub fn make_rdeps_runnable_observed(
+    step: &Arc<Step>,
+    metrics: &crate::observability::metrics::Metrics,
+) {
+    let t0 = Instant::now();
+    make_rdeps_runnable(step);
+    metrics
+        .inner
+        .rdep_propagation_duration_seconds
+        .observe(t0.elapsed().as_secs_f64());
+}
 
 /// Walk self's rdep list; decrement each rdep's pending-dep set by
 /// removing self; for each rdep whose deps become empty (and whose

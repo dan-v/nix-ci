@@ -135,6 +135,22 @@ pub struct ServerConfig {
     /// behind a separate secret. When `None`, admin endpoints accept
     /// the worker `auth_bearer` (current behavior).
     pub admin_bearer: Option<String>,
+    /// Overload-shedding threshold on `claims_in_flight`. When the
+    /// gauge reaches this value, new claim requests (both per-job and
+    /// fleet) return 503 with a `Retry-After: 1` header and the
+    /// `overload_rejections` counter is incremented. The contract:
+    /// clients see a clean rejection, not a hang or OOM; existing
+    /// in-flight claims continue unaffected.
+    ///
+    /// This is the primary lever in the degradation contract. It
+    /// protects the coordinator's memory under worker flood (e.g., a
+    /// runaway fleet triple-spawning workers) without affecting
+    /// legitimate traffic below the threshold.
+    ///
+    /// `None` (default) = shedding disabled; claims_in_flight can grow
+    /// without coordinator-level limit (bounded only by worker fleet
+    /// size). Set to ~2× expected peak in-flight for production.
+    pub max_claims_in_flight: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -171,6 +187,7 @@ impl Default for ServerConfig {
             request_timeout_secs: 30,
             auth_bearer: None,
             admin_bearer: None,
+            max_claims_in_flight: None,
         }
     }
 }
@@ -362,7 +379,9 @@ impl ServerConfig {
     /// so operators can `echo token > file` without breaking the
     /// comparison. Empty contents become `None`.
     fn load_bearer_from_file_env(env_key: &str) -> Option<String> {
-        let path = std::env::var(env_key).ok().filter(|s| !s.trim().is_empty())?;
+        let path = std::env::var(env_key)
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
         match std::fs::read_to_string(&path) {
             Ok(s) => {
                 let trimmed = s.trim_end_matches(['\n', '\r', ' ', '\t']).to_string();

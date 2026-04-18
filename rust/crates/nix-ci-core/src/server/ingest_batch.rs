@@ -22,7 +22,7 @@ use crate::dispatch::rdep::{attach_dep, enqueue_for_all_submissions};
 use crate::dispatch::{Step, Submission};
 use crate::durable::writeback;
 use crate::error::Result;
-use crate::observability::metrics::TerminalLabels;
+use crate::observability::metrics::{PhaseLabels, TerminalLabels};
 use crate::types::{
     drv_hash_from_path, IngestBatchRequest, IngestBatchResponse, JobEvent, JobId, JobStatus,
     JobStatusResponse,
@@ -110,6 +110,7 @@ pub async fn submit_batch(
     let known_failed = writeback::failed_output_hits(&state.pool, &output_path_refs).await;
 
     // Phase 1: look up or create every Step.
+    let t_parse = std::time::Instant::now();
     let mut primary: Vec<(_, Arc<Step>, bool)> = Vec::with_capacity(req.drvs.len());
     let mut errored: u32 = 0;
     for d in req.drvs {
@@ -147,20 +148,28 @@ pub async fn submit_batch(
         });
         let stripped: &str = d.drv_path.trim_end_matches(".drv");
         if is_new && known_failed.contains(stripped) {
-            step.previous_failure
-                .store(true, Ordering::Release);
-            step.finished
-                .store(true, Ordering::Release);
+            step.previous_failure.store(true, Ordering::Release);
+            step.finished.store(true, Ordering::Release);
             state.metrics.inner.failed_outputs_hits_total.inc();
         }
         primary.push((d, step, is_new));
     }
+
+    state
+        .metrics
+        .inner
+        .ingest_phase_duration_seconds
+        .get_or_create(&PhaseLabels {
+            phase: "parse".into(),
+        })
+        .observe(t_parse.elapsed().as_secs_f64());
 
     // Post-Phase-1 refinement of the drv-cap reservation: the initial
     // `try_reserve_drvs` reserved against the raw incoming count
     // (conservative upper bound). Now that Phase 1 has computed dedup
     // hits, release the deduped slots back to the counter so streams
     // with heavy cross-batch overlap don't spuriously trip the cap.
+    let t_reserve = std::time::Instant::now();
     let dedup_in_batch: u32 = primary
         .iter()
         .filter(|(_, _, is_new)| !*is_new)
@@ -171,8 +180,17 @@ pub async fn submit_batch(
         sub.reserved_drvs
             .fetch_sub(dedup_in_batch, Ordering::AcqRel);
     }
+    state
+        .metrics
+        .inner
+        .ingest_phase_duration_seconds
+        .get_or_create(&PhaseLabels {
+            phase: "reserve".into(),
+        })
+        .observe(t_reserve.elapsed().as_secs_f64());
 
     // Phase 2: membership + edges.
+    let t_attach = std::time::Instant::now();
     let mut new_drvs: u32 = 0;
     let mut dedup_skipped: u32 = 0;
     for (req_drv, step, is_new) in &primary {
@@ -202,12 +220,30 @@ pub async fn submit_batch(
         }
     }
 
+    state
+        .metrics
+        .inner
+        .ingest_phase_duration_seconds
+        .get_or_create(&PhaseLabels {
+            phase: "attach".into(),
+        })
+        .observe(t_attach.elapsed().as_secs_f64());
+
     // Phase 3: arm fresh leaves.
+    let t_enqueue = std::time::Instant::now();
     for (_, step, is_new) in &primary {
         if *is_new {
             arm_if_leaf(step);
         }
     }
+    state
+        .metrics
+        .inner
+        .ingest_phase_duration_seconds
+        .get_or_create(&PhaseLabels {
+            phase: "enqueue".into(),
+        })
+        .observe(t_enqueue.elapsed().as_secs_f64());
 
     state.dispatcher.wake();
     state.metrics.inner.drvs_ingested.inc_by(new_drvs as u64);
@@ -321,7 +357,7 @@ fn wire_dep(
         if dep.previous_failure.load(Ordering::Acquire) {
             super::complete::propagate_failure_inmem_for_bench(&dep, dep.drv_hash());
         } else {
-            crate::dispatch::rdep::make_rdeps_runnable(&dep);
+            crate::dispatch::rdep::make_rdeps_runnable_observed(&dep, &state.metrics);
         }
     }
     Ok(())

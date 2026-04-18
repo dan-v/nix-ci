@@ -6,10 +6,34 @@
 //! inserts into `failed_outputs`. No cross-table joins, no recursive
 //! CTEs.
 
+use std::time::Instant;
+
 use sqlx::PgPool;
 
 use crate::error::{Error, Result};
+use crate::observability::metrics::Metrics;
 use crate::types::{DrvHash, JobId, JobStatusResponse};
+
+/// Acquire a pooled connection while recording the wait time into the
+/// `pg_pool_acquire_duration_seconds` histogram. Callers on the hot
+/// complete / ingest paths use this variant; tests and cold-path
+/// lookups can call `pool.acquire()` directly.
+///
+/// The observation is taken on BOTH success and error — an `acquire`
+/// that hits `acquire_timeout` (10s default) still tells us the pool
+/// is starving, and the histogram should reflect that.
+pub async fn timed_acquire(
+    pool: &PgPool,
+    metrics: &Metrics,
+) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    let t0 = Instant::now();
+    let out = pool.acquire().await;
+    metrics
+        .inner
+        .pg_pool_acquire_duration_seconds
+        .observe(t0.elapsed().as_secs_f64());
+    Ok(out?)
+}
 
 /// Insert the job row and return the winning id. Idempotent under
 /// concurrent retries on EITHER unique constraint:
@@ -29,11 +53,7 @@ use crate::types::{DrvHash, JobId, JobStatusResponse};
 /// and SELECT the existing row by `external_ref`. This keeps the
 /// happy path a single round trip and only pays the extra SELECT on
 /// the rare external-ref race.
-pub async fn upsert_job(
-    pool: &PgPool,
-    job_id: JobId,
-    external_ref: Option<&str>,
-) -> Result<JobId> {
+pub async fn upsert_job(pool: &PgPool, job_id: JobId, external_ref: Option<&str>) -> Result<JobId> {
     let inserted: std::result::Result<Option<(sqlx::types::Uuid,)>, sqlx::Error> = sqlx::query_as(
         r#"
         INSERT INTO jobs (id, status, external_ref)
@@ -66,12 +86,11 @@ pub async fn upsert_job(
                 // ever surprises us.
                 return Err(sqlx::Error::Database(db_err).into());
             };
-            let row: (sqlx::types::Uuid,) = sqlx::query_as(
-                "SELECT id FROM jobs WHERE external_ref = $1 LIMIT 1",
-            )
-            .bind(ext)
-            .fetch_one(pool)
-            .await?;
+            let row: (sqlx::types::Uuid,) =
+                sqlx::query_as("SELECT id FROM jobs WHERE external_ref = $1 LIMIT 1")
+                    .bind(ext)
+                    .fetch_one(pool)
+                    .await?;
             Ok(JobId(row.0))
         }
         Err(e) => Err(e.into()),
@@ -138,6 +157,20 @@ pub async fn persist_terminal_snapshot(
     transition_job_terminal(pool, job_id, snapshot.status.as_str(), &json).await
 }
 
+/// Observed variant: records pool-acquire wait time on the hot
+/// complete path. Prefer this over `persist_terminal_snapshot` from
+/// code that has a Metrics handle in scope.
+pub async fn persist_terminal_snapshot_observed(
+    pool: &PgPool,
+    metrics: &Metrics,
+    job_id: JobId,
+    snapshot: &JobStatusResponse,
+) -> Result<bool> {
+    let json = serde_json::to_value(snapshot)
+        .map_err(|e| Error::Internal(format!("serialize terminal snapshot: {e}")))?;
+    transition_job_terminal_observed(pool, metrics, job_id, snapshot.status.as_str(), &json).await
+}
+
 pub async fn transition_job_terminal(
     pool: &PgPool,
     job_id: JobId,
@@ -161,6 +194,31 @@ pub async fn transition_job_terminal(
     Ok(res.rows_affected() > 0)
 }
 
+async fn transition_job_terminal_observed(
+    pool: &PgPool,
+    metrics: &Metrics,
+    job_id: JobId,
+    status: &str,
+    result: &serde_json::Value,
+) -> Result<bool> {
+    let mut conn = timed_acquire(pool, metrics).await?;
+    let res = sqlx::query(
+        r#"
+        UPDATE jobs
+        SET status = $2,
+            done_at = now(),
+            result = $3
+        WHERE id = $1 AND done_at IS NULL
+        "#,
+    )
+    .bind(job_id.0)
+    .bind(status)
+    .bind(result)
+    .execute(&mut *conn)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Insert a batch of failed output paths into the TTL cache. Called
 /// once per terminal-failed drv so future ingests of the same output
 /// path can short-circuit without dispatching a worker.
@@ -175,6 +233,28 @@ pub async fn insert_failed_outputs(
     output_paths: &[String],
     ttl_secs: u64,
 ) -> Result<()> {
+    insert_failed_outputs_inner(pool, None, drv_hash, output_paths, ttl_secs).await
+}
+
+/// Observed variant: records pool-acquire wait time on the hot
+/// failure path.
+pub async fn insert_failed_outputs_observed(
+    pool: &PgPool,
+    metrics: &Metrics,
+    drv_hash: &DrvHash,
+    output_paths: &[String],
+    ttl_secs: u64,
+) -> Result<()> {
+    insert_failed_outputs_inner(pool, Some(metrics), drv_hash, output_paths, ttl_secs).await
+}
+
+async fn insert_failed_outputs_inner(
+    pool: &PgPool,
+    metrics: Option<&Metrics>,
+    drv_hash: &DrvHash,
+    output_paths: &[String],
+    ttl_secs: u64,
+) -> Result<()> {
     if output_paths.is_empty() {
         return Ok(());
     }
@@ -182,19 +262,28 @@ pub async fn insert_failed_outputs(
         std::iter::repeat_n(drv_hash.as_str(), output_paths.len()).collect();
     let path_refs: Vec<&str> = output_paths.iter().map(String::as_str).collect();
     let ttl: f64 = ttl_secs as f64;
-    sqlx::query(
-        r#"
+    let query = r#"
         INSERT INTO failed_outputs (output_path, drv_hash, expires_at)
         SELECT output_path, drv_hash, now() + make_interval(secs => $3)
         FROM UNNEST($1::text[], $2::text[]) AS t(output_path, drv_hash)
         ON CONFLICT (output_path) DO NOTHING
-        "#,
-    )
-    .bind(&path_refs)
-    .bind(&drv_hash_refs)
-    .bind(ttl)
-    .execute(pool)
-    .await?;
+        "#;
+    if let Some(m) = metrics {
+        let mut conn = timed_acquire(pool, m).await?;
+        sqlx::query(query)
+            .bind(&path_refs)
+            .bind(&drv_hash_refs)
+            .bind(ttl)
+            .execute(&mut *conn)
+            .await?;
+    } else {
+        sqlx::query(query)
+            .bind(&path_refs)
+            .bind(&drv_hash_refs)
+            .bind(ttl)
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 

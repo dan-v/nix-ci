@@ -124,9 +124,8 @@ async fn writes_archived_log_for_originating_failure(pool: PgPool) {
     collect_failure_logs(&client, job.id, &snap, tmp.path()).await;
 
     let log_path = tmp.path().join("build_logs").join("broken-pkg.log");
-    let body = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
-        panic!("expected file at {log_path:?}: {e}")
-    });
+    let body = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("expected file at {log_path:?}: {e}"));
     assert!(
         body.contains("FULL ARCHIVED LOG"),
         "must pull archived log, got {body:?}"

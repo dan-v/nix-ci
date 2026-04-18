@@ -340,7 +340,9 @@ fn fenced_vec(state: &AppState) -> Vec<String> {
 
 fn validate_worker_id(worker_id: &str, max_bytes: usize) -> Result<(), crate::Error> {
     if worker_id.is_empty() {
-        return Err(crate::Error::BadRequest("worker_id must be non-empty".into()));
+        return Err(crate::Error::BadRequest(
+            "worker_id must be non-empty".into(),
+        ));
     }
     if worker_id.len() > max_bytes {
         return Err(crate::Error::BadRequest(format!(

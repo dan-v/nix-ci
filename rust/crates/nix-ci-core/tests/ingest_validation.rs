@@ -3,14 +3,10 @@
 
 mod common;
 
-
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CreateJobRequest, IngestBatchRequest, IngestDrvRequest,
-};
+use nix_ci_core::types::{CreateJobRequest, IngestBatchRequest, IngestDrvRequest};
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn ingest_rejects_empty_drv_path(pool: PgPool) {
@@ -99,8 +95,8 @@ async fn ingest_batch_partial_validation_counts_errors(pool: PgPool) {
     };
     let batch = IngestBatchRequest {
         drvs: vec![ingest(&good, "pkg", &[], true), bad_empty, bad_nohyphen],
-    eval_errors: Vec::new(),
-        };
+        eval_errors: Vec::new(),
+    };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.new_drvs, 1);
     assert_eq!(resp.errored, 2);
@@ -151,7 +147,13 @@ async fn ingest_length_boundaries_accept_at_max_reject_above(pool: PgPool) {
         attr: None,
     };
     let resp = client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs: vec![at_cap], eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: vec![at_cap],
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(resp.errored, 0, "drv at exactly cap must be accepted");
@@ -172,8 +174,8 @@ async fn ingest_length_boundaries_accept_at_max_reject_above(pool: PgPool) {
             job.id,
             &IngestBatchRequest {
                 drvs: vec![over_cap],
-            eval_errors: Vec::new(),
-        },
+                eval_errors: Vec::new(),
+            },
         )
         .await
         .unwrap();
@@ -201,8 +203,8 @@ async fn ingest_batch_counts_wire_dep_errors(pool: PgPool) {
             job.id,
             &IngestBatchRequest {
                 drvs: vec![good_parent],
-            eval_errors: Vec::new(),
-        },
+                eval_errors: Vec::new(),
+            },
         )
         .await
         .unwrap();
@@ -231,7 +233,10 @@ async fn ingest_batch_rejects_empty_drv_name(pool: PgPool) {
         .unwrap();
     let mut bad = ingest(&drv_path("ok", "ignored"), "ignored", &[], true);
     bad.drv_name = "".into();
-    let batch = IngestBatchRequest { drvs: vec![bad], eval_errors: Vec::new() };
+    let batch = IngestBatchRequest {
+        drvs: vec![bad],
+        eval_errors: Vec::new(),
+    };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.errored, 1);
     assert_eq!(resp.new_drvs, 0);
@@ -250,7 +255,10 @@ async fn ingest_batch_rejects_empty_system(pool: PgPool) {
         .unwrap();
     let mut bad = ingest(&drv_path("ok", "ignored"), "ignored", &[], true);
     bad.system = "".into();
-    let batch = IngestBatchRequest { drvs: vec![bad], eval_errors: Vec::new() };
+    let batch = IngestBatchRequest {
+        drvs: vec![bad],
+        eval_errors: Vec::new(),
+    };
     let resp = client.ingest_batch(job.id, &batch).await.unwrap();
     assert_eq!(resp.errored, 1);
     assert_eq!(resp.new_drvs, 0);

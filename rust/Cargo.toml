@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nix-ci-core", "crates/nix-ci"]
+members = ["crates/nix-ci-core", "crates/nix-ci", "crates/nix-ci-loom-checks"]
 resolver = "2"
 
 [workspace.package]

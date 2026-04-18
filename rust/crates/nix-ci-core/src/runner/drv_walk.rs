@@ -57,10 +57,10 @@ pub fn walk_filtered(
             // a silent partial-closure submission — if a single .drv
             // can't be read, the build graph is not trustworthy and
             // the caller needs to know so they can retry or diagnose.
-            let bytes = std::fs::read(&drv_path)
-                .with_context(|| format!("read .drv file {drv_path}"))?;
-            let parsed = drv_parser::parse(&bytes)
-                .with_context(|| format!("parse .drv file {drv_path}"))?;
+            let bytes =
+                std::fs::read(&drv_path).with_context(|| format!("read .drv file {drv_path}"))?;
+            let parsed =
+                drv_parser::parse(&bytes).with_context(|| format!("parse .drv file {drv_path}"))?;
             parsed_cache.insert(drv_path.clone(), parsed);
         }
         let parsed = &parsed_cache[&drv_path];

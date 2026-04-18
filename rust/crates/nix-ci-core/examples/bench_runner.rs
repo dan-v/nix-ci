@@ -203,12 +203,36 @@ fn scenario_build_dag_timed(iters: usize, layers: usize, width: usize, fi: usize
         + t.add_root;
     let pct = |d: std::time::Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64().max(1e-9);
     eprintln!("phase breakdown (total={total:?}):");
-    eprintln!("  get_or_create     {:>8?}  {:5.1}%", t.get_or_create, pct(t.get_or_create));
-    eprintln!("  add_member        {:>8?}  {:5.1}%", t.add_member, pct(t.add_member));
-    eprintln!("  attach_submission {:>8?}  {:5.1}%", t.attach_submission, pct(t.attach_submission));
-    eprintln!("  attach_dep        {:>8?}  {:5.1}%", t.attach_dep, pct(t.attach_dep));
-    eprintln!("  arm_leaves        {:>8?}  {:5.1}%", t.arm_leaves, pct(t.arm_leaves));
-    eprintln!("  add_root          {:>8?}  {:5.1}%", t.add_root, pct(t.add_root));
+    eprintln!(
+        "  get_or_create     {:>8?}  {:5.1}%",
+        t.get_or_create,
+        pct(t.get_or_create)
+    );
+    eprintln!(
+        "  add_member        {:>8?}  {:5.1}%",
+        t.add_member,
+        pct(t.add_member)
+    );
+    eprintln!(
+        "  attach_submission {:>8?}  {:5.1}%",
+        t.attach_submission,
+        pct(t.attach_submission)
+    );
+    eprintln!(
+        "  attach_dep        {:>8?}  {:5.1}%",
+        t.attach_dep,
+        pct(t.attach_dep)
+    );
+    eprintln!(
+        "  arm_leaves        {:>8?}  {:5.1}%",
+        t.arm_leaves,
+        pct(t.arm_leaves)
+    );
+    eprintln!(
+        "  add_root          {:>8?}  {:5.1}%",
+        t.add_root,
+        pct(t.add_root)
+    );
 }
 
 fn scenario_detect_cycle(iters: usize, layers: usize, width: usize) {

@@ -120,9 +120,7 @@ pub async fn run(
                 // cause rather than silently dropping an attr (which
                 // would seal the job as Done with incomplete ingest
                 // and the user would never know).
-                Error::Internal(format!(
-                    "drv closure walk failed for root {root_drv}: {e}"
-                ))
+                Error::Internal(format!("drv closure walk failed for root {root_drv}: {e}"))
             })?;
 
         let mut drvs: Vec<_> = walked
@@ -149,10 +147,7 @@ pub async fn run(
         let count = drvs.len();
         let eval_errors = std::mem::take(&mut eval_error_buf);
         match client
-            .ingest_batch(
-                job_id,
-                &IngestBatchRequest { drvs, eval_errors },
-            )
+            .ingest_batch(job_id, &IngestBatchRequest { drvs, eval_errors })
             .await
         {
             Ok(resp) => {

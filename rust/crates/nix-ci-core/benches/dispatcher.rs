@@ -183,54 +183,50 @@ fn bench_fleet_scan(c: &mut Criterion) {
     // skippable except the last — worst case for the scan.
     for &n_subs in &[10usize, 100, 1_000] {
         group.throughput(Throughput::Elements(n_subs as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_subs),
-            &n_subs,
-            |b, &n| {
-                let subs = Submissions::new();
-                let mut jobs: Vec<JobId> = Vec::with_capacity(n);
-                for i in 0..n {
-                    let id = JobId::new();
-                    let sub = subs.get_or_insert(id, 256);
-                    jobs.push(id);
-                    // Put one ready step in each submission EXCEPT we
-                    // arm only the LAST one. The prior subs have empty
-                    // ready queues; the scan walks past them.
-                    if i + 1 == n {
-                        let s = make_step(0, i);
-                        s.created.store(true, Ordering::Release);
+        group.bench_with_input(BenchmarkId::from_parameter(n_subs), &n_subs, |b, &n| {
+            let subs = Submissions::new();
+            let mut jobs: Vec<JobId> = Vec::with_capacity(n);
+            for i in 0..n {
+                let id = JobId::new();
+                let sub = subs.get_or_insert(id, 256);
+                jobs.push(id);
+                // Put one ready step in each submission EXCEPT we
+                // arm only the LAST one. The prior subs have empty
+                // ready queues; the scan walks past them.
+                if i + 1 == n {
+                    let s = make_step(0, i);
+                    s.created.store(true, Ordering::Release);
+                    s.runnable.store(true, Ordering::Release);
+                    sub.add_member(&s);
+                    sub.enqueue_ready(&s);
+                }
+            }
+            b.iter(|| {
+                // Sort + scan — same op the fleet claim does.
+                let sorted = subs.sorted_by_created_at();
+                let systems = vec!["x86_64-linux".to_string()];
+                let features: Vec<String> = Vec::new();
+                let mut hit = None;
+                for sub in &sorted {
+                    if let Some(step) = sub.pop_runnable(&systems, &features, 0) {
+                        hit = Some(step);
+                        break;
+                    }
+                }
+                black_box(hit);
+            });
+            // Re-arm the last sub's ready for the next iteration
+            // since pop consumed it. (Outside b.iter so it doesn't
+            // pollute measurement.)
+            if let Some(id) = jobs.last() {
+                if let Some(sub) = subs.get(*id) {
+                    for s in sub.members.read().values() {
                         s.runnable.store(true, Ordering::Release);
-                        sub.add_member(&s);
-                        sub.enqueue_ready(&s);
+                        sub.enqueue_ready(s);
                     }
                 }
-                b.iter(|| {
-                    // Sort + scan — same op the fleet claim does.
-                    let sorted = subs.sorted_by_created_at();
-                    let systems = vec!["x86_64-linux".to_string()];
-                    let features: Vec<String> = Vec::new();
-                    let mut hit = None;
-                    for sub in &sorted {
-                        if let Some(step) = sub.pop_runnable(&systems, &features, 0) {
-                            hit = Some(step);
-                            break;
-                        }
-                    }
-                    black_box(hit);
-                });
-                // Re-arm the last sub's ready for the next iteration
-                // since pop consumed it. (Outside b.iter so it doesn't
-                // pollute measurement.)
-                if let Some(id) = jobs.last() {
-                    if let Some(sub) = subs.get(*id) {
-                        for s in sub.members.read().values() {
-                            s.runnable.store(true, Ordering::Release);
-                            sub.enqueue_ready(s);
-                        }
-                    }
-                }
-            },
-        );
+            }
+        });
     }
     group.finish();
 }
@@ -345,27 +341,23 @@ fn bench_attach_step_many_submissions(c: &mut Criterion) {
     // attach_submission in turn. On the Nth call the scan is O(N-1).
     for &n_subs in &[10usize, 100, 1_000] {
         group.throughput(Throughput::Elements(n_subs as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_subs),
-            &n_subs,
-            |b, &n| {
-                b.iter_batched(
-                    || {
-                        let step = make_step(0, 0);
-                        let subs: Vec<Arc<Submission>> =
-                            (0..n).map(|_| Submission::new(JobId::new(), 8)).collect();
-                        (step, subs)
-                    },
-                    |(step, subs)| {
-                        for sub in &subs {
-                            let _ = step.state.write().attach_submission(sub);
-                        }
-                        black_box(step);
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(n_subs), &n_subs, |b, &n| {
+            b.iter_batched(
+                || {
+                    let step = make_step(0, 0);
+                    let subs: Vec<Arc<Submission>> =
+                        (0..n).map(|_| Submission::new(JobId::new(), 8)).collect();
+                    (step, subs)
+                },
+                |(step, subs)| {
+                    for sub in &subs {
+                        let _ = step.state.write().attach_submission(sub);
+                    }
+                    black_box(step);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
     }
     group.finish();
 }
@@ -409,7 +401,8 @@ fn bench_drv_parser(c: &mut Criterion) {
             |b, input| {
                 b.iter(|| {
                     let parsed =
-                        nix_ci_core::runner::drv_parser::parse(black_box(input.as_slice())).unwrap();
+                        nix_ci_core::runner::drv_parser::parse(black_box(input.as_slice()))
+                            .unwrap();
                     black_box(parsed);
                 });
             },

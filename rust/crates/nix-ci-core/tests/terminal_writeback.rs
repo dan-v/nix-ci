@@ -7,12 +7,8 @@ use std::time::Duration;
 
 use common::{drv_path, ingest};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, ErrorCategory,
-    JobStatus,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, ErrorCategory, JobStatus};
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn terminal_snapshot_caps_failures(pool: PgPool) {

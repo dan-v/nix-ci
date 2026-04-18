@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 
 use super::AppState;
-use crate::dispatch::rdep::make_rdeps_runnable;
+use crate::dispatch::rdep::make_rdeps_runnable_observed;
 use crate::dispatch::Submission;
 use crate::durable::writeback;
 use crate::error::{Error, Result};
@@ -42,11 +42,7 @@ pub async fn complete(
     // the legitimate /complete on the correct job to return
     // ignored:true. `take_for_job` leaves the claim in place on a
     // job mismatch so the correct owner can still finish it.
-    let claim = match state
-        .dispatcher
-        .claims
-        .take_for_job(claim_id, job_id)
-    {
+    let claim = match state.dispatcher.claims.take_for_job(claim_id, job_id) {
         Ok(c) => c,
         Err(crate::dispatch::ClaimJobMismatch::NotFound) => {
             return Ok(Json(CompleteResponse { ignored: true }));
@@ -136,7 +132,7 @@ async fn handle_success(
         });
     }
 
-    make_rdeps_runnable(step);
+    make_rdeps_runnable_observed(step, &state.metrics);
 
     for sub in &subs {
         check_and_publish_terminal(state, sub).await?;
@@ -200,8 +196,9 @@ async fn handle_failure(
         // validates), so the stripped result is guaranteed non-empty
         // and distinct from the input.
         let output_path = step.drv_path().trim_end_matches(".drv").to_string();
-        if let Err(e) = writeback::insert_failed_outputs(
+        if let Err(e) = writeback::insert_failed_outputs_observed(
             &state.pool,
+            &state.metrics,
             step.drv_hash(),
             &[output_path],
             state.cfg.failed_outputs_ttl_secs,
@@ -416,10 +413,7 @@ pub(crate) fn cap_failures(mut all: Vec<DrvFailure>, cap: usize) -> Vec<DrvFailu
 /// because they owned the root. Without that restriction a dedup-shared
 /// originating failure would pollute every joined submission's failures
 /// list with drvs those submissions never submitted.
-pub(super) fn propagate_failure_inmem(
-    root: &Arc<crate::dispatch::Step>,
-    origin: &DrvHash,
-) -> u64 {
+pub(super) fn propagate_failure_inmem(root: &Arc<crate::dispatch::Step>, origin: &DrvHash) -> u64 {
     use std::collections::VecDeque;
     let mut frontier: VecDeque<Arc<crate::dispatch::Step>> = VecDeque::new();
     {
@@ -506,7 +500,13 @@ pub(super) async fn check_and_publish_terminal(
         eval_error: None,
         eval_errors: eval_errors_snapshot,
     };
-    let _ = writeback::persist_terminal_snapshot(&state.pool, sub.id, &snapshot).await?;
+    let _ = writeback::persist_terminal_snapshot_observed(
+        &state.pool,
+        &state.metrics,
+        sub.id,
+        &snapshot,
+    )
+    .await?;
 
     if !sub.mark_terminal() {
         return Ok(());

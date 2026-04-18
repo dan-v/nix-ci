@@ -192,10 +192,22 @@ mod tests {
         for name in ["..", ".", "../../etc/passwd", "../../../tmp/pwn", ""] {
             let mut used = HashSet::new();
             let out = unique_filename(name, &mut used);
-            assert!(!out.contains('/'), "must not contain '/': {out:?} (from {name:?})");
-            assert!(!out.contains('\\'), "must not contain '\\': {out:?} (from {name:?})");
-            assert_ne!(out, ".log", "must not be bare `.log`: {out:?} (from {name:?})");
-            assert_ne!(out, "..log", "must not be bare `..log`: {out:?} (from {name:?})");
+            assert!(
+                !out.contains('/'),
+                "must not contain '/': {out:?} (from {name:?})"
+            );
+            assert!(
+                !out.contains('\\'),
+                "must not contain '\\': {out:?} (from {name:?})"
+            );
+            assert_ne!(
+                out, ".log",
+                "must not be bare `.log`: {out:?} (from {name:?})"
+            );
+            assert_ne!(
+                out, "..log",
+                "must not be bare `..log`: {out:?} (from {name:?})"
+            );
 
             let base = std::path::PathBuf::from("/base/sub");
             let joined = base.join(&out);

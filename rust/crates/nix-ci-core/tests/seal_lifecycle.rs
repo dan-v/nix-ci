@@ -3,15 +3,10 @@
 
 mod common;
 
-
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CreateJobRequest, IngestBatchRequest,
-    JobStatus,
-};
+use nix_ci_core::types::{CreateJobRequest, IngestBatchRequest, JobStatus};
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn ingest_on_sealed_job_is_rejected(pool: PgPool) {
@@ -120,8 +115,8 @@ async fn seal_rejects_dep_cycle(pool: PgPool) {
     // the same batch to wire the back-edge.
     let batch = IngestBatchRequest {
         drvs: vec![ingest(&a, "a", &[&b], true), ingest(&b, "b", &[&a], false)],
-    eval_errors: Vec::new(),
-        };
+        eval_errors: Vec::new(),
+    };
     client.ingest_batch(job.id, &batch).await.unwrap();
 
     // Seal must fail the job immediately (without stalling) with
@@ -166,8 +161,8 @@ async fn ingest_strips_self_loop(pool: PgPool) {
             job.id,
             &IngestBatchRequest {
                 drvs: vec![ingest(&a, "a", &[&a], true)],
-            eval_errors: Vec::new(),
-        },
+                eval_errors: Vec::new(),
+            },
         )
         .await
         .unwrap();

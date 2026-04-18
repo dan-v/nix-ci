@@ -113,6 +113,39 @@ pub struct MetricsInner {
     /// alive); a sudden drop coinciding with rising `claims_expired`
     /// means workers are failing to refresh.
     pub claim_lease_extensions: Counter,
+    /// Fleet-claim scan duration: walking every live submission in
+    /// schedule order looking for a claimable step. Under 1000+
+    /// concurrent workers racing on a single `notify_waiters` edge,
+    /// this is O(live_submissions) per wake-up. A drift upward here
+    /// directly explains p99 claim-latency regressions.
+    pub fleet_scan_duration_seconds: Histogram,
+    /// `make_rdeps_runnable` duration. Tail reveals dep-graph fan-out
+    /// pathologies — a single completion touching 10K rdeps takes
+    /// time that dispatch_wait wrongly attributes to claim-path cost.
+    pub rdep_propagation_duration_seconds: Histogram,
+    /// `pool.acquire()` wait time. When the 16-slot pool is saturated,
+    /// `acquire_timeout` kicks in at 10s — but we want to see the
+    /// contention building up long before then. A non-zero p99 here
+    /// is the canary for "writeback can't keep up."
+    pub pg_pool_acquire_duration_seconds: Histogram,
+    /// Per-phase ingest latency. The `phase` label takes one of
+    /// `parse`, `reserve`, `attach`, `enqueue`. Attributes a slow
+    /// batch to a specific phase so we can intervene surgically
+    /// (e.g., attach-phase tail → dep-graph lock contention;
+    /// enqueue-phase tail → many systems or oversubscribed ready
+    /// queue).
+    pub ingest_phase_duration_seconds: Family<PhaseLabels, Histogram>,
+    /// Hot-path lock wait time. Labeled by `site`: `claims_map_write`,
+    /// `submissions_read`, `submission_ready_write`, `step_state_write`,
+    /// `steps_registry_write`. Most calls should sit in the first two
+    /// buckets (<10µs). A rising tail for a specific site directly
+    /// names the contention source.
+    pub lock_wait_seconds: Family<LockLabels, Histogram>,
+    /// Requests shed by the overload-protection path (503). Non-zero
+    /// is not a bug — it's the degradation contract firing. Critical
+    /// path: when this rate exceeds a threshold, operators should
+    /// scale out, not debug.
+    pub overload_rejections: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -133,6 +166,21 @@ pub struct HttpLabels {
     pub method: String,
     pub route: String,
     pub status: String,
+}
+
+/// Label for `ingest_phase_duration_seconds`. Low cardinality: values
+/// are enumerated at the callsite (`parse`, `reserve`, `attach`,
+/// `enqueue`) — no user-controlled strings ever reach this label.
+#[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
+pub struct PhaseLabels {
+    pub phase: String,
+}
+
+/// Label for `lock_wait_seconds`. `site` is one of a small, fixed set
+/// of lock-instrumentation callsites; low cardinality by construction.
+#[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
+pub struct LockLabels {
+    pub site: String,
 }
 
 impl Default for Metrics {
@@ -361,6 +409,61 @@ impl Metrics {
             claim_lease_extensions.clone(),
         );
 
+        // Scale-diagnostics histograms. Before these existed, a p99
+        // spike in dispatch_wait_seconds had no attribution: lock
+        // contention, fleet-scan cost, rdep fan-out, and PG pool waits
+        // all looked identical from the outside. Buckets are chosen
+        // for the dispatcher's expected µs–ms regime — a single
+        // observation in the ≥1s bucket is a 3am alert.
+        let fleet_scan_duration_seconds =
+            Histogram::new([0.000_01, 0.000_1, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]);
+        registry.register(
+            "nix_ci_fleet_scan_duration_seconds",
+            "Fleet-claim scan: Submissions::sorted_by_created_at walk. Tail reveals O(N) scaling vs. live-submission count.",
+            fleet_scan_duration_seconds.clone(),
+        );
+        let rdep_propagation_duration_seconds =
+            Histogram::new([0.000_001, 0.000_01, 0.000_1, 0.001, 0.01, 0.1, 1.0]);
+        registry.register(
+            "nix_ci_rdep_propagation_duration_seconds",
+            "make_rdeps_runnable wall-clock. Tail reveals fan-out pathologies in the dep graph.",
+            rdep_propagation_duration_seconds.clone(),
+        );
+        let pg_pool_acquire_duration_seconds =
+            Histogram::new([0.000_1, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]);
+        registry.register(
+            "nix_ci_pg_pool_acquire_duration_seconds",
+            "Wall-clock waiting for a connection from the Postgres pool. Rising tail means pool starvation.",
+            pg_pool_acquire_duration_seconds.clone(),
+        );
+        let ingest_phase_duration_seconds: Family<PhaseLabels, Histogram> =
+            Family::new_with_constructor(|| {
+                Histogram::new([0.000_01, 0.000_1, 0.001, 0.01, 0.1, 1.0, 10.0])
+            });
+        registry.register(
+            "nix_ci_ingest_phase_duration_seconds",
+            "Per-phase ingest latency: parse / reserve / attach / enqueue. Attributes a slow ingest to a specific phase.",
+            ingest_phase_duration_seconds.clone(),
+        );
+        let lock_wait_seconds: Family<LockLabels, Histogram> = Family::new_with_constructor(|| {
+            Histogram::new([0.000_001, 0.000_01, 0.000_1, 0.001, 0.01, 0.1, 1.0])
+        });
+        registry.register(
+            "nix_ci_lock_wait_seconds",
+            "Wall-clock waiting to acquire a hot-path lock. Labels identify the lock site.",
+            lock_wait_seconds.clone(),
+        );
+        // Degradation contract: requests rejected by the coordinator's
+        // own overload-shedding path. A non-zero rate is not a bug —
+        // it's the contract saying "I'm protecting myself." Clients
+        // see 503 and are expected to back off and retry.
+        let overload_rejections = Counter::default();
+        registry.register(
+            "nix_ci_overload_rejections",
+            "Requests shed to protect the coordinator under overload (503).",
+            overload_rejections.clone(),
+        );
+
         // Process-global panic counter. Cloned into the per-instance
         // registry so `/metrics` surfaces any panic in this process,
         // including panics in background tasks that aren't part of the
@@ -402,6 +505,12 @@ impl Metrics {
                 pg_pool_idle,
                 failed_outputs_hits_total,
                 claim_lease_extensions,
+                fleet_scan_duration_seconds,
+                rdep_propagation_duration_seconds,
+                pg_pool_acquire_duration_seconds,
+                ingest_phase_duration_seconds,
+                lock_wait_seconds,
+                overload_rejections,
             }),
         }
     }

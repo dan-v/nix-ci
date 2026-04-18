@@ -7,12 +7,8 @@ use std::time::Duration;
 
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, ErrorCategory,
-    JobStatus,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, ErrorCategory, JobStatus};
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn retryable_exhaustion_becomes_terminal(pool: PgPool) {

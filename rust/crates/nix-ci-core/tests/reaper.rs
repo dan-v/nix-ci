@@ -7,11 +7,8 @@ use std::time::Duration;
 
 use common::{drv_path, ingest};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CreateJobRequest, IngestBatchRequest, IngestDrvRequest,
-};
+use nix_ci_core::types::{CreateJobRequest, IngestBatchRequest, IngestDrvRequest};
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn reaper_does_not_re_arm_step_finished_via_propagation(pool: PgPool) {
@@ -115,7 +112,13 @@ async fn reaper_rearms_many_concurrent_expired_claims(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();

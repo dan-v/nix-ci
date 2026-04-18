@@ -198,10 +198,10 @@ async fn request_timeout_layer(
     let fut = next.run(req);
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
         Ok(resp) => resp,
-        Err(_) => crate::Error::ServiceUnavailable(format!(
-            "handler exceeded {timeout_secs}s timeout"
-        ))
-        .into_response(),
+        Err(_) => {
+            crate::Error::ServiceUnavailable(format!("handler exceeded {timeout_secs}s timeout"))
+                .into_response()
+        }
     }
 }
 
@@ -274,10 +274,8 @@ async fn bearer_auth_layer(
         if matches_worker {
             // Authenticated but not privileged: 403 is more accurate
             // than 401 and tells operators exactly what went wrong.
-            return crate::Error::Forbidden(
-                "admin bearer required for this endpoint".into(),
-            )
-            .into_response();
+            return crate::Error::Forbidden("admin bearer required for this endpoint".into())
+                .into_response();
         }
         return crate::Error::Unauthorized("invalid bearer token".into()).into_response();
     }

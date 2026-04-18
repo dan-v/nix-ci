@@ -48,6 +48,21 @@ days of nightly chaos-scale + property runs without a violation.
   Measured by `load::memory_budget` using `/proc/self/status` + metric.
 - **S-WAKE-FLEET**: Fleet-claim wake-up of 1000 workers on 100
   submissions costs < 200ms total CPU. Measured by `load::fleet_wake`.
+- **S-CLAIM-1K**: Under a 1000-worker, 5K-drv fan-in DAG, p99 claim
+  latency < 500ms and runtime < 180s. Measured by
+  `scale::scale_1k_workers_fan_in`.
+- **S-CHAIN-DEPTH**: A 2000-deep linear dep chain terminates in
+  < 180s (stresses `make_rdeps_runnable` critical path). Measured by
+  `scale::scale_tall_narrow_chain`.
+- **S-WIDE-CLAIM**: 20 000 independent leaf drvs with 1000 workers
+  complete in < 180s with p99 < 1s. Measured by
+  `scale::scale_wide_flat_leaves`.
+- **S-FLEET-SCAN**: A single fleet-claim scan across 1000 live
+  submissions completes in < 200ms. Measured by
+  `memory_bounds::fleet_scan_cost_sublinear_at_1k_subs`.
+- **S-SIM-SEEDS**: 10 000 nightly simulator seeds × 3000 events each
+  produce zero invariant violations. Measured by
+  `sim::sim_multiple_seeds_all_green` with `SIM_SEEDS=10000`.
 
 ## Observability
 
@@ -60,6 +75,29 @@ days of nightly chaos-scale + property runs without a violation.
 - **O-TRACE-E2E**: A single job's trace has spans from submitter →
   coordinator ingest → claim → complete, all under one root trace_id.
   Spot-checked via OTel Collector integration.
+
+## Degradation (the "won't break production" bar)
+
+- **R-SHED-CLEAN**: With `max_claims_in_flight=N`, the (N+1)-th
+  concurrent claim returns HTTP 503 + `Retry-After: 1` within 100ms
+  (no hang). Existing in-flight claims continue unaffected. Measured
+  by `degradation::claim_shedding_at_threshold` and
+  `degradation::active_claims_complete_despite_shedding`.
+- **R-POOL-EXHAUST**: With every Postgres pool slot held, claim and
+  non-terminal `complete` round-trips stay < 1s. Measured by
+  `pg_faults::claim_path_live_under_pool_exhaustion`.
+- **R-PG-DEGRADED**: With `statement_timeout=1ms` on the coordinator's
+  database, every API call either succeeds or returns a bounded-time
+  clean error (< 15s). No hangs. Measured by
+  `pg_faults::coordinator_survives_database_statement_timeout`.
+- **R-TERMINAL-JSONB-BOUNDED**: A catastrophic-failure job (every
+  drv fails) produces a terminal `jobs.result` JSONB under 1 MiB,
+  and `failures` is truncated at `max_failures_in_result` + a
+  synthetic marker. Measured by
+  `scale::scale_failures_vec_under_catastrophic_job`.
+- **R-CLAIMS-NO-LEAK**: After every terminal transition, the
+  in-memory claims map drops to 0 entries for the affected job.
+  Measured by `memory_bounds::claims_map_drains_after_all_completes`.
 
 ## Deployability
 

@@ -8,11 +8,9 @@ use std::time::Duration;
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
 use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, ErrorCategory, IngestBatchRequest,
-    JobStatus,
+    CompleteRequest, CreateJobRequest, ErrorCategory, IngestBatchRequest, JobStatus,
 };
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn previously_failed_drv_short_circuits_on_fresh_ingest(pool: PgPool) {
@@ -265,7 +263,13 @@ async fn propagated_failures_count_matches_rdep_closure(pool: PgPool) {
         ingest(&root, "root", &[&mid], true),
     ];
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();

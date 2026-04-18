@@ -12,9 +12,7 @@ use std::time::Duration;
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
 use nix_ci_core::runner::sse::print_events_with;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, ErrorCategory, JobId, JobStatus,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, ErrorCategory, JobId, JobStatus};
 use sqlx::PgPool;
 use tokio::sync::watch;
 
@@ -171,15 +169,7 @@ async fn unreachable_coordinator_surfaces_after_reconnect_budget(pool: PgPool) {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let sse_tx = shutdown_tx.clone();
     let sse = tokio::spawn(async move {
-        print_events_with(
-            client,
-            JobId::new(),
-            None,
-            false,
-            sse_tx,
-            shutdown_rx,
-        )
-        .await
+        print_events_with(client, JobId::new(), None, false, sse_tx, shutdown_rx).await
     });
 
     // After a short wait, the task should still be making reconnect

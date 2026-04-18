@@ -134,7 +134,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"].as_str().unwrap(), "bad request: missing system query param");
+        assert_eq!(
+            body["error"].as_str().unwrap(),
+            "bad request: missing system query param"
+        );
         assert_eq!(body["code"], 400);
     }
 
@@ -246,9 +249,8 @@ mod tests {
 
     #[tokio::test]
     async fn service_unavailable_body_is_sanitized_with_canonical_reason() {
-        let e = Error::ServiceUnavailable(
-            "pool saturated; 12 tasks queued on internal-host-7".into(),
-        );
+        let e =
+            Error::ServiceUnavailable("pool saturated; 12 tasks queued on internal-host-7".into());
         assert_eq!(e.status_code(), StatusCode::SERVICE_UNAVAILABLE);
         let resp = e.into_response();
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();

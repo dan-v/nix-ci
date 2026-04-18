@@ -9,12 +9,10 @@ use std::collections::HashSet;
 use chrono::{Duration as ChronoDuration, Utc};
 use nix_ci_core::durable::writeback::{
     failed_output_hits, find_job_by_external_ref, heartbeat_job, insert_failed_outputs,
-    list_jobs_by_status, lookup_job_by_external_ref, lookup_job_by_id,
-    persist_terminal_snapshot, seal_job, transition_job_terminal, upsert_job,
+    list_jobs_by_status, lookup_job_by_external_ref, lookup_job_by_id, persist_terminal_snapshot,
+    seal_job, transition_job_terminal, upsert_job,
 };
-use nix_ci_core::types::{
-    DrvHash, JobCounts, JobId, JobStatus, JobStatusResponse,
-};
+use nix_ci_core::types::{DrvHash, JobCounts, JobId, JobStatus, JobStatusResponse};
 use sqlx::PgPool;
 
 async fn migrate(pool: &PgPool) {
@@ -57,7 +55,9 @@ async fn upsert_job_is_idempotent_on_duplicate_id(pool: PgPool) {
 #[sqlx::test]
 async fn find_job_by_external_ref_returns_none_when_missing(pool: PgPool) {
     migrate(&pool).await;
-    let got = find_job_by_external_ref(&pool, "no-such-ref").await.unwrap();
+    let got = find_job_by_external_ref(&pool, "no-such-ref")
+        .await
+        .unwrap();
     assert!(got.is_none());
 }
 
@@ -103,7 +103,10 @@ async fn heartbeat_job_returns_true_for_pending_and_advances_timestamp(pool: PgP
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(t1 > t0, "heartbeat must advance last_heartbeat (got {t0} → {t1})");
+    assert!(
+        t1 > t0,
+        "heartbeat must advance last_heartbeat (got {t0} → {t1})"
+    );
 }
 
 #[sqlx::test]
@@ -138,7 +141,10 @@ async fn seal_job_is_idempotent_on_repeat(pool: PgPool) {
     migrate(&pool).await;
     let id = JobId::new();
     upsert_job(&pool, id, None).await.unwrap();
-    assert!(seal_job(&pool, id).await.unwrap(), "first seal returns true");
+    assert!(
+        seal_job(&pool, id).await.unwrap(),
+        "first seal returns true"
+    );
     assert!(
         seal_job(&pool, id).await.unwrap(),
         "second seal still returns true — the UPDATE still matches the row"
@@ -196,7 +202,10 @@ async fn persist_terminal_snapshot_writes_status_and_result_in_one_pass(pool: Pg
         .await
         .unwrap();
     assert_eq!(status, "done");
-    assert!(done_at.is_some(), "done_at must be populated for terminal jobs");
+    assert!(
+        done_at.is_some(),
+        "done_at must be populated for terminal jobs"
+    );
     let r = result.expect("result must be set");
     assert_eq!(r["status"], "done");
 }
@@ -213,7 +222,10 @@ async fn persist_terminal_snapshot_second_call_is_noop(pool: PgPool) {
     // done_at IS NULL guard must block it. The first write wins.
     let second = snapshot(id, JobStatus::Failed);
     let transitioned = persist_terminal_snapshot(&pool, id, &second).await.unwrap();
-    assert!(!transitioned, "second persist_terminal_snapshot must be a no-op");
+    assert!(
+        !transitioned,
+        "second persist_terminal_snapshot must be a no-op"
+    );
 
     let (status,): (String,) = sqlx::query_as("SELECT status FROM jobs WHERE id = $1")
         .bind(id.0)
@@ -247,11 +259,15 @@ async fn insert_failed_outputs_on_conflict_is_noop(pool: PgPool) {
         "/nix/store/out-a-fail".to_string(),
         "/nix/store/out-b-fail".to_string(),
     ];
-    insert_failed_outputs(&pool, &drv, &paths, 3600).await.unwrap();
+    insert_failed_outputs(&pool, &drv, &paths, 3600)
+        .await
+        .unwrap();
     // Re-insert the same paths: ON CONFLICT DO NOTHING must keep the
     // row count at 2. Without the guard, the second insert would
     // either error or duplicate the row.
-    insert_failed_outputs(&pool, &drv, &paths, 3600).await.unwrap();
+    insert_failed_outputs(&pool, &drv, &paths, 3600)
+        .await
+        .unwrap();
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM failed_outputs")
         .fetch_one(&pool)
         .await
@@ -265,7 +281,10 @@ async fn insert_failed_outputs_on_conflict_is_noop(pool: PgPool) {
 async fn failed_output_hits_empty_input_is_empty(pool: PgPool) {
     migrate(&pool).await;
     let got = failed_output_hits(&pool, &[]).await;
-    assert!(got.is_empty(), "zero inputs must produce zero hits without a DB trip");
+    assert!(
+        got.is_empty(),
+        "zero inputs must produce zero hits without a DB trip"
+    );
 }
 
 #[sqlx::test]
@@ -292,7 +311,11 @@ async fn failed_output_hits_returns_only_unexpired_matches(pool: PgPool) {
 
     let got = failed_output_hits(
         &pool,
-        &[live_path.as_str(), stale_path.as_str(), "/nix/store/missing-unique"],
+        &[
+            live_path.as_str(),
+            stale_path.as_str(),
+            "/nix/store/missing-unique",
+        ],
     )
     .await;
     let want: HashSet<String> = [live_path].into_iter().collect();
@@ -364,7 +387,10 @@ async fn lookup_job_by_external_ref_returns_row_fields(pool: PgPool) {
 #[sqlx::test]
 async fn lookup_job_by_external_ref_returns_none_for_missing(pool: PgPool) {
     migrate(&pool).await;
-    assert!(lookup_job_by_external_ref(&pool, "nope").await.unwrap().is_none());
+    assert!(lookup_job_by_external_ref(&pool, "nope")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 // ─── list_jobs_by_status ──────────────────────────────────────────────
@@ -390,7 +416,10 @@ async fn list_jobs_by_status_filters_to_requested_status_only(pool: PgPool) {
     let rows = list_jobs_by_status(&pool, "done", None, 10).await.unwrap();
     let ids: Vec<JobId> = rows.iter().map(|r| r.id).collect();
     assert!(ids.contains(&done_id), "done list must include done_id");
-    assert!(!ids.contains(&failed_id), "done list must exclude failed_id");
+    assert!(
+        !ids.contains(&failed_id),
+        "done list must exclude failed_id"
+    );
     assert!(
         !ids.contains(&pending_id),
         "list_jobs_by_status must exclude non-terminal rows (done_at IS NOT NULL guard)"
@@ -418,7 +447,9 @@ async fn list_jobs_by_status_cursor_excludes_rows_at_or_after_cursor(pool: PgPoo
         .find(|r| r.id == first_id)
         .expect("inserted row");
     let ts = row.done_at.unwrap();
-    let next = list_jobs_by_status(&pool, "done", Some(ts), 10).await.unwrap();
+    let next = list_jobs_by_status(&pool, "done", Some(ts), 10)
+        .await
+        .unwrap();
     assert!(
         next.iter().all(|r| r.id != first_id),
         "strict `<` comparison means cursor must exclude the row at its own timestamp"

@@ -33,9 +33,7 @@ use std::time::Duration;
 
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    ClaimResponse, CompleteRequest, CreateJobRequest, IngestBatchRequest,
-};
+use nix_ci_core::types::{ClaimResponse, CompleteRequest, CreateJobRequest, IngestBatchRequest};
 use sqlx::PgPool;
 
 /// Invariant 3 (Steps dedup): a drv_hash shared across two concurrent
@@ -54,8 +52,14 @@ async fn cross_job_shared_drv_dedups_at_registry_level(pool: PgPool) {
 
     // Two jobs with the same drv (same drv_path ⟹ same drv_hash).
     let shared_drv = drv_path("shared", "libcommon");
-    let job_a = client.create_job(&CreateJobRequest::default()).await.unwrap();
-    let job_b = client.create_job(&CreateJobRequest::default()).await.unwrap();
+    let job_a = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let job_b = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
     for jid in [job_a.id, job_b.id] {
         client
             .ingest_drv(jid, &ingest(&shared_drv, "libcommon", &[], true))
@@ -74,7 +78,10 @@ async fn cross_job_shared_drv_dedups_at_registry_level(pool: PgPool) {
     // Claim from job B — should get NOTHING. The step is shared and
     // already runnable=false after A's CAS win. A broken dedup would
     // issue a second claim with a fresh claim_id.
-    let claim_b = client.claim(job_b.id, "x86_64-linux", &[], 1).await.unwrap();
+    let claim_b = client
+        .claim(job_b.id, "x86_64-linux", &[], 1)
+        .await
+        .unwrap();
     assert!(
         claim_b.is_none(),
         "cross-job dedup broken: job B received an independent claim for the shared drv"
@@ -130,7 +137,10 @@ async fn cross_job_shared_drv_dedups_at_registry_level(pool: PgPool) {
 async fn parent_not_claimable_until_dep_completes(pool: PgPool) {
     let handle = spawn_server(pool).await;
     let client = CoordinatorClient::new(&handle.base_url);
-    let job = client.create_job(&CreateJobRequest::default()).await.unwrap();
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
     let leaf = drv_path("l", "leaf");
     let parent = drv_path("p", "parent");
     client
@@ -207,14 +217,18 @@ async fn cross_submission_claim_cas_exactly_one_winner(pool: PgPool) {
     let job_a = {
         let c = CoordinatorClient::new(&handle.base_url);
         let j = c.create_job(&CreateJobRequest::default()).await.unwrap();
-        c.ingest_drv(j.id, &ingest(&shared_drv, "race", &[], true)).await.unwrap();
+        c.ingest_drv(j.id, &ingest(&shared_drv, "race", &[], true))
+            .await
+            .unwrap();
         c.seal(j.id).await.unwrap();
         j.id
     };
     let job_b = {
         let c = CoordinatorClient::new(&handle.base_url);
         let j = c.create_job(&CreateJobRequest::default()).await.unwrap();
-        c.ingest_drv(j.id, &ingest(&shared_drv, "race", &[], true)).await.unwrap();
+        c.ingest_drv(j.id, &ingest(&shared_drv, "race", &[], true))
+            .await
+            .unwrap();
         c.seal(j.id).await.unwrap();
         j.id
     };
@@ -238,7 +252,8 @@ async fn cross_submission_claim_cas_exactly_one_winner(pool: PgPool) {
     let b = rb.unwrap().unwrap();
     let winners = a.is_some() as u32 + b.is_some() as u32;
     assert_eq!(
-        winners, 1,
+        winners,
+        1,
         "exactly one of the racing jobs must win the CAS; got {winners} (a={}, b={})",
         a.is_some(),
         b.is_some()
@@ -263,9 +278,15 @@ async fn steps_registry_returns_to_zero_after_all_terminal(pool: PgPool) {
     // Drive a handful of independent single-drv jobs through Done.
     // Each creates one Step; after terminal, all should GC.
     for i in 0..5 {
-        let job = client.create_job(&CreateJobRequest::default()).await.unwrap();
+        let job = client
+            .create_job(&CreateJobRequest::default())
+            .await
+            .unwrap();
         let d = drv_path(&format!("gc{i:02}"), "solo");
-        client.ingest_drv(job.id, &ingest(&d, "solo", &[], true)).await.unwrap();
+        client
+            .ingest_drv(job.id, &ingest(&d, "solo", &[], true))
+            .await
+            .unwrap();
         client.seal(job.id).await.unwrap();
         let c = client
             .claim(job.id, "x86_64-linux", &[], 2)
@@ -300,12 +321,8 @@ async fn steps_registry_returns_to_zero_after_all_terminal(pool: PgPool) {
     // observable contract is exactly what this test should catch.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let gauge = common::scrape_metric_expect(
-            &handle.base_url,
-            "nix_ci_steps_registry_size",
-            &[],
-        )
-        .await;
+        let gauge =
+            common::scrape_metric_expect(&handle.base_url, "nix_ci_steps_registry_size", &[]).await;
         let snap = client.admin_snapshot().await.unwrap();
         if gauge == 0.0 && snap.submissions == 0 {
             return;

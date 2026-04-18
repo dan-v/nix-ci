@@ -327,8 +327,7 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
     // floor here and track the actual number in log output — raising
     // the bar toward 10K requires switching ingest to batch mode
     // (separate test; see spec_report.sh H14).
-    let ingest_throughput =
-        (LAYERS * WIDTH) as f64 / ingest_elapsed.as_secs_f64();
+    let ingest_throughput = (LAYERS * WIDTH) as f64 / ingest_elapsed.as_secs_f64();
     eprintln!("ingest throughput: {ingest_throughput:.0} drvs/sec");
     assert!(
         ingest_throughput > 2_000.0,
@@ -362,9 +361,9 @@ fn read_rss_kb() -> std::io::Result<u64> {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             let parts: Vec<_> = rest.split_whitespace().collect();
             if let Some(kb_str) = parts.first() {
-                return kb_str.parse::<u64>().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                });
+                return kb_str
+                    .parse::<u64>()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
             }
         }
     }

@@ -908,7 +908,10 @@ mod build_timeout_tests {
         assert!(!o.success);
         assert_eq!(o.category, Some(ErrorCategory::Transient));
         assert!(
-            o.message.as_deref().unwrap().contains("per-drv build timeout"),
+            o.message
+                .as_deref()
+                .unwrap()
+                .contains("per-drv build timeout"),
             "message must name the reason: {:?}",
             o.message
         );

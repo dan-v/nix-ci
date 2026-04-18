@@ -36,8 +36,8 @@ async fn concurrent_create_with_same_external_ref_is_idempotent(pool: PgPool) {
         (Ok(a), Ok(b)) => {
             assert_eq!(a.id, b.id, "same external_ref must resolve to same id");
         }
-        other => panic!(
-            "concurrent POST /jobs with same external_ref must be idempotent; got {other:?}"
-        ),
+        other => {
+            panic!("concurrent POST /jobs with same external_ref must be idempotent; got {other:?}")
+        }
     }
 }

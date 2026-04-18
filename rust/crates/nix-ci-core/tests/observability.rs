@@ -427,4 +427,3 @@ async fn progress_event_carries_enrichments(pool: PgPool) {
 // rather than confusingly in the unrelated fleet.rs file.
 
 // ─── Sanity: list endpoint returns empty when no failures ────────────
-

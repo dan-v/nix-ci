@@ -3,14 +3,10 @@
 
 mod common;
 
-
 use common::{drv_path, ingest, spawn_server};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{
-    CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest,
-};
+use nix_ci_core::types::{CompleteRequest, CreateJobRequest, IngestBatchRequest, IngestDrvRequest};
 use sqlx::PgPool;
-
 
 #[sqlx::test]
 async fn metrics_counts_ingested_and_completed(pool: PgPool) {
@@ -215,7 +211,13 @@ async fn admin_snapshot_counts_scale_linearly_with_members(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();

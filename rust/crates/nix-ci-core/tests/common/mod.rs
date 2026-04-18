@@ -149,11 +149,7 @@ pub fn ingest(
 /// Returns `None` if the metric isn't present (counter at 0 isn't
 /// written in OpenMetrics text format until incremented).
 #[allow(dead_code)]
-pub async fn scrape_metric(
-    base_url: &str,
-    name: &str,
-    labels: &[(&str, &str)],
-) -> Option<f64> {
+pub async fn scrape_metric(base_url: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
     let body = reqwest::get(format!("{base_url}/metrics"))
         .await
         .expect("scrape /metrics")

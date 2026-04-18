@@ -55,7 +55,13 @@ async fn many_workers_single_job_exactly_once(pool: PgPool) {
         })
         .collect();
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();
@@ -262,7 +268,13 @@ async fn wide_fan_out_sequences_correctly_under_load(pool: PgPool) {
     drvs.push(ingest(&root, "final", &root_deps, true));
 
     client
-        .ingest_batch(job.id, &IngestBatchRequest { drvs, eval_errors: Vec::new() })
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
         .await
         .unwrap();
     client.seal(job.id).await.unwrap();

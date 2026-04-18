@@ -4,16 +4,17 @@
 //! classification, drv_hash extraction) the moment it happens rather
 //! than in an e2e test three levels up.
 
-use nix_ci_core::types::{
-    drv_hash_from_path, ClaimQuery, DrvState, ErrorCategory, JobStatus,
-};
+use nix_ci_core::types::{drv_hash_from_path, ClaimQuery, DrvState, ErrorCategory, JobStatus};
 
 // ─── drv_hash_from_path ───────────────────────────────────────────────
 
 #[test]
 fn drv_hash_from_standard_nix_store_path() {
     let got = drv_hash_from_path("/nix/store/abc123def-hello-2.12.1.drv");
-    assert_eq!(got.as_ref().map(|h| h.as_str()), Some("abc123def-hello-2.12.1.drv"));
+    assert_eq!(
+        got.as_ref().map(|h| h.as_str()),
+        Some("abc123def-hello-2.12.1.drv")
+    );
 }
 
 #[test]
