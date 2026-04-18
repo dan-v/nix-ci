@@ -46,6 +46,13 @@ pub struct ActiveClaim {
     /// supplied by the worker on the `?worker=` query param. Empty
     /// for older clients.
     pub worker_id: Option<String>,
+    /// Absolute wall-ceiling: no extension may push `deadline` past
+    /// this instant. Protects against a worker that keeps sending
+    /// `/extend` but never finishes — e.g. a build stuck on NFS I/O
+    /// that still heartbeats. Derived from `started_at +
+    /// max_claim_lifetime_secs` at issue time; `None` disables the
+    /// ceiling (v3 default, matching `max_claim_lifetime_secs`).
+    pub hard_deadline: Option<Instant>,
 }
 
 pub struct Claims {
@@ -132,16 +139,43 @@ impl Claims {
             .collect()
     }
 
-    /// Extend the deadline of an active claim to `now + deadline_window`.
-    /// Returns the new deadline if the claim was found, `None` otherwise
-    /// (claim already expired / completed / evicted). The caller uses
-    /// `None` as the signal to stop sending extensions.
+    /// Extend the deadline of an active claim to `now + deadline_window`,
+    /// capped at the claim's `hard_deadline` (when set). Returns the new
+    /// deadline if the claim was found, `None` otherwise (claim already
+    /// expired / completed / evicted). The caller uses `None` as the
+    /// signal to stop sending extensions.
+    ///
+    /// When the hard ceiling pins the new deadline below
+    /// `now + deadline_window`, the caller can detect this by
+    /// comparing the returned value — the extend still succeeds (so
+    /// the worker keeps running until the ceiling hits) but future
+    /// extensions will saturate at the same instant. Once `now` is
+    /// past the hard deadline, the returned value is in the past and
+    /// the reaper will evict on its next tick.
     pub fn extend(&self, claim_id: ClaimId, now: Instant) -> Option<Instant> {
         let guard = self.inner.read();
         let claim = guard.get(&claim_id)?;
-        let new_deadline = now + claim.deadline_window;
+        let proposed = now + claim.deadline_window;
+        let new_deadline = match claim.hard_deadline {
+            Some(ceiling) if ceiling < proposed => ceiling,
+            _ => proposed,
+        };
         *claim.deadline.lock() = new_deadline;
         Some(new_deadline)
+    }
+
+    /// True when this claim's deadline was capped by its hard ceiling
+    /// — i.e. the claim's `deadline` equals its `hard_deadline`.
+    /// Callers in the reap path use this to distinguish a normal
+    /// deadline-expiry reap (worker stopped heartbeating) from a
+    /// hard-ceiling reap (worker kept extending forever). Metrics
+    /// split on this axis so operators can alert on stuck-but-alive
+    /// workers without noise from normal reap.
+    pub fn was_reaped_by_hard_ceiling(claim: &ActiveClaim, now: Instant) -> bool {
+        let Some(ceiling) = claim.hard_deadline else {
+            return false;
+        };
+        now >= ceiling
     }
 
     /// Snapshot every active claim. Used by the reaper to find claims
@@ -158,6 +192,10 @@ mod tests {
     use std::time::Duration;
 
     fn mk_claim(deadline: Instant) -> Arc<ActiveClaim> {
+        mk_claim_with_ceiling(deadline, None)
+    }
+
+    fn mk_claim_with_ceiling(deadline: Instant, ceiling: Option<Instant>) -> Arc<ActiveClaim> {
         Arc::new(ActiveClaim {
             claim_id: ClaimId::new(),
             job_id: JobId::new(),
@@ -168,6 +206,7 @@ mod tests {
             started_at: Instant::now(),
             started_at_wall: chrono::Utc::now(),
             worker_id: None,
+            hard_deadline: ceiling,
         })
     }
 
@@ -251,5 +290,92 @@ mod tests {
         c.insert(claim);
         let _ = c.take(cid).expect("present");
         assert!(c.extend(cid, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn extend_caps_at_hard_deadline() {
+        // The contract under test: no amount of extension can push
+        // `deadline` past the hard ceiling. Without this, a worker
+        // that keeps sending /extend while stuck can hold a drv
+        // forever (the most-dangerous-failure-mode item E of the
+        // reliability review).
+        let c = Claims::new();
+        let now = Instant::now();
+        // Claim started at `now`, with window=60s and ceiling=90s
+        // from `now`. After one extension at `now+30s` the extend's
+        // proposed value is `now+30s+60s = now+90s`, which is
+        // exactly the ceiling — just barely OK.
+        //
+        // After a *second* extension at `now+60s`, proposed is
+        // `now+120s`, clearly past the ceiling: must clamp.
+        let claim = mk_claim_with_ceiling(
+            now + Duration::from_secs(60),
+            Some(now + Duration::from_secs(90)),
+        );
+        let cid = claim.claim_id;
+        c.insert(claim);
+
+        // First extension at t=30s → proposed 90s, ceiling 90s. Equal.
+        let t30 = now + Duration::from_secs(30);
+        let new1 = c.extend(cid, t30).expect("claim present");
+        assert_eq!(new1, now + Duration::from_secs(90));
+
+        // Second extension at t=60s → proposed 120s, clamp to 90s.
+        let t60 = now + Duration::from_secs(60);
+        let new2 = c.extend(cid, t60).expect("claim present");
+        assert_eq!(
+            new2,
+            now + Duration::from_secs(90),
+            "extend must clamp at hard_deadline"
+        );
+
+        // Reaper behavior: at t=91s the claim is expired because
+        // deadline=90s ≤ 91s. was_reaped_by_hard_ceiling returns true.
+        let at_ceiling = now + Duration::from_secs(91);
+        let expired = c.expired_ids(at_ceiling);
+        assert!(
+            expired.contains(&cid),
+            "claim clamped to ceiling must be reaped once ceiling passes"
+        );
+        // Inspect the claim's hard-ceiling attribution.
+        let taken = c.take(cid).expect("still present before take");
+        assert!(
+            Claims::was_reaped_by_hard_ceiling(&taken, at_ceiling),
+            "ceiling-clamped claim past its hard_deadline must flag as ceiling-reaped"
+        );
+    }
+
+    #[test]
+    fn extend_without_ceiling_is_unbounded_like_before() {
+        // Back-compat: `hard_deadline=None` must preserve the v3
+        // behavior where /extend keeps pushing indefinitely.
+        let c = Claims::new();
+        let now = Instant::now();
+        let claim = mk_claim_with_ceiling(now + Duration::from_secs(60), None);
+        let cid = claim.claim_id;
+        c.insert(claim);
+        for i in 1..=5 {
+            let t = now + Duration::from_secs(10 * i);
+            let new = c.extend(cid, t).expect("claim present");
+            assert_eq!(new, t + Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn was_reaped_by_hard_ceiling_is_false_before_ceiling() {
+        let now = Instant::now();
+        let claim = mk_claim_with_ceiling(
+            now + Duration::from_secs(60),
+            Some(now + Duration::from_secs(120)),
+        );
+        assert!(!Claims::was_reaped_by_hard_ceiling(&claim, now));
+        assert!(!Claims::was_reaped_by_hard_ceiling(
+            &claim,
+            now + Duration::from_secs(119)
+        ));
+        assert!(Claims::was_reaped_by_hard_ceiling(
+            &claim,
+            now + Duration::from_secs(120)
+        ));
     }
 }

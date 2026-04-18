@@ -98,6 +98,54 @@ days of nightly chaos-scale + property runs without a violation.
 - **R-CLAIMS-NO-LEAK**: After every terminal transition, the
   in-memory claims map drops to 0 entries for the affected job.
   Measured by `memory_bounds::claims_map_drains_after_all_completes`.
+- **R-PANIC-ISOLATED**: A panic in any HTTP handler (including
+  ingest / claim / complete) must produce a sanitized 500 with the
+  axum task intact, not a dropped connection or poisoned router.
+  Measured by `server::router::catch_panic_tests` (oneshot isolation
+  + "router stays alive after panic" assertion). Protects the
+  "poison-input can't break the coordinator" contract at the
+  middleware layer.
+- **R-WORKER-QUARANTINE**: With
+  `worker_quarantine_failure_threshold=T`, a **fleet** worker
+  reporting ≥ T failures within `worker_quarantine_window_secs`
+  is auto-fenced; its subsequent fleet claims return 204 until
+  `cooldown` elapses. Healthy workers (different `worker_id`) are
+  unaffected. **Per-job claims are NOT quarantined** — the per-job
+  worker is the CI run's only claimant and failures there should
+  surface as build errors, not 204 hangs. Measured by
+  `worker_quarantine::fleet_worker_is_quarantined_on_next_fleet_claim`,
+  `worker_quarantine::per_job_mode_is_not_quarantined`, and the
+  end-to-end `full_fleet_story_sick_worker_contained`.
+- **R-CLAIM-LIFETIME-CEILING**: With `max_claim_lifetime_secs=S`,
+  `POST /extend` never pushes `deadline` past `started_at + S`,
+  and the reaper forcibly re-arms the step once the ceiling passes.
+  Measured by `dispatch::claim::tests::extend_caps_at_hard_deadline`
+  + `claim_lifetime_ceiling::reaper_fires_when_ceiling_passes_in_virtual_time`.
+  Guards against "stuck but heartbeating" worker patterns.
+- **R-CLASSIFIER-KILL-TRANSIENT**: No exit code in {137, 143, 124}
+  produces `BuildFailure`, regardless of stderr content — an
+  externally-killed builder is always classified retryable. Measured
+  by `classify_tests::exit_137_sigkill_is_transient_even_with_buildfailure_stderr`,
+  `exit_143_sigterm_overrides_buildfailure_anchor`,
+  `exit_124_gnu_timeout_is_transient`,
+  and the enumeration test `kill_exit_codes_never_produce_buildfailure`.
+- **R-CLASSIFIER-UNKNOWN-SAFE**: No unknown stderr × exit code
+  combination produces a terminal `BuildFailure` — the default
+  path is always retryable. Measured by
+  `classify_tests::unknown_or_empty_stderr_is_always_retryable_regardless_of_exit`.
+  This is the primary "only broken builds break builds" bar at the
+  classification boundary.
+- **R-INGEST-PER-DRV-CAPS**: Drvs exceeding `max_input_drvs_per_drv`
+  or `max_required_features_per_drv` are counted in `errored` and
+  skipped; the rest of the batch proceeds. The coordinator never
+  allocates unbounded per-drv Vecs from a malformed submission.
+  Measured by `reliability_caps::per_drv_input_drvs_cap_skips_over_limit_drv`
+  and `per_drv_features_cap_skips_over_limit_drv`.
+- **R-REFUTE-FALSE-POSITIVE**: `POST /admin/refute` removes entries
+  from the `failed_outputs` TTL cache, enabling operators to undo
+  a sick worker's cache poisoning without waiting out the TTL.
+  Measured by `admin_refute::refute_by_output_path_deletes_entry`
+  and `refute_by_drv_hash_removes_all_output_paths`.
 
 ## Deployability
 

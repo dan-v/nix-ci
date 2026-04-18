@@ -47,15 +47,20 @@ pub async fn claim(
 ) -> Result<Response> {
     q.wait = q.wait.min(state.cfg.max_claim_wait_secs);
     validate_worker_id(&q.worker, state.cfg.max_identifier_bytes)?;
-    // Drain / fence short-circuit: return 204 immediately so the
-    // worker exits its poll loop cleanly rather than holding the
-    // connection open until the wait deadline. Long-polling
-    // workers during a drain would otherwise leave claim_in_flight
-    // RSS pinned for up to max_claim_wait_secs.
+    // Drain / manual fence short-circuit: return 204 immediately so
+    // the worker exits its poll loop cleanly rather than holding the
+    // connection open until the wait deadline. Long-polling workers
+    // during a drain would otherwise leave claim_in_flight RSS
+    // pinned for up to max_claim_wait_secs.
+    //
+    // NOTE: auto-quarantine is NOT checked here. Per-job mode's
+    // worker is the CI run's only claimant; quarantining it would
+    // just hang the run waiting for a worker that won't claim.
+    // See `fleet_worker_is_quarantined`'s doc for the rationale.
     if state.draining.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    if worker_is_fenced(&state, q.worker.as_deref()) {
+    if worker_is_manually_fenced(&state, q.worker.as_deref()) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     if let Some(resp) = shed_if_overloaded(&state) {
@@ -145,7 +150,12 @@ pub async fn claim_any(
     if state.draining.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    if worker_is_fenced(&state, q.worker.as_deref()) {
+    // Fleet mode applies BOTH manual fence AND auto-quarantine:
+    // fleet workers share work across jobs, so containing a sick
+    // host is critical here.
+    if worker_is_manually_fenced(&state, q.worker.as_deref())
+        || fleet_worker_is_quarantined(&state, q.worker.as_deref())
+    {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     if let Some(resp) = shed_if_overloaded(&state) {
@@ -339,11 +349,36 @@ pub async fn list_claims(State(state): State<AppState>) -> Result<axum::Json<Cla
 
 /// True when the worker identified by `worker_id` is in the admin
 /// fence set. Missing (None) worker_ids are never fenced — the fence
-/// is an explicit opt-in for known hosts. Read-only snapshot via the
-/// RwLock; no `.await` under the guard.
-fn worker_is_fenced(state: &AppState, worker_id: Option<&str>) -> bool {
+/// is an explicit opt-in for known hosts.
+///
+/// **Scope**: manual fence applies to BOTH per-job and fleet claims
+/// — an operator retiring a host wants it to drain regardless of
+/// how the worker is reaching the coordinator. Auto-quarantine is
+/// NOT checked here (see [`fleet_worker_is_quarantined`]); it
+/// applies to fleet claims only.
+fn worker_is_manually_fenced(state: &AppState, worker_id: Option<&str>) -> bool {
     let Some(w) = worker_id else { return false };
     state.fenced_workers.read().contains(w)
+}
+
+/// True when `worker_id` has been auto-quarantined by the per-
+/// worker failure circuit breaker. **Fleet-claim only**: per-job
+/// mode (`GET /jobs/{id}/claim`) deliberately skips this check
+/// because the worker's lifecycle is tied to a single CI run.
+///
+/// In per-job mode the worker IS the CI run; its failures stay
+/// bounded inside that run, and quarantining it mid-run would
+/// just return 204 to a worker that is the only claimant, hanging
+/// the CI job waiting for itself. The honest behavior is "the
+/// per-job worker keeps trying until the drv terminally fails or
+/// `max_attempts` is exhausted" — the user's CI then surfaces the
+/// failures directly as build errors.
+///
+/// In fleet mode, by contrast, one sick worker's failures
+/// otherwise spread across unrelated jobs. Quarantine is the
+/// containment lever for that case.
+fn fleet_worker_is_quarantined(state: &AppState, worker_id: Option<&str>) -> bool {
+    state.worker_health.is_quarantined(worker_id, Instant::now())
 }
 
 /// Degradation contract: if `claims_in_flight >= max_claims_in_flight`,
@@ -553,6 +588,16 @@ fn issue_claim(
 
     let now = Instant::now();
     let now_wall = Utc::now();
+    // Absolute ceiling for lease extensions: `started_at +
+    // max_claim_lifetime_secs`. When unset, no ceiling — extensions
+    // may push the deadline forever (v3 baseline behavior). When
+    // set, `Claims::extend` clamps at this instant, the reaper
+    // evicts once reached, and the `claims_hard_ceiling_reaped`
+    // counter attributes the reap.
+    let hard_deadline = state
+        .cfg
+        .max_claim_lifetime_secs
+        .map(|s| now + Duration::from_secs(s));
     state.dispatcher.claims.insert(Arc::new(ActiveClaim {
         claim_id,
         job_id,
@@ -563,6 +608,7 @@ fn issue_claim(
         started_at: now,
         started_at_wall: now_wall,
         worker_id,
+        hard_deadline,
     }));
     // Per-submission in-flight counter for max_workers cap. Decremented
     // in `complete` and in the claim-deadline reaper. `evict_claims_for`

@@ -146,6 +146,19 @@ pub struct MetricsInner {
     /// path: when this rate exceeds a threshold, operators should
     /// scale out, not debug.
     pub overload_rejections: Counter,
+    /// Workers auto-quarantined by the per-worker failure-rate
+    /// guard. A non-zero rate means the circuit breaker is
+    /// containing at least one sick host — operators should
+    /// investigate that host, not the counter itself. Increments
+    /// each time a worker crosses (or re-crosses) the threshold.
+    pub worker_auto_quarantined: Counter,
+    /// Claims force-re-armed because they hit the
+    /// `max_claim_lifetime_secs` ceiling. A non-zero rate means at
+    /// least one worker was "extending forever" without making
+    /// progress — useful for catching stuck builders that still
+    /// heartbeat. Decoupled from `claims_expired`, which only
+    /// counts deadline-window expiries without extension.
+    pub claims_hard_ceiling_reaped: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -463,6 +476,18 @@ impl Metrics {
             "Requests shed to protect the coordinator under overload (503).",
             overload_rejections.clone(),
         );
+        let worker_auto_quarantined = Counter::default();
+        registry.register(
+            "nix_ci_worker_auto_quarantined",
+            "Workers auto-quarantined by the per-worker failure-rate circuit breaker.",
+            worker_auto_quarantined.clone(),
+        );
+        let claims_hard_ceiling_reaped = Counter::default();
+        registry.register(
+            "nix_ci_claims_hard_ceiling_reaped",
+            "Claims force-re-armed because they exceeded max_claim_lifetime_secs despite lease extensions.",
+            claims_hard_ceiling_reaped.clone(),
+        );
 
         // Process-global panic counter. Cloned into the per-instance
         // registry so `/metrics` surfaces any panic in this process,
@@ -511,6 +536,8 @@ impl Metrics {
                 ingest_phase_duration_seconds,
                 lock_wait_seconds,
                 overload_rejections,
+                worker_auto_quarantined,
+                claims_hard_ceiling_reaped,
             }),
         }
     }

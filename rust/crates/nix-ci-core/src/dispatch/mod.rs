@@ -49,11 +49,13 @@ pub mod rdep;
 pub mod step;
 pub mod steps;
 pub mod submission;
+pub mod worker_health;
 
 pub use claim::{ActiveClaim, ClaimJobMismatch, Claims};
 pub use step::{Step, StepState};
 pub use steps::StepsRegistry;
 pub use submission::{Submission, Submissions};
+pub use worker_health::{RecordOutcome, WorkerHealth, WorkerQuarantinePolicy};
 
 use std::sync::Arc;
 use tokio::sync::Notify;

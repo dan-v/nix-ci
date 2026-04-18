@@ -50,6 +50,12 @@ tokio = { workspace = true, features = ["test-util"] }
 # pipelining, and Sentinel awareness — see docs/design-stateless-coordinator.md.
 fred = { version = "9", default-features = false, features = ["i-std", "i-scripts", "transactions", "sentinel-client"] }
 hdrhistogram = "7"
+# Test-only: drive a Router through `ServiceExt::oneshot` to exercise
+# middleware (catch_panic, auth) in isolation without standing up a
+# full TCP server. axum pulls tower in as a direct dep but doesn't
+# re-export `ServiceExt`; adding it here at dev scope avoids a
+# production-dependency footprint bump.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "dispatcher"

@@ -81,6 +81,7 @@ pub async fn spawn_server_with_cfg(
         log_store,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         fenced_workers: Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new())),
+        worker_health: nix_ci_core::dispatch::WorkerHealth::new(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

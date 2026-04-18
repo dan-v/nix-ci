@@ -141,6 +141,12 @@ Each line is an **assertion** (not a goal): a CI test enforces it.
 | Submission-member cap (`max_drvs_per_job`) exceeded | OK                    | OK                      | N/A                            | **413 + `eval_too_large`** |
 | `failures` vec > `max_failures_in_result`        | OK                      | OK                      | Terminal JSONB truncated with marker | N/A |
 | Coordinator SIGKILL mid-build                    | New calls see 410 (job gone) | 410 (job gone)          | Non-terminal → `clear_busy` cancels on restart | N/A |
+| **Panic in handler** (catch_panic_layer)         | **500 + sanitized body** (connection stays up) | **500 + sanitized body** | **500 + sanitized body**     | **500 + sanitized body** |
+| **Fleet worker ≥ threshold failures in window** | **204 on fleet claim** (auto-fenced for cooldown; per-job claims unaffected) | OK | OK | OK |
+| **Claim extended past `max_claim_lifetime_secs`**| N/A (ceiling on existing claim) | N/A            | N/A                            | N/A (step re-armed on reap) |
+| **`input_drvs.len()` > `max_input_drvs_per_drv`**| OK                      | OK                      | OK                             | **Drv skipped, `errored` incremented** |
+| **`eval_errors.len()` > `max_eval_errors_per_batch`** | OK                 | OK                      | OK                             | **413 + cap-cite message** |
+| **Worker reports exit 137/143/124**              | N/A (worker-side classification) | OK (Transient, re-armed) | N/A                         | N/A |
 
 **Key invariants across all conditions:**
 
@@ -152,9 +158,21 @@ Each line is an **assertion** (not a goal): a CI test enforces it.
    lets clients retry with fresh backoff. Existing claims continue.
 3. **Memory stays bounded**: every unbounded-growth risk has an
    explicit cap (`max_drvs_per_job`, `max_failures_in_result`,
-   `EVAL_ERRORS_CAP`) + regression test.
+   `EVAL_ERRORS_CAP`, `max_input_drvs_per_drv`,
+   `max_required_features_per_drv`, `max_eval_errors_per_batch`) +
+   regression test.
 4. **Failure is idempotent**: SIGKILL, PG drop, worker vanish all
    converge on a consistent state; callers retry; no partial writes.
+5. **Only broken builds break builds.** The classifier's exit-code
+   + stderr rule never converts an external-kill (137/143/124) or
+   an unknown stderr × exit code into a terminal `BuildFailure`.
+   The per-worker quarantine contains a single sick host before
+   its failures spread across many drvs.
+6. **Panics are contained.** The innermost axum layer catches
+   panics and converts them to sanitized 500s, so no malformed
+   submission can crash the coordinator or silently drop
+   connections. `nix_ci_process_panics` counter + global panic
+   hook surface the original payload to operators.
 
 ## Observability instrumentation
 

@@ -286,6 +286,48 @@ async fn insert_failed_outputs_inner(
     Ok(())
 }
 
+/// Remove rows from the `failed_outputs` cache. Operator-invoked
+/// counter to a false-positive: e.g. a legitimate drv that was
+/// marked failed by a sick worker, or a drv whose environment was
+/// fixed before the cache TTL expired.
+///
+/// Returns the number of rows deleted — callers surface it so the
+/// operator can tell their `/admin/refute` call actually hit
+/// something (empty `output_paths` + `drv_hash` unspecified is a
+/// 0-row no-op, which is fine for idempotency).
+///
+/// `output_paths` deletes specific entries; `drv_hash` deletes every
+/// entry pointing at a derivation (useful when a single failed
+/// drv's outputs are distributed across many paths). Passing both
+/// deletes the union.
+pub async fn delete_failed_outputs(
+    pool: &PgPool,
+    drv_hash: Option<&DrvHash>,
+    output_paths: &[String],
+) -> Result<u64> {
+    if drv_hash.is_none() && output_paths.is_empty() {
+        return Ok(0);
+    }
+    // Two-arm WHERE so a caller can refute by drv_hash, by path,
+    // or both in one call. `COALESCE` on empty arrays lets the
+    // `$2 = ANY($2)` arm be "absent" without a separate query.
+    let paths_ref: Vec<&str> = output_paths.iter().map(String::as_str).collect();
+    let drv_hash_str = drv_hash.map(|h| h.as_str()).unwrap_or("");
+    let has_drv_hash = drv_hash.is_some();
+    let query = r#"
+        DELETE FROM failed_outputs
+        WHERE (output_path = ANY($1::text[]))
+           OR ($2 AND drv_hash = $3)
+        "#;
+    let result = sqlx::query(query)
+        .bind(&paths_ref)
+        .bind(has_drv_hash)
+        .bind(drv_hash_str)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Look up a job by its caller-supplied `external_ref`. Returns the
 /// terminal-snapshot result JSONB (if the job has reached terminal)
 /// alongside identity fields. Used by `GET /jobs/by-external-ref/{ref}`

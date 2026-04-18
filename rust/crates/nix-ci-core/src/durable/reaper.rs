@@ -180,6 +180,20 @@ pub fn reap_expired_claims(dispatcher: &Dispatcher) {
             .inner
             .claim_age_seconds
             .observe(claim.started_at.elapsed().as_secs_f64());
+        // Attribute: was this reap caused by the absolute lifetime
+        // ceiling (worker kept extending but never finished) or the
+        // normal deadline window (worker stopped extending)? Only
+        // the ceiling case is a "stuck worker" incident.
+        if crate::dispatch::claim::Claims::was_reaped_by_hard_ceiling(&claim, now) {
+            dispatcher.metrics.inner.claims_hard_ceiling_reaped.inc();
+            tracing::warn!(
+                claim_id = %claim.claim_id,
+                drv_hash = %claim.drv_hash,
+                worker_id = %claim.worker_id.as_deref().unwrap_or(""),
+                elapsed_secs = claim.started_at.elapsed().as_secs(),
+                "claim hit hard lifetime ceiling; re-arming for another worker"
+            );
+        }
         // Mirror active_claims decrement on the owning submission so
         // the fleet scheduler's per-job cap clears as claims expire.
         if let Some(sub) = dispatcher.submissions.get(claim.job_id) {

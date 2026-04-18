@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use sqlx::PgPool;
 
 use crate::config::ServerConfig;
-use crate::dispatch::Dispatcher;
+use crate::dispatch::{Dispatcher, WorkerHealth};
 use crate::durable::logs::LogStore;
 use crate::observability::metrics::Metrics;
 
@@ -33,4 +33,9 @@ pub struct AppState {
     /// while the rest of the fleet keeps running. Claims already
     /// issued to a fenced worker finish normally.
     pub fenced_workers: Arc<RwLock<HashSet<String>>>,
+    /// Per-worker failure-rate tracker + auto-quarantine. Layered on
+    /// top of `fenced_workers`: the claim path consults both.
+    /// Feature-off by default; opt in via
+    /// `ServerConfig::worker_quarantine_failure_threshold`.
+    pub worker_health: WorkerHealth,
 }

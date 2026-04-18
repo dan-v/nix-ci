@@ -292,6 +292,7 @@ impl Sim {
                             started_at: tokio::time::Instant::now(),
                             started_at_wall: chrono::Utc::now(),
                             worker_id: None,
+                            hard_deadline: None,
                         },
                     ));
                     self.issued_claims

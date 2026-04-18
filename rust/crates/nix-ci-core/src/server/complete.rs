@@ -155,6 +155,44 @@ async fn handle_failure(
     let attempt = claim.attempt;
     let can_retry = category.is_retryable() && attempt < step.max_tries();
 
+    // Per-worker health tracking for auto-quarantine. Every failure
+    // counts — BuildFailure, Transient, DiskFull alike. The goal is
+    // "this host is sick"; a worker that produces a burst of
+    // failures of any kind is the signal we want to catch. A broken
+    // drv is separately short-circuited by the `failed_outputs`
+    // cache.
+    let quarantine_policy = crate::dispatch::WorkerQuarantinePolicy::from_config(
+        state.cfg.worker_quarantine_failure_threshold,
+        state.cfg.worker_quarantine_window_secs,
+        state.cfg.worker_quarantine_cooldown_secs,
+    );
+    let worker_id = claim.worker_id.as_deref();
+    let now = tokio::time::Instant::now();
+    match state
+        .worker_health
+        .record_failure(worker_id, quarantine_policy.as_ref(), now)
+    {
+        crate::dispatch::RecordOutcome::Tripped {
+            failures_in_window,
+            ..
+        } => {
+            tracing::warn!(
+                worker_id = %worker_id.unwrap_or(""),
+                failures_in_window,
+                "worker auto-quarantined (threshold exceeded); skipping at claim time until cooldown"
+            );
+            state.metrics.inner.worker_auto_quarantined.inc();
+        }
+        crate::dispatch::RecordOutcome::Counted { failures_in_window } => {
+            tracing::debug!(
+                worker_id = %worker_id.unwrap_or(""),
+                failures_in_window,
+                "per-worker failure recorded"
+            );
+        }
+        crate::dispatch::RecordOutcome::Ignored => {}
+    }
+
     if can_retry {
         return handle_flaky_retry(state, step, req, category, attempt).await;
     }

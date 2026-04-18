@@ -657,7 +657,13 @@ async fn build(
     match status {
         Ok(s) if s.success() => BuildOutcome::success(s.code().unwrap_or(0)),
         Ok(s) => {
-            let category = classify_stderr_bytes(&captured.raw);
+            // Exit code is load-bearing for classification: 137 /
+            // 143 / 124 all indicate external kill (OOM, SIGTERM,
+            // GNU timeout) and must never be treated as terminal
+            // `BuildFailure`, regardless of what Nix's stderr says —
+            // a kill interrupts the compile, it doesn't *diagnose*
+            // it. See `classify_outcome` for the full rule table.
+            let category = classify_outcome_bytes(&captured.raw, s.code());
             BuildOutcome::failed(
                 s.code(),
                 category,
@@ -717,52 +723,103 @@ async fn stderr_capture(stderr: Option<tokio::process::ChildStderr>) -> StderrCa
     }
 }
 
-/// Lossy classification on the raw bytes — same matcher as
-/// `classify_stderr` but without the `.to_ascii_lowercase()` allocation
-/// of the full log; we lower-case ad-hoc for matching.
-fn classify_stderr_bytes(raw: &[u8]) -> ErrorCategory {
-    let s = String::from_utf8_lossy(raw);
-    classify_stderr(&s)
+/// Classification inputs: the stderr tail we captured and the child's
+/// exit status. Bundled so the rule table stays together and new
+/// signals (rusage, cgroup OOM file, timing) can be added without
+/// touching every call site.
+#[derive(Debug, Clone, Copy)]
+struct BuildOutcomeSignals<'a> {
+    stderr_tail: &'a str,
+    exit_code: Option<i32>,
 }
 
-/// Classify a failed build from its stderr tail.
-///
-/// Retry policy is driven by [`ErrorCategory::is_retryable`], so the
-/// default matters: an unknown error string drops through to
-/// `Transient`, which will be retried up to `max_attempts` times. This
-/// is the *conservative* choice — we'd rather re-run a flaky build a
-/// second time than turn a transient hiccup into a failed PR. The
-/// attempt counter bounds the worst case.
-///
-/// We classify as a terminal [`ErrorCategory::BuildFailure`] only when
-/// we're confident. Two wire formats to recognize:
-///
-/// * **Upstream Nix**: `error: builder for '<drv>' failed with exit
-///   code N` (also `failed to produce output path`).
-/// * **Determinate Nix**: `Cannot build '<drv>'.\nReason: builder
-///   failed with exit code N.` (also `failed due to signal N (desc)`).
-///
-/// Everything else — including network / substituter / daemon blips —
-/// drops to `Transient`, bounded by `max_attempts` server-side.
-fn classify_stderr(tail: &str) -> ErrorCategory {
-    let t = tail.to_ascii_lowercase();
+/// Lossy classification on the raw bytes — wraps the lower-level
+/// text classifier. Kept separate so callers can avoid materializing
+/// a full `String` until it's needed.
+fn classify_outcome_bytes(raw: &[u8], exit_code: Option<i32>) -> ErrorCategory {
+    let s = String::from_utf8_lossy(raw);
+    classify_outcome(BuildOutcomeSignals {
+        stderr_tail: &s,
+        exit_code,
+    })
+}
 
-    // Resource exhaustion — retryable, likely on a different worker.
-    // Check first so `signal 9` + OOM context beats the BuildFailure
-    // classifier below.
-    if t.contains("no space left on device")
-        || t.contains("disk full")
-        || t.contains("out of memory")
-        || t.contains("cannot allocate memory")
-        || t.contains("killed") && (t.contains("oom") || t.contains("out of memory"))
-    {
+/// Classify a failed build from its stderr tail plus exit code.
+///
+/// # Design contract
+///
+/// The rule "only broken builds break builds" reduces to: we must
+/// never return [`ErrorCategory::BuildFailure`] when the underlying
+/// failure is an *infra* problem (kill signal, OOM, disk full,
+/// network blip). A `BuildFailure` terminalizes the drv — no more
+/// retries, no fallback to a different worker — so a mis-classified
+/// infra issue fails user CI for reasons unrelated to their code.
+///
+/// The reverse miss (infra issue classified as `Transient`) is
+/// strictly better: retries are bounded by `max_attempts`, and if the
+/// drv really *is* broken the retry budget still terminates with
+/// `max_retries_exceeded` — user CI fails, just with a less precise
+/// reason string. We bias every ambiguous case toward `Transient`.
+///
+/// # Rule table (checked in order)
+///
+/// 1. **Resource exhaustion** → `DiskFull` (retryable). Catches disk
+///    full, memory allocation failures, cgroup OOM reaper, explicit
+///    OOM-kill patterns. Paired with signal 9, the OOM patterns take
+///    precedence so a different-worker retry can fix it.
+///
+/// 2. **External kill** (exit 137 SIGKILL / 143 SIGTERM / 124 GNU
+///    `timeout`; or stderr mentions `signal 9` / `signal 15`) →
+///    `Transient`. A killed process did not "fail to compile" — it
+///    was interrupted. Re-running it on any worker (possibly the
+///    same one after memory pressure clears) can succeed.
+///
+/// 3. **Deterministic build failure** → `BuildFailure`. Requires
+///    BOTH an anchor phrase (`builder for ` or `cannot build '`)
+///    and a terminal marker (`failed with exit code`, `failed to
+///    produce output path`, `failed due to signal N` with N != 9/15).
+///    Covers upstream Nix and Determinate Systems Nix wire formats.
+///
+/// 4. **Hash mismatch / reference violation** → `BuildFailure`.
+///    These are deterministic integrity-check failures; re-running
+///    won't change the outcome.
+///
+/// 5. **Unknown** → `Transient`. Network, substituter, daemon, and
+///    anything we haven't enumerated. Bounded by `max_attempts`.
+///
+/// # Why exit code is consulted first for kill signals
+///
+/// A process killed by SIGKILL has no chance to write a diagnostic —
+/// stderr stops where the kernel got around to it. Nix may still
+/// surface the killed phase's prior output as `Cannot build ...
+/// failed due to signal 9` (DetSys format), but the right answer is
+/// *still* `Transient`: the compile didn't finish, so we can't trust
+/// that diagnostic. Exit 137 is the clean signal; the stderr pattern
+/// is the fallback when the exit code is unavailable.
+fn classify_outcome(signals: BuildOutcomeSignals<'_>) -> ErrorCategory {
+    let t = signals.stderr_tail.to_ascii_lowercase();
+
+    // 1. Resource exhaustion — retryable, likely on a different
+    //    worker. Checked first so OOM context wins over signal-9
+    //    patterns below.
+    if is_resource_exhaustion(&t) {
         return ErrorCategory::DiskFull;
     }
 
-    // Deterministic build failure signatures — not retryable.
+    // 2. External kill — via exit code (cleanest signal) or stderr
+    //    (fallback when the process's wait status is unavailable).
+    //    Checked BEFORE the BuildFailure anchor so a DetSys-format
+    //    `Cannot build ... failed due to signal 9` doesn't get
+    //    mis-classified as terminal.
+    if was_killed_externally(&t, signals.exit_code) {
+        return ErrorCategory::Transient;
+    }
+
+    // 3. Deterministic build failure — terminal, not retryable.
     //
-    // The `builder for ` / `cannot build '` anchors guard against
-    // matching spurious substrings in e.g. network error logs.
+    //    The anchor phrase guards against matching the terminal
+    //    marker in unrelated contexts (e.g. `nix-daemon failed with
+    //    exit code 3` is a daemon problem, not a build failure).
     let has_anchor = t.contains("builder for ") || t.contains("cannot build '");
     let has_terminal_marker = t.contains("failed with exit code")
         || t.contains("failed to produce output path")
@@ -770,15 +827,103 @@ fn classify_stderr(tail: &str) -> ErrorCategory {
     if has_anchor && has_terminal_marker {
         return ErrorCategory::BuildFailure;
     }
+
+    // 4. Integrity-check failures — always terminal. No retry will
+    //    change a hash mismatch or a reference violation.
     if t.contains("hash mismatch in fixed-output derivation")
-        || t.contains("output path ") && t.contains(" is not allowed to refer to ")
+        || (t.contains("output path ") && t.contains(" is not allowed to refer to "))
     {
         return ErrorCategory::BuildFailure;
     }
 
-    // Everything else — network, substituter, daemon, unknown — is
-    // treated as transient. Bounded by `max_attempts` at the server.
+    // 5. Unknown — retryable. This is the key bias: we never let an
+    //    un-catalogued error turn into a terminal fail.
     ErrorCategory::Transient
+}
+
+/// Disk / memory / IO exhaustion patterns. Matched against the
+/// already-lower-cased stderr so every branch is a single substring
+/// check.
+fn is_resource_exhaustion(t: &str) -> bool {
+    // Filesystem: ENOSPC and EDQUOT shapes.
+    if t.contains("no space left on device")
+        || t.contains("disk full")
+        || t.contains("disk quota exceeded")
+    {
+        return true;
+    }
+    // Memory: glibc / kernel / nix wrappers.
+    if t.contains("out of memory") || t.contains("cannot allocate memory") {
+        return true;
+    }
+    // Kernel OOM killer / cgroup OOM. Multiple shapes because the
+    // kernel's exact wording has shifted across releases and is
+    // further re-wrapped by systemd-journald, kubelet, etc.
+    if t.contains("oom reaper")
+        || t.contains("oom-kill")
+        || t.contains("killed by oom")
+        || t.contains("memory cgroup out of memory")
+        || (t.contains("killed") && (t.contains("oom") || t.contains("out of memory")))
+    {
+        return true;
+    }
+    // Filesystem layer errors. `input/output error` is a strong
+    // signal that the storage itself failed; treating it as
+    // retryable lets a different-worker retry succeed when the
+    // underlying block device is flaky.
+    if t.contains("input/output error") {
+        return true;
+    }
+    false
+}
+
+/// Detect an external kill. Cleanest signal is the exit code; stderr
+/// patterns are the fallback for the rare case where a wrapper
+/// swallows the wait status.
+fn was_killed_externally(t: &str, exit_code: Option<i32>) -> bool {
+    // Exit codes set by the shell convention 128+N when a child is
+    // terminated by signal N. We care about:
+    //   * 137 — SIGKILL (9). Typically OOM killer, container kill,
+    //     operator `kill -9`. The process didn't get a chance to
+    //     run an exit handler.
+    //   * 143 — SIGTERM (15). Graceful termination — from systemd,
+    //     k8s preStop, or `docker stop`. The build might have been
+    //     mid-compile.
+    //   * 124 — GNU `timeout` command's default exit when its
+    //     grace period expires. Convention, not POSIX: callers
+    //     sometimes wrap build scripts in `timeout` and the build
+    //     shouldn't be failed because it ran long.
+    if let Some(code) = exit_code {
+        if matches!(code, 137 | 143 | 124) {
+            return true;
+        }
+    }
+    // Stderr fallback patterns. `signal 9` is substring-matched
+    // against the Nix DetSys format (`failed due to signal 9
+    // (Killed)`) and any other build tool that reports the same way.
+    // Bare `killed by sigkill` / `killed by sigterm` match the
+    // systemd / kubectl wording.
+    if t.contains("signal 9")
+        || t.contains("killed by sigkill")
+        || t.contains("signal 15")
+        || t.contains("killed by sigterm")
+    {
+        return true;
+    }
+    false
+}
+
+// Back-compat thin wrapper. Kept test-only because production code
+// must always have an exit code — dropping the exit-code signal in
+// main code would regress the classifier contract. Tests that only
+// care about stderr pattern-matching continue to use the simpler
+// entrypoint.
+#[cfg(test)]
+fn classify_stderr(tail: &str) -> ErrorCategory {
+    classify_outcome(BuildOutcomeSignals {
+        stderr_tail: tail,
+        exit_code: None,
+    })
 }
 
 /// RAII guard that aborts a `tokio::task::JoinHandle` when dropped.
@@ -1096,6 +1241,364 @@ mod classify_tests {
                     Reason: builder failed due to signal 9 (Killed).\n\
                     process killed by OOM reaper";
         assert_eq!(classify_stderr(tail), ErrorCategory::DiskFull);
+    }
+
+    // ─── Exit-code-aware rules ──────────────────────────────────
+    //
+    // These lock in the "only broken builds break builds" contract
+    // at the strongest level: even when stderr *looks* like a
+    // terminal build failure, an external-kill exit code must flip
+    // the classification to Transient. Rerunning on a different
+    // worker (or on the same worker after memory pressure clears)
+    // can succeed; a BuildFailure label would foreclose that.
+
+    fn outcome(tail: &str, exit_code: Option<i32>) -> ErrorCategory {
+        classify_outcome(BuildOutcomeSignals {
+            stderr_tail: tail,
+            exit_code,
+        })
+    }
+
+    #[test]
+    fn exit_137_sigkill_is_transient_even_with_buildfailure_stderr() {
+        // The most dangerous false-positive: Nix reports the killed
+        // phase as `Cannot build ... failed due to signal 9` but the
+        // TRUE cause is the worker running out of memory. Without
+        // the exit-code check the anchor+marker path would mis-label
+        // this as terminal and fail the drv on every worker in
+        // sequence.
+        let tail = "Cannot build '/nix/store/abc-hello.drv'.\n\
+                    Reason: builder failed due to signal 9 (Killed).";
+        // Sanity: without the exit code we get an honest-but-imprecise
+        // Transient via the stderr `signal 9` fallback.
+        assert_eq!(outcome(tail, None), ErrorCategory::Transient);
+        // With the exit code: same answer, but via the stronger signal.
+        assert_eq!(outcome(tail, Some(137)), ErrorCategory::Transient);
+    }
+
+    #[test]
+    fn exit_143_sigterm_overrides_buildfailure_anchor() {
+        // Worker shutdown path: graceful-stop sends SIGTERM, the
+        // build dies mid-way, Nix reports it as a build failure.
+        // The correct answer is Transient — the shutdown interrupted
+        // a compile, it didn't diagnose one.
+        let tail = "error: builder for '/nix/store/abc-llvm.drv' failed with exit code 143";
+        assert_eq!(outcome(tail, Some(143)), ErrorCategory::Transient);
+    }
+
+    #[test]
+    fn exit_124_gnu_timeout_is_transient() {
+        // `timeout 5m nix build ...` pattern — the build script
+        // ran too long per some wall-clock cap. Our own per-drv
+        // timeout already surfaces as Transient; this handles the
+        // case where an outer wrapper imposed its own timeout.
+        assert_eq!(
+            outcome("error: builder for x.drv failed with exit code 124", Some(124)),
+            ErrorCategory::Transient
+        );
+    }
+
+    #[test]
+    fn legitimate_buildfailure_with_exit_1_stays_terminal() {
+        // Counter-case: a normal exit-1 build failure must still
+        // be classified as BuildFailure — otherwise the whole
+        // retry system becomes infinite and every broken drv
+        // exhausts `max_attempts` before terminalizing.
+        let tail = "error: builder for '/nix/store/abc-hello.drv' failed with exit code 1";
+        assert_eq!(outcome(tail, Some(1)), ErrorCategory::BuildFailure);
+        assert_eq!(outcome(tail, Some(2)), ErrorCategory::BuildFailure);
+        assert_eq!(outcome(tail, None), ErrorCategory::BuildFailure);
+    }
+
+    #[test]
+    fn sigabrt_signal_6_stays_buildfailure() {
+        // SIGABRT (6) is a deliberate `abort()` call — usually from
+        // an assertion, not an external kill. Treat as BuildFailure
+        // (retrying on a different worker won't fix a failing assert).
+        let tail = "Cannot build '/nix/store/abc.drv'.\n\
+                    Reason: builder failed due to signal 6 (Aborted).";
+        assert_eq!(outcome(tail, Some(134)), ErrorCategory::BuildFailure);
+        assert_eq!(outcome(tail, None), ErrorCategory::BuildFailure);
+    }
+
+    #[test]
+    fn oom_wins_over_signal_9_exit_code() {
+        // Even when exit is 137, if stderr says OOM, we want DiskFull
+        // not just Transient — the "different worker with more RAM"
+        // policy is a tighter hint than a generic retry.
+        let tail = "builder failed due to signal 9 (Killed).\n\
+                    Memory cgroup out of memory: Killed process 1234 (gcc)";
+        assert_eq!(outcome(tail, Some(137)), ErrorCategory::DiskFull);
+    }
+
+    #[test]
+    fn edquot_and_enospc_variants_all_diskfull() {
+        // Regression spread: the ENOSPC/EDQUOT family must all be
+        // classified alike. Test each literal string the kernel /
+        // glibc emit, so a future-Linux rename of one doesn't
+        // silently become Transient.
+        for s in [
+            "No space left on device",
+            "error: disk full",
+            "Disk quota exceeded",
+            "Input/output error while writing to /nix/store",
+        ] {
+            assert_eq!(
+                classify_stderr(s),
+                ErrorCategory::DiskFull,
+                "stderr fragment not classified as DiskFull: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_oom_reaper_patterns_all_diskfull() {
+        // Three common shapes across kernel versions / wrappers.
+        for s in [
+            "process killed by oom-kill",
+            "oom reaper: killed process 2345",
+            "Memory cgroup out of memory: Killed process 1 (pid1)",
+        ] {
+            assert_eq!(
+                classify_stderr(s),
+                ErrorCategory::DiskFull,
+                "kernel OOM fragment not classified: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_substituter_daemon_all_transient() {
+        // These are the most common "infra-but-not-exhaustion"
+        // failures and must never become BuildFailure.
+        for s in [
+            "curl: (7) Failed to connect to cache.nixos.org port 443",
+            "unable to download 'https://cache.nixos.org/abc.narinfo': SSL peer error",
+            "substituter 'https://cache.nixos.org': ignoring (operation timed out)",
+            "error: unable to connect to /tmp/nix-daemon: Connection refused",
+            "error: cannot add path '/nix/store/abc': connection reset by peer",
+            "error: renaming '/nix/store/.links-temp': Input/output error",
+            // ^ IOError *is* classified as DiskFull, test below
+        ] {
+            let got = classify_stderr(s);
+            if s.contains("Input/output error") {
+                assert_eq!(got, ErrorCategory::DiskFull, "IO error must be DiskFull: {s:?}");
+            } else {
+                assert_eq!(got, ErrorCategory::Transient, "network/daemon must be Transient: {s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_exit_codes_follow_stderr_classification() {
+        // Weird exit codes (e.g. exit 101 from a cargo panic) must
+        // not trigger the kill-signal branch; they should fall
+        // through to the normal stderr analysis.
+        for code in [1, 2, 101, 126, 127, 255] {
+            let tail = "error: builder for '/nix/store/x.drv' failed with exit code 1";
+            assert_eq!(outcome(tail, Some(code)), ErrorCategory::BuildFailure);
+        }
+    }
+
+    #[test]
+    fn empty_stderr_with_kill_exit_is_transient() {
+        // A builder killed so fast it didn't write stderr. Without
+        // the exit code we default to Transient; with it we still
+        // get Transient but via the intended branch.
+        assert_eq!(outcome("", None), ErrorCategory::Transient);
+        assert_eq!(outcome("", Some(137)), ErrorCategory::Transient);
+        assert_eq!(outcome("", Some(143)), ErrorCategory::Transient);
+        // Exit 1 with empty stderr: we can't prove it's a build
+        // failure (no anchor), so default-Transient is right.
+        assert_eq!(outcome("", Some(1)), ErrorCategory::Transient);
+    }
+
+    #[test]
+    fn classify_outcome_bytes_matches_text_path() {
+        // Parity check: every fixture we care about must produce the
+        // same answer through the `_bytes` entrypoint the production
+        // code uses. Without this parity, someone refactoring the
+        // bytes wrapper could silently skip the exit-code signal.
+        let fixtures: &[(&str, Option<i32>, ErrorCategory)] = &[
+            (
+                "error: builder for '/nix/store/x.drv' failed with exit code 1",
+                Some(1),
+                ErrorCategory::BuildFailure,
+            ),
+            (
+                "Cannot build '/nix/store/x.drv'.\n\
+                 Reason: builder failed due to signal 9 (Killed).",
+                Some(137),
+                ErrorCategory::Transient,
+            ),
+            (
+                "error: writing to file: No space left on device",
+                Some(1),
+                ErrorCategory::DiskFull,
+            ),
+            (
+                "curl: (7) Failed to connect",
+                Some(1),
+                ErrorCategory::Transient,
+            ),
+        ];
+        for (tail, code, want) in fixtures {
+            assert_eq!(
+                classify_outcome_bytes(tail.as_bytes(), *code),
+                *want,
+                "bytes-path mismatch: tail={tail:?}, code={code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lowercase_only_pattern_still_matches_mixed_case_stderr() {
+        // Kernel / systemd patterns come through with mixed case
+        // depending on the log aggregator in front of the worker.
+        // The classifier lower-cases once up front — the fixtures
+        // here are deliberately mixed-case to guard against a
+        // future refactor that skips the lowercase conversion.
+        assert_eq!(
+            classify_stderr("ERROR: No Space Left On Device"),
+            ErrorCategory::DiskFull
+        );
+        assert_eq!(
+            classify_stderr("Memory Cgroup Out Of Memory: Killed process 9"),
+            ErrorCategory::DiskFull
+        );
+    }
+
+    // ─── Property-style enumerations ────────────────────────────
+    //
+    // Classifier correctness ultimately reduces to a handful of
+    // invariants that must hold across ALL inputs, not just the
+    // canonical fixtures. The tests below enumerate the product of
+    // (stderr variant × exit code) for the axes where a single bad
+    // rule interaction could regress the "no infra-induced
+    // BuildFailure" contract.
+
+    const KILL_EXIT_CODES: &[i32] = &[137, 143, 124];
+    const BENIGN_EXIT_CODES: &[i32] = &[1, 2, 101, 126, 127, 255];
+    const TERMINAL_BUILDFAILURE_TAILS: &[&str] = &[
+        "error: builder for '/nix/store/x-a.drv' failed with exit code 1",
+        "error: builder for '/nix/store/x-b.drv' failed to produce output path",
+        "Cannot build '/nix/store/x-c.drv'.\nReason: builder failed with exit code 2.",
+        "Cannot build '/nix/store/x-d.drv'.\nReason: builder failed due to signal 6 (Aborted).",
+    ];
+    const RESOURCE_EXHAUSTION_TAILS: &[&str] = &[
+        "No space left on device",
+        "disk full",
+        "Disk quota exceeded",
+        "out of memory",
+        "Cannot allocate memory",
+        "Memory cgroup out of memory: Killed process 1234",
+        "oom reaper: killed victim 4321",
+        "process killed by OOM reaper",
+        "Input/output error",
+    ];
+
+    #[test]
+    fn kill_exit_codes_never_produce_buildfailure() {
+        // The contract under test: no stderr content, however
+        // terminal-looking, can outweigh an external-kill exit code.
+        // Permutations across kill codes × terminal-looking stderr.
+        for &code in KILL_EXIT_CODES {
+            for &tail in TERMINAL_BUILDFAILURE_TAILS {
+                let cat = outcome(tail, Some(code));
+                assert!(
+                    cat.is_retryable(),
+                    "kill exit {code} + tail {tail:?} must be retryable, got {cat:?}"
+                );
+                assert_ne!(
+                    cat,
+                    ErrorCategory::BuildFailure,
+                    "kill exit {code} + tail {tail:?} produced BuildFailure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resource_exhaustion_is_diskfull_under_any_exit_code() {
+        // DiskFull pre-empts everything: a drv that OOM'd is retry-
+        // able regardless of the wait status we captured.
+        let all_codes: Vec<Option<i32>> = std::iter::once(None)
+            .chain(KILL_EXIT_CODES.iter().map(|c| Some(*c)))
+            .chain(BENIGN_EXIT_CODES.iter().map(|c| Some(*c)))
+            .collect();
+        for &tail in RESOURCE_EXHAUSTION_TAILS {
+            for &code in &all_codes {
+                assert_eq!(
+                    outcome(tail, code),
+                    ErrorCategory::DiskFull,
+                    "exhaustion tail {tail:?} + code {code:?} must be DiskFull"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legitimate_buildfailure_is_terminal_under_benign_exit_codes() {
+        // Counter-direction: a normal exit-1 build failure must NOT
+        // be misclassified as retryable just because the exit code
+        // is one we don't specifically enumerate. This guards against
+        // an over-zealous "retry on anything unknown" regression.
+        for &code in BENIGN_EXIT_CODES {
+            for &tail in TERMINAL_BUILDFAILURE_TAILS {
+                // Skip the signal-6 DetSys fixture when pairing with
+                // exit codes that are themselves signal-kill shapes;
+                // the BENIGN list excludes those by construction.
+                let cat = outcome(tail, Some(code));
+                assert_eq!(
+                    cat,
+                    ErrorCategory::BuildFailure,
+                    "benign exit {code} + tail {tail:?} must be BuildFailure, got {cat:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_or_empty_stderr_is_always_retryable_regardless_of_exit() {
+        // The classifier's default bias: when we can't identify
+        // what happened, the retry budget must get a chance. This
+        // is the single rule that most directly realizes "only
+        // broken builds break builds" — without a positive
+        // terminal signal, we never give up.
+        let unknowns = [
+            "",
+            "unexpected string we have never observed",
+            "2025-04-18T12:00:00Z some log line",
+            "\t\n\r ",
+        ];
+        let all_codes: Vec<Option<i32>> = std::iter::once(None)
+            .chain((1..=255).map(Some))
+            .collect();
+        for tail in unknowns {
+            for &code in &all_codes {
+                let cat = outcome(tail, code);
+                assert!(
+                    cat.is_retryable(),
+                    "unknown tail {tail:?} + exit {code:?} must be retryable (got {cat:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exit_code_alone_never_upgrades_to_buildfailure() {
+        // Edge case: if stderr carries none of the build-failure
+        // anchors, no exit code — however "terminal-looking" —
+        // should synthesize a BuildFailure. The positive signal
+        // must come from stderr.
+        for code in 1..=255 {
+            let cat = outcome("unexplained tail", Some(code));
+            assert_ne!(
+                cat,
+                ErrorCategory::BuildFailure,
+                "exit {code} synthesized BuildFailure from generic stderr"
+            );
+        }
     }
 }
 

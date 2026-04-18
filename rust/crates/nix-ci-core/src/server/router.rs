@@ -1,5 +1,7 @@
 //! Route table.
 
+use std::panic::AssertUnwindSafe;
+
 use tokio::time::Instant;
 
 use axum::body::Body;
@@ -9,6 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
+use futures::FutureExt;
 use opentelemetry::propagation::Extractor;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -152,7 +155,28 @@ pub fn build_router(state: AppState) -> Router {
                 .get(ops::admin_fence_list)
                 .delete(ops::admin_fence_remove),
         )
+        // Refute: operator lever for clearing false-positive
+        // failed_outputs entries (e.g. a sick worker marked a
+        // drv failed before auto-quarantine kicked in, and the
+        // drv is still blocked by the TTL cache). Gated by the
+        // admin bearer via is_admin_route.
+        .route("/admin/refute", post(ops::admin_refute))
         .layer(DefaultBodyLimit::max(max_body))
+        // Catch-panic sits innermost so a panic inside any handler or
+        // deeper middleware is converted to a 500 response rather than
+        // unwinding through the axum task — dropping the connection
+        // and leaving the client with no signal. Each of the outer
+        // layers (timeout, metrics, auth, request-id) then observes a
+        // synthetic 500 and records/emits the same way as any other
+        // error. The real panic is logged by the global panic hook
+        // (installed at binary startup) which also increments the
+        // `nix_ci_process_panics` counter — operators alert on that.
+        //
+        // Placed inside the body-limit layer so a panic triggered by
+        // an unusually large body (a reserved-but-unusual eventuality)
+        // still doesn't escape; the body-limit check itself is a
+        // `Service`, not a future, and doesn't panic.
+        .layer(middleware::from_fn(catch_panic_layer))
         .layer(middleware::from_fn_with_state(
             request_timeout,
             request_timeout_layer,
@@ -288,6 +312,67 @@ async fn bearer_auth_layer(
     } else {
         crate::Error::Unauthorized("invalid bearer token".into()).into_response()
     }
+}
+
+/// Convert a panic in any downstream handler/middleware into a 500
+/// response, keeping the axum task alive and the connection healthy.
+///
+/// Without this, a panic propagates up through the spawned connection
+/// task; axum drops the connection silently (the client sees an EOF,
+/// not an error payload) and — more importantly for reliability — the
+/// blast radius of a single malformed input is unbounded: any panic
+/// the input triggers also skips our metrics/auth layers, so the
+/// operator's dashboards don't see the failure cleanly.
+///
+/// Semantics mirror `Error::Internal`: fixed-shape 500 body, the real
+/// panic payload is logged (via the global panic hook + a targeted
+/// tracing event here), and the `nix_ci_process_panics` counter
+/// increments. Callers cannot distinguish "handler panicked" from
+/// "handler returned Error::Internal" — by design; both are our fault
+/// and both require the same ops response.
+///
+/// `AssertUnwindSafe` is required because `Next`'s future captures the
+/// request (not `UnwindSafe`). It's sound here because:
+/// * we don't reuse the future on the error path — a panicked future
+///   is dropped, not resumed;
+/// * no observer holds references into the future across the .await;
+/// * the caller synthesizes a fresh response from constants.
+async fn catch_panic_layer(req: Request<Body>, next: Next) -> Response {
+    // Capture the path up front so the tracing line still names the
+    // route after the request is consumed by `next.run`.
+    let matched = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let raw_path = req.uri().path().to_string();
+    match AssertUnwindSafe(next.run(req)).catch_unwind().await {
+        Ok(resp) => resp,
+        Err(payload) => {
+            let msg = panic_payload_message(&payload);
+            let route = matched.unwrap_or(raw_path);
+            tracing::error!(
+                route = %route,
+                panic_payload = %msg,
+                "handler panicked; returning 500"
+            );
+            crate::Error::Internal(format!("handler panic at {route}")).into_response()
+        }
+    }
+}
+
+/// Best-effort extraction of a panic payload's string representation.
+/// Panics typically use `&'static str` (from `panic!("msg")`) or
+/// `String` (from `panic!("{x}")`); other payload types are rare and
+/// don't carry a diagnostic — fall back to a marker string so the log
+/// line always has *something* useful.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
 }
 
 /// Byte-equal constant-time compare. Prevents timing oracles on the
@@ -469,5 +554,156 @@ mod extractor_tests {
         assert!(!is_long_poll_route("/jobs/{id}/seal"));
         assert!(!is_long_poll_route("/jobs/{id}/drvs/batch"));
         assert!(!is_long_poll_route("/jobs"));
+    }
+
+    #[test]
+    fn panic_payload_message_downcasts_str_and_string() {
+        // `panic!("lit")` payload is `&'static str`; `panic!("{x}")`
+        // payload is `String`; other types fall through to the marker.
+        // The middleware relies on all three cases in production.
+        let p: Box<dyn std::any::Any + Send> = Box::new("hello");
+        assert_eq!(panic_payload_message(&p), "hello");
+
+        let p: Box<dyn std::any::Any + Send> = Box::new(String::from("world"));
+        assert_eq!(panic_payload_message(&p), "world");
+
+        // Anything else — `Box<u32>` is a plausible-ish "I panicked
+        // with a value that isn't a diagnostic string" case.
+        let p: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_payload_message(&p), "<non-string panic payload>");
+    }
+}
+
+#[cfg(test)]
+mod catch_panic_tests {
+    //! Exercise the catch-panic middleware in isolation. We don't use
+    //! the full `spawn_server` harness here — tower's `oneshot` lets us
+    //! drive a mini-router directly with no TCP listener, no DB pool,
+    //! and no background tasks, so the test runtime stays tight and
+    //! the assertions focus entirely on the panic-recovery surface.
+    //!
+    //! The coverage we need:
+    //! * A panic in a handler → 500 response with the sanitized
+    //!   error body (not a dropped connection).
+    //! * After a panic, the router still serves the next request
+    //!   (panics must not poison shared state — catch_unwind is per
+    //!   future, so this should hold, but we assert it explicitly).
+    //! * The panic body is the same `Error::Internal`-shaped JSON
+    //!   clients already handle, so tooling that parses 5xx errors
+    //!   doesn't need a second code path.
+    //! * Both `&'static str` and formatted-`String` panic payloads
+    //!   are handled without the middleware itself panicking.
+    //! * A non-panicking handler is completely unaffected (no
+    //!   latency added beyond the catch_unwind poll, no body
+    //!   rewriting, no status mutation).
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    async fn panics_with_str() -> &'static str {
+        panic!("intentional: static str payload")
+    }
+
+    async fn panics_with_formatted_string() -> &'static str {
+        let noun = "world";
+        panic!("intentional: formatted {noun}")
+    }
+
+    async fn returns_ok() -> &'static str {
+        "ok"
+    }
+
+    fn test_router() -> Router {
+        Router::new()
+            .route("/boom_str", get(panics_with_str))
+            .route("/boom_string", get(panics_with_formatted_string))
+            .route("/ok", get(returns_ok))
+            .layer(middleware::from_fn(catch_panic_layer))
+    }
+
+    async fn status_and_body(
+        app: Router,
+        path: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192)
+            .await
+            .expect("collect body");
+        if bytes.is_empty() {
+            return (status, serde_json::Value::Null);
+        }
+        let v = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn str_panic_becomes_sanitized_500() {
+        let (status, body) = status_and_body(test_router(), "/boom_str").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // Error body shape must match the regular Error::Internal
+        // path so clients have one 5xx parser.
+        assert_eq!(body["code"], 500);
+        assert_eq!(body["error"], "internal server error");
+        // Crucially: the panic payload MUST NOT be echoed into the
+        // response body — operators see it in logs, but the network
+        // only ever sees the sanitized constant.
+        let body_str = body.to_string();
+        assert!(
+            !body_str.contains("static str payload"),
+            "panic payload leaked into response body: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn formatted_string_panic_becomes_sanitized_500() {
+        let (status, body) = status_and_body(test_router(), "/boom_string").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], 500);
+        assert_eq!(body["error"], "internal server error");
+        assert!(!body.to_string().contains("formatted world"));
+    }
+
+    #[tokio::test]
+    async fn non_panicking_handler_is_untouched() {
+        let (status, body) = status_and_body(test_router(), "/ok").await;
+        assert_eq!(status, StatusCode::OK);
+        // The handler returned a bare string, not JSON; our
+        // extractor collapses to a JSON string in that case.
+        assert_eq!(body.as_str().unwrap_or_default(), "ok");
+    }
+
+    #[tokio::test]
+    async fn router_stays_alive_after_a_panic() {
+        // The regression this guards against is an axum / tokio / tower
+        // interaction where a panicking future somehow poisons the
+        // router (e.g. via a Layer that holds `&mut` state). Our layer
+        // is stateless so this should be stable, but an explicit
+        // assertion is cheap and documents the contract.
+        let router = test_router();
+        let (boom_status, _) = status_and_body(router.clone(), "/boom_str").await;
+        assert_eq!(boom_status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (ok_status, body) = status_and_body(router, "/ok").await;
+        assert_eq!(ok_status, StatusCode::OK);
+        assert_eq!(body.as_str().unwrap_or_default(), "ok");
+    }
+
+    #[tokio::test]
+    async fn sequential_panics_all_produce_500() {
+        // Two back-to-back panics must both surface clean 500s —
+        // the per-future catch_unwind must not pick up state from
+        // a previous unwind.
+        let router = test_router();
+        for _ in 0..3 {
+            let (s, _) = status_and_body(router.clone(), "/boom_str").await;
+            assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 }

@@ -48,6 +48,21 @@ pub async fn submit_batch(
             errored: 0,
         }));
     }
+
+    // Hard per-batch cap on eval_errors. A runaway evaluator could
+    // otherwise ship tens of thousands of error strings in one batch,
+    // inflating the per-submission `eval_errors` vec and the final
+    // `jobs.result` JSONB snapshot. Rejecting the whole batch (not
+    // silently truncating) surfaces the problem to the submitter so
+    // they know some errors never reached the coordinator.
+    if req.eval_errors.len() > state.cfg.max_eval_errors_per_batch as usize {
+        return Err(crate::Error::PayloadTooLarge(format!(
+            "eval_errors batch of {} exceeds max_eval_errors_per_batch={}",
+            req.eval_errors.len(),
+            state.cfg.max_eval_errors_per_batch
+        )));
+    }
+
     reject_if_terminal(&state, id).await?;
     let sub = state
         .dispatcher
@@ -121,6 +136,34 @@ pub async fn submit_batch(
         if d.drv_path.len() > state.cfg.max_drv_path_bytes
             || d.drv_name.len() > state.cfg.max_drv_name_bytes
         {
+            errored += 1;
+            continue;
+        }
+        // Per-drv fan-out caps. A drv with thousands of direct
+        // `input_drvs` or dozens of `required_features` has never
+        // been observed in real nixpkgs evaluations; values above
+        // the caps are either malicious or a client bug, and letting
+        // them through costs O(N) work per edge plus a Vec allocation
+        // in the Step registry. Skipping here preserves the rest of
+        // the batch — the caller sees `errored` rise and can diagnose
+        // the offending attr.
+        if d.input_drvs.len() > state.cfg.max_input_drvs_per_drv as usize {
+            tracing::warn!(
+                drv_path = %d.drv_path,
+                input_drvs = d.input_drvs.len(),
+                cap = state.cfg.max_input_drvs_per_drv,
+                "ingest: drv exceeds max_input_drvs_per_drv; skipping"
+            );
+            errored += 1;
+            continue;
+        }
+        if d.required_features.len() > state.cfg.max_required_features_per_drv as usize {
+            tracing::warn!(
+                drv_path = %d.drv_path,
+                required_features = d.required_features.len(),
+                cap = state.cfg.max_required_features_per_drv,
+                "ingest: drv exceeds max_required_features_per_drv; skipping"
+            );
             errored += 1;
             continue;
         }

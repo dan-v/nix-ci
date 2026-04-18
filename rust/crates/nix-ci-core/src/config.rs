@@ -151,6 +151,72 @@ pub struct ServerConfig {
     /// without coordinator-level limit (bounded only by worker fleet
     /// size). Set to ~2× expected peak in-flight for production.
     pub max_claims_in_flight: Option<u32>,
+    /// Per-drv cap on `input_drvs` length. A single nix derivation
+    /// with >4k direct inputs has never been observed in real nixpkgs
+    /// evaluations — the highest stdenv closure sits in the low
+    /// hundreds — so this bound is defensive. Drvs that exceed the
+    /// cap are counted in `errored` and skipped; the rest of the
+    /// batch proceeds. Paired with `catch_panic_layer` for the
+    /// "one bad submission must not break the coordinator" rule.
+    pub max_input_drvs_per_drv: u32,
+    /// Per-drv cap on `required_features` length. Nix features are a
+    /// short enumerated set (big-parallel, kvm, benchmark, …); even
+    /// the most feature-demanding drvs use 5-10. Anything above
+    /// `max_required_features_per_drv` is either malicious or a
+    /// client bug. Over-limit drvs are counted in `errored` and
+    /// skipped — the same contract as the other per-drv caps.
+    pub max_required_features_per_drv: u32,
+    /// Per-batch cap on `eval_errors` length. Bounds the worst-case
+    /// ingest-phase memory cost and the final `eval_errors` snapshot
+    /// shipped to `jobs.result`. A single broken attr can yield
+    /// dozens of lines; 10k is dramatic headroom. Over the cap the
+    /// whole batch is rejected with 413 so a runaway evaluator
+    /// surfaces instead of silently truncating user-facing errors.
+    pub max_eval_errors_per_batch: u32,
+    /// Maximum total wall-clock time a single claim can live before
+    /// the reaper forcibly re-arms the step, regardless of how often
+    /// the worker has extended the lease. Protects against a worker
+    /// that's "stuck but still heartbeating" — e.g. a build pinned on
+    /// an NFS mount — from holding a drv forever while the fleet
+    /// idles. The claim-deadline extension path still works within
+    /// this ceiling; expiry on the ceiling is a distinct event from
+    /// normal deadline expiry and the step re-arms for another
+    /// worker to try fresh. `None` disables the ceiling (claims can
+    /// extend indefinitely — the v3 default); set to ~2× the longest
+    /// legitimate build to catch pathologies. Measured from
+    /// `ActiveClaim.started_at`.
+    pub max_claim_lifetime_secs: Option<u64>,
+    /// Per-worker error-rate quarantine. When a worker reports more
+    /// than `worker_quarantine_failure_threshold` failures inside
+    /// `worker_quarantine_window_secs`, the coordinator auto-fences
+    /// that worker for `worker_quarantine_cooldown_secs`. Designed
+    /// to catch a single-host infra problem (bad `/nix/store`,
+    /// corrupted sandbox, flaky network) from poisoning many drvs
+    /// before an operator notices.
+    ///
+    /// **Scope: fleet mode only.** The per-job claim endpoint
+    /// (`GET /jobs/{id}/claim`) deliberately skips this check —
+    /// the per-job worker IS the CI run, and quarantining it
+    /// mid-run would hang the run waiting for a worker that won't
+    /// claim. Per-job failures stay bounded inside their own CI
+    /// job; fleet failures otherwise spread across unrelated jobs,
+    /// so fleet is where containment matters.
+    ///
+    /// `None` (default) = auto-quarantine disabled; fencing remains
+    /// fully manual via `/admin/fence`. Operators opt in by setting
+    /// a non-zero threshold.
+    pub worker_quarantine_failure_threshold: Option<u32>,
+    /// Sliding-window length for auto-quarantine failure counting.
+    /// Worker events older than this are evicted from the per-worker
+    /// counter. Default 300s — a single flaky minute won't trip
+    /// quarantine, but a sustained hour won't be forgotten before
+    /// cooldown either.
+    pub worker_quarantine_window_secs: u64,
+    /// Cooldown after auto-quarantine. The worker is unfenced once
+    /// `worker_quarantine_cooldown_secs` have elapsed since the
+    /// most recent failure that tripped the threshold. Operators
+    /// who want a permanent ban should use `/admin/fence` manually.
+    pub worker_quarantine_cooldown_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -188,6 +254,13 @@ impl Default for ServerConfig {
             auth_bearer: None,
             admin_bearer: None,
             max_claims_in_flight: None,
+            max_input_drvs_per_drv: 4096,
+            max_required_features_per_drv: 32,
+            max_eval_errors_per_batch: 10_000,
+            max_claim_lifetime_secs: None,
+            worker_quarantine_failure_threshold: None,
+            worker_quarantine_window_secs: 300,
+            worker_quarantine_cooldown_secs: 900,
         }
     }
 }
@@ -315,6 +388,41 @@ impl ServerConfig {
         }
         if self.failed_outputs_ttl_secs == 0 {
             errors.push("failed_outputs_ttl_secs must be > 0".into());
+        }
+        if self.max_input_drvs_per_drv == 0 {
+            errors.push("max_input_drvs_per_drv must be > 0".into());
+        }
+        if self.max_required_features_per_drv == 0 {
+            errors.push("max_required_features_per_drv must be > 0".into());
+        }
+        if self.max_eval_errors_per_batch == 0 {
+            errors.push("max_eval_errors_per_batch must be > 0".into());
+        }
+        if self.worker_quarantine_window_secs == 0 {
+            errors.push("worker_quarantine_window_secs must be > 0".into());
+        }
+        if self.worker_quarantine_cooldown_secs == 0 {
+            errors.push("worker_quarantine_cooldown_secs must be > 0".into());
+        }
+        if let Some(t) = self.worker_quarantine_failure_threshold {
+            if t == 0 {
+                errors.push(
+                    "worker_quarantine_failure_threshold, when set, must be > 0 (use null to disable)"
+                        .into(),
+                );
+            }
+        }
+        if let Some(m) = self.max_claim_lifetime_secs {
+            if m == 0 {
+                errors.push(
+                    "max_claim_lifetime_secs, when set, must be > 0 (use null to disable)".into(),
+                );
+            } else if m < self.claim_deadline_secs {
+                errors.push(format!(
+                    "max_claim_lifetime_secs ({m}) must be >= claim_deadline_secs ({}) — otherwise the ceiling fires before the first lease extension",
+                    self.claim_deadline_secs
+                ));
+            }
         }
 
         // Log retention must not outlive job retention: the

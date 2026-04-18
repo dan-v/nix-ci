@@ -308,9 +308,7 @@ pub async fn admin_fence_add(
     validate_worker_id(&q.worker_id, state.cfg.max_identifier_bytes)?;
     state.fenced_workers.write().insert(q.worker_id);
     state.dispatcher.wake();
-    Ok(Json(FenceStatus {
-        fenced: fenced_vec(&state),
-    }))
+    Ok(Json(fence_status(&state)))
 }
 
 #[tracing::instrument(skip_all, fields(worker_id = %q.worker_id))]
@@ -321,15 +319,34 @@ pub async fn admin_fence_remove(
     validate_worker_id(&q.worker_id, state.cfg.max_identifier_bytes)?;
     state.fenced_workers.write().remove(&q.worker_id);
     state.dispatcher.wake();
-    Ok(Json(FenceStatus {
-        fenced: fenced_vec(&state),
-    }))
+    Ok(Json(fence_status(&state)))
+}
+
+/// Shared shape builder for the three `/admin/fence` handlers.
+/// Returns the manual fence list + the live auto-quarantine
+/// snapshot so operators see a unified picture of "workers not
+/// getting new claims."
+fn fence_status(state: &AppState) -> FenceStatus {
+    let auto_quarantined = state
+        .worker_health
+        .snapshot_quarantined()
+        .into_iter()
+        .map(|(worker_id, release_at)| {
+            let remaining = release_at.saturating_duration_since(tokio::time::Instant::now());
+            AutoQuarantinedWorker {
+                worker_id,
+                release_in_secs: remaining.as_secs(),
+            }
+        })
+        .collect();
+    FenceStatus {
+        fenced: fenced_vec(state),
+        auto_quarantined,
+    }
 }
 
 pub async fn admin_fence_list(State(state): State<AppState>) -> Json<FenceStatus> {
-    Json(FenceStatus {
-        fenced: fenced_vec(&state),
-    })
+    Json(fence_status(&state))
 }
 
 fn fenced_vec(state: &AppState) -> Vec<String> {
@@ -361,4 +378,110 @@ pub struct FenceQuery {
 #[derive(serde::Serialize)]
 pub struct FenceStatus {
     pub fenced: Vec<String>,
+    /// Workers currently auto-quarantined by the per-worker failure
+    /// circuit breaker. Emitted alongside `fenced` so an operator
+    /// running `GET /admin/fence` sees the union of "things that
+    /// aren't getting new work." Omitted from the response when
+    /// serde skips the empty Vec? No — we always emit so clients
+    /// can branch on the presence of the key without parsing.
+    pub auto_quarantined: Vec<AutoQuarantinedWorker>,
+}
+
+#[derive(serde::Serialize)]
+pub struct AutoQuarantinedWorker {
+    pub worker_id: String,
+    /// Seconds until auto-release. Zero means the next claim by
+    /// this worker will clear the quarantine lazily.
+    pub release_in_secs: u64,
+}
+
+// ─── `/admin/refute` — clear false-positive failed_outputs entries ─
+
+/// `POST /admin/refute` — remove one or more entries from the
+/// `failed_outputs` TTL cache. Two caller-facing use cases:
+///
+/// * **False positive on a single drv**: a sick worker reported a
+///   drv as `BuildFailure`, poisoning the cache so every future
+///   job referencing the same output path skips the build and
+///   inherits the failure. Refuting by `drv_hash` clears every
+///   output associated with it.
+///
+/// * **Environment was fixed**: an external dependency (broken
+///   substituter, missing sandbox mount) was corrected before the
+///   TTL expired. Refuting by `output_paths` lets the next job try
+///   rebuilding the drv without waiting out the TTL.
+///
+/// Returns the number of rows deleted. Zero rows isn't an error —
+/// the operator may have passed paths that were already expired,
+/// or the cache was queried before the insert raced.
+///
+/// Gated behind the admin bearer via `is_admin_route` + the
+/// router's auth middleware.
+#[tracing::instrument(skip_all)]
+pub async fn admin_refute(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<RefuteRequest>,
+) -> Result<Json<RefuteResponse>, crate::Error> {
+    // Input validation: bound the request size so a malformed
+    // client can't drive the DELETE into a pathological shape.
+    // `max_identifier_bytes` is the right bound for individual
+    // paths (they're already constrained by ingest validation to
+    // `max_drv_path_bytes`, but we defensively re-check here).
+    if req.output_paths.len() > state.cfg.max_input_drvs_per_drv as usize {
+        return Err(crate::Error::PayloadTooLarge(format!(
+            "output_paths batch of {} exceeds max_input_drvs_per_drv={}",
+            req.output_paths.len(),
+            state.cfg.max_input_drvs_per_drv
+        )));
+    }
+    for p in &req.output_paths {
+        if p.len() > state.cfg.max_drv_path_bytes {
+            return Err(crate::Error::BadRequest(format!(
+                "output_path length {} exceeds max_drv_path_bytes",
+                p.len()
+            )));
+        }
+    }
+    if req.output_paths.is_empty() && req.drv_hash.is_none() {
+        return Err(crate::Error::BadRequest(
+            "specify at least one of: drv_hash, output_paths".into(),
+        ));
+    }
+
+    let drv_hash_ref = req.drv_hash.as_ref();
+    let rows_affected = crate::durable::writeback::delete_failed_outputs(
+        &state.pool,
+        drv_hash_ref,
+        &req.output_paths,
+    )
+    .await?;
+
+    tracing::warn!(
+        drv_hash = ?req.drv_hash,
+        paths = req.output_paths.len(),
+        rows_affected,
+        "admin: refuted failed_outputs entries"
+    );
+    Ok(Json(RefuteResponse { rows_affected }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct RefuteRequest {
+    /// Remove every cached failed-output entry whose `drv_hash`
+    /// matches. Optional; when combined with `output_paths` both
+    /// filters contribute (union).
+    #[serde(default)]
+    pub drv_hash: Option<crate::types::DrvHash>,
+    /// Specific output paths to remove. Empty when refuting by
+    /// `drv_hash` alone.
+    #[serde(default)]
+    pub output_paths: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct RefuteResponse {
+    /// Number of `failed_outputs` rows deleted. Callers log this
+    /// so operators can distinguish "refute hit N entries" from
+    /// "refute was a no-op" (typo, already expired, etc.).
+    pub rows_affected: u64,
 }
