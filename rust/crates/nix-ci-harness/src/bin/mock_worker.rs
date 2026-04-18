@@ -1,8 +1,8 @@
 //! Mock fleet worker. One process spawns N independent claim→complete
 //! loops against a coordinator. Modes:
-//!   - `healthy`: always reports success
-//!   - `sick`:    always reports BuildFailure (exit 1). Used to
-//!                drive the worker quarantine contract.
+//! - `healthy`: always reports success
+//! - `sick`: always reports BuildFailure (exit 1). Used to drive the
+//!   worker quarantine contract.
 //!
 //! On SIGTERM/SIGINT the process stops claiming new work, lets
 //! in-flight completes finish (short grace), and emits a

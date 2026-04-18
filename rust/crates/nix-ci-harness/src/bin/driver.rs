@@ -4,15 +4,13 @@
 //! doing the actual claim/complete work.
 //!
 //! Scenarios:
-//!   - `wide-fleet`           large deep-wide DAG, all-healthy workers.
-//!                            Primary assertion: job reaches Done
-//!                            within wall budget, zero failures.
-//!   - `sick-worker-contained` small DAG, ONE healthy worker handles
-//!                            work while sick workers failure-flood.
-//!                            Assertions: job reaches Done (healthy
-//!                            worker finishes the graph), quarantine
-//!                            counter ticks, admin/refute clears
-//!                            failed_outputs cache.
+//! - `wide-fleet`: large deep-wide DAG, all-healthy workers.
+//!   Primary assertion: job reaches Done within wall budget, zero
+//!   failures.
+//! - `sick-worker-contained`: small DAG, ONE healthy worker handles
+//!   work while sick workers failure-flood. Assertions: job reaches
+//!   Done (healthy worker finishes the graph), quarantine counter
+//!   ticks, admin/refute clears failed_outputs cache.
 
 use std::time::{Duration, Instant};
 
