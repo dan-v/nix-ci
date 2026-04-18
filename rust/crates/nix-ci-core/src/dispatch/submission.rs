@@ -137,6 +137,17 @@ pub struct Submission {
     /// the same `members.len()`, both pass the check, and both insert
     /// — silently overshooting the cap.
     pub reserved_drvs: AtomicU32,
+    /// Count of members currently in observable_state `Done` (finished
+    /// & !previous_failure). Cached to make `live_counts()` O(1).
+    /// Incremented on `handle_success` / `add_member` (dedup of an
+    /// already-built step). Monotonic per-submission — a step never
+    /// leaves `Done` once it's in it.
+    pub done_count: AtomicU32,
+    /// Count of members currently in observable_state `Failed`
+    /// (finished & previous_failure). Same semantics as `done_count`.
+    /// Bumped on terminal failure (originating or propagated) and on
+    /// `add_member` if the step is already in failed state.
+    pub failed_count: AtomicU32,
 }
 
 impl Submission {
@@ -172,6 +183,8 @@ impl Submission {
             transient_retries: AtomicU32::new(0),
             warned_oversized: AtomicBool::new(false),
             reserved_drvs: AtomicU32::new(0),
+            done_count: AtomicU32::new(0),
+            failed_count: AtomicU32::new(0),
         })
     }
 
@@ -270,6 +283,19 @@ impl Submission {
             return;
         }
         guard.insert(step.drv_hash().clone(), step.clone());
+        // Cross-job dedup edge: if we're picking up an Arc<Step> that's
+        // already terminal from a prior job, the completion handler
+        // won't fire again for us. Back-fill the cached counter so
+        // `live_counts()` sees this member in the right bucket.
+        // Non-terminal steps (the usual case during ingest) fall
+        // through and will be counted by the normal transition path.
+        if step.finished.load(Ordering::Acquire) {
+            if step.previous_failure.load(Ordering::Acquire) {
+                self.failed_count.fetch_add(1, Ordering::AcqRel);
+            } else {
+                self.done_count.fetch_add(1, Ordering::AcqRel);
+            }
+        }
     }
 
     pub fn add_root(&self, step: Arc<Step>) {
@@ -398,20 +424,39 @@ impl Submission {
         self.terminal.load(Ordering::Acquire)
     }
 
-    /// Compute live counts from the submission's member set.
+    /// O(1) live counts from cached atomic counters.
+    ///
+    /// Used to scan every member and call `observable_state()` under
+    /// `members.read()` — at 100k+ members that was ~100ms of atomic
+    /// loads per call, and 1500 concurrent status polls piled up to
+    /// 500ms tail latency on `/jobs/{id}` (see docs/scale-xl-findings.md).
+    ///
+    /// Now reads four atomics and does arithmetic. `total` comes from
+    /// `members.read().len()` which is O(1) on HashMap. `done_count`
+    /// and `failed_count` are bumped at state transitions; `building`
+    /// is the existing `active_claims` gauge. `pending` is what's
+    /// left over.
+    ///
+    /// **Invariant**: `building + done + failed <= total`. The
+    /// `saturating_sub` below ensures we never produce a negative
+    /// `pending` during a brief transient where a claim has been
+    /// issued (active_claims++) but its member was reserved_drvs
+    /// without a final add_member. In steady state this is always 0
+    /// or positive.
     pub fn live_counts(&self) -> crate::types::JobCounts {
-        use crate::types::{DrvState, JobCounts};
-        let mut c = JobCounts::default();
-        for s in self.members.read().values() {
-            c.total += 1;
-            match s.observable_state() {
-                DrvState::Pending => c.pending += 1,
-                DrvState::Building => c.building += 1,
-                DrvState::Done => c.done += 1,
-                DrvState::Failed => c.failed += 1,
-            }
+        use crate::types::JobCounts;
+        let total = self.members.read().len() as u32;
+        let building = self.active_claims.load(Ordering::Acquire);
+        let done = self.done_count.load(Ordering::Acquire);
+        let failed = self.failed_count.load(Ordering::Acquire);
+        let pending = total.saturating_sub(building + done + failed);
+        JobCounts {
+            total,
+            pending,
+            building,
+            done,
+            failed,
         }
-        c
     }
 
     /// Walk the dep graph rooted at `toplevels` and return a cycle if
@@ -530,11 +575,28 @@ impl Submission {
     /// of root state because more roots may still be ingested.
     pub fn live_status(&self) -> crate::types::JobStatus {
         use crate::types::JobStatus;
-        let tops = self.toplevels.read();
-        let all_finished = tops.iter().all(|t| t.finished.load(Ordering::Acquire));
-        let any_failed = tops
-            .iter()
-            .any(|t| t.previous_failure.load(Ordering::Acquire));
+        // O(1) via cached counters — see `live_counts()` and
+        // `check_and_publish_terminal()` for the same pattern. Calling
+        // `live_status` on a sealed job with tens of thousands of
+        // toplevels 1500× concurrently was taking 450ms tail latency
+        // by iterating them all (docs/scale-xl-findings.md).
+        //
+        // Counter invariants (maintained at transition sites):
+        // - total = members.len()
+        // - done + failed <= total, monotonic, strictly increasing
+        // - all members terminal  ⟺  done + failed == total
+        // - any propagated/direct failure  ⟺  failed > 0
+        //
+        // A job is effectively Failed (even mid-build) as soon as an
+        // eval error was recorded — the runner's contract is that any
+        // eval error means at least one attr was expected to build
+        // and didn't. Check that first to avoid reporting `Building`
+        // on a doomed submission.
+        let total = self.members.read().len() as u32;
+        let done = self.done_count.load(Ordering::Acquire);
+        let failed = self.failed_count.load(Ordering::Acquire);
+        let any_failed = failed > 0;
+        let all_finished = done + failed >= total;
         match (self.is_sealed(), all_finished, any_failed) {
             (true, true, true) => JobStatus::Failed,
             (true, true, false) => JobStatus::Done,
@@ -868,13 +930,14 @@ mod tests {
 
     #[test]
     fn live_counts_totals_match_membership() {
-        // live_counts uses `c.total += 1` per member plus per-state
-        // increments. A mutation that replaces `+=` with `*=` for any
-        // of the four state lanes would silently stick that count at
-        // 0 or 1 — cover ALL four lanes (Pending, Building, Done,
-        // Failed) so every increment site is asserted with a count > 1.
+        // `live_counts` reads cached atomic counters maintained at
+        // state-transition sites (see docs/scale-xl-findings.md). This
+        // unit test validates the arithmetic — that the four buckets
+        // add to `total` and that each bucket reflects its backing
+        // atomic — rather than the transition-site bookkeeping
+        // itself, which is covered by integration tests (complete,
+        // failure_propagation).
         let sub = Submission::new(JobId::new(), 8);
-        // Two of each state so *= vs += is visibly different (2 vs 1).
         let pending = [mk_step("p1"), mk_step("p2")];
         let building = [mk_step("b1"), mk_step("b2")];
         let done = [mk_step("d1"), mk_step("d2")];
@@ -884,20 +947,26 @@ mod tests {
             sub.add_member(step);
             step.runnable.store(true, Ordering::Release);
         }
+        // Simulate two claims in flight — `issue_claim` would bump
+        // this in production.
         for step in building.iter() {
             sub.add_member(step);
-            // Building = tries > 0 ∧ !runnable ∧ !finished.
             step.tries.store(1, Ordering::Release);
         }
+        sub.active_claims.store(2, Ordering::Release);
+        // Simulate two successful completions.
         for step in done.iter() {
             sub.add_member(step);
             step.finished.store(true, Ordering::Release);
         }
+        sub.done_count.store(2, Ordering::Release);
+        // Simulate two terminal failures.
         for step in failed.iter() {
             sub.add_member(step);
             step.finished.store(true, Ordering::Release);
             step.previous_failure.store(true, Ordering::Release);
         }
+        sub.failed_count.store(2, Ordering::Release);
 
         let counts = sub.live_counts();
         assert_eq!(counts.total, 8, "total must be linear in membership");
@@ -905,7 +974,8 @@ mod tests {
         assert_eq!(counts.building, 2);
         assert_eq!(counts.done, 2);
         assert_eq!(counts.failed, 2);
-        // Sanity on observable_state mapping.
+        // Sanity on observable_state mapping (unchanged — still used
+        // by terminal-snapshot writeback).
         assert!(matches!(pending[0].observable_state(), DrvState::Pending));
         assert!(matches!(building[0].observable_state(), DrvState::Building));
         assert!(matches!(done[0].observable_state(), DrvState::Done));

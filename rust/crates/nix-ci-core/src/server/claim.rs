@@ -426,6 +426,12 @@ async fn terminal_fail_exhausted(state: &AppState, step: &Arc<Step>) -> Result<(
     };
     for sub in &subs {
         sub.record_failure(failure.clone());
+        // Cached failed counter for O(1) live_counts(). Mirrors the
+        // bump in `handle_failure`; without this the fast-path in
+        // `check_and_publish_terminal` would never see the job reach
+        // total, leaving a max-retries-exhausted job "building"
+        // forever in status polls.
+        sub.failed_count.fetch_add(1, Ordering::AcqRel);
     }
 
     step.previous_failure.store(true, Ordering::Release);

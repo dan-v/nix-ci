@@ -125,6 +125,10 @@ async fn handle_success(
 
     let subs = collect_submissions(step);
     for sub in &subs {
+        // Cached done counter for O(1) live_counts(). Must happen per
+        // subscribing submission because a step can be a member of
+        // multiple jobs via cross-job dedup.
+        sub.done_count.fetch_add(1, Ordering::AcqRel);
         sub.publish(JobEvent::DrvCompleted {
             drv_hash: step.drv_hash().clone(),
             drv_name: step.drv_name().to_string(),
@@ -176,6 +180,15 @@ async fn handle_failure(
     };
     for sub in &subs {
         sub.record_failure(failure.clone());
+        // Cached failed counter for O(1) live_counts(). Paired with
+        // the `finished + previous_failure` stores below; we bump
+        // BEFORE the stores so a concurrent status call that observes
+        // the state flip also observes the matching counter bump.
+        // (Counters are atomic and independent of the flags, so the
+        // worst case is a status call sees counter++ before flag==
+        // which is still consistent with observable_state behaviour:
+        // the member reads as Failed either way.)
+        sub.failed_count.fetch_add(1, Ordering::AcqRel);
     }
 
     step.previous_failure.store(true, Ordering::Release);
@@ -444,6 +457,11 @@ pub(super) fn propagate_failure_inmem(root: &Arc<crate::dispatch::Step>, origin:
             });
             // Per-submission count for the runner's progress display.
             sub.propagated_failed.fetch_add(1, Ordering::Relaxed);
+            // Cached failed counter for O(1) live_counts(). A
+            // propagated step goes directly from Pending → Failed
+            // without passing through Building, so only failed_count
+            // changes here.
+            sub.failed_count.fetch_add(1, Ordering::AcqRel);
         }
 
         let next: Vec<Arc<crate::dispatch::Step>> = {
@@ -468,6 +486,25 @@ pub(super) async fn check_and_publish_terminal(
     if sub.terminal.load(Ordering::Acquire) {
         return Ok(());
     }
+    // Fast-exit via cached counters. Every complete lands here; for a
+    // non-terminal submission we must return in O(1), not iterate
+    // 10k+ toplevels. `done + failed < total` proves at least one
+    // member is still non-terminal, so the submission can't be
+    // terminal yet. See docs/scale-xl-findings.md for the measured
+    // cost of the old toplevel-scan path.
+    {
+        let total = sub.members.read().len() as u32;
+        let done = sub.done_count.load(Ordering::Acquire);
+        let failed = sub.failed_count.load(Ordering::Acquire);
+        if done + failed < total {
+            return Ok(());
+        }
+    }
+    // Counters say every member is terminal. Double-check by scanning
+    // toplevels — cheap now that it happens at most once per job (the
+    // last completion), and it's defence-in-depth against a counter
+    // drift we haven't thought of. The `terminal` flag below makes
+    // this atomic: subsequent completers bail on the early return.
     let tops = sub.toplevels.read().snapshot();
     let all_finished = tops.iter().all(|t| t.finished.load(Ordering::Acquire));
     if !all_finished {

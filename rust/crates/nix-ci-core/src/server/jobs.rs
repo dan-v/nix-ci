@@ -284,7 +284,10 @@ pub async fn status(
     // Live job: build response from the in-memory submission — cheapest
     // path and freshest data.
     if let Some(sub) = state.dispatcher.submissions.get(id) {
-        return Ok(Json(response_from_live(&sub)));
+        return Ok(Json(response_from_live(
+            &sub,
+            state.cfg.max_failures_in_result,
+        )));
     }
     // Terminal job: read the JSONB snapshot persisted at terminal time.
     let row: Option<(serde_json::Value,)> = sqlx::query_as("SELECT result FROM jobs WHERE id = $1")
@@ -301,13 +304,30 @@ pub async fn status(
     }
 }
 
-fn response_from_live(sub: &Arc<Submission>) -> JobStatusResponse {
+/// Build the live in-memory status response. Caps the failures slice
+/// at the same `max_failures_in_result` cap applied to the terminal
+/// snapshot — without this, a pathological job with many propagated
+/// failures would force every status call to allocate and copy a
+/// multi-megabyte `Vec<DrvFailure>`, and at 1500 concurrent callers
+/// this is a measurable hotspot (docs/scale-xl-findings.md).
+///
+/// Callers that want every failure can still get it at terminal time
+/// via `jobs.result` (written before any in-memory truncation).
+fn response_from_live(sub: &Arc<Submission>, max_failures: usize) -> JobStatusResponse {
+    let failures = {
+        let guard = sub.failures.read();
+        // Take-then-clone keeps the read-lock scope tight. We
+        // deliberately don't add a "+1 truncation marker" entry here
+        // because the callers get the live counts (`counts.failed`)
+        // which already tells them the true count.
+        guard.iter().take(max_failures).cloned().collect()
+    };
     JobStatusResponse {
         id: sub.id,
         status: sub.live_status(),
         sealed: sub.is_sealed(),
         counts: sub.live_counts(),
-        failures: sub.failures.read().clone(),
+        failures,
         eval_error: None,
         eval_errors: sub.eval_errors.read().clone(),
     }
@@ -399,7 +419,10 @@ pub async fn by_external_ref(
         .ok_or_else(|| Error::NotFound(format!("job ext_ref={external_ref}")))?;
     // Live-job path: prefer the in-memory snapshot for freshness.
     if let Some(sub) = state.dispatcher.submissions.get(lookup.id) {
-        return Ok(Json(response_from_live(&sub)));
+        return Ok(Json(response_from_live(
+            &sub,
+            state.cfg.max_failures_in_result,
+        )));
     }
     // Terminal job: use the stored result JSONB.
     let snap = lookup
