@@ -72,13 +72,16 @@ jobs:
           workspaces: rust
       - name: integration tests
         working-directory: rust
-        # Serial execution: every sqlx::test gets its own database
-        # (so they don't share tables), but several tests spin up
-        # multiple pools per test and a highly parallel runner can
-        # exhaust the shared Postgres connection limit. Running with
-        # --test-threads=1 is deterministic, keeps pool churn
-        # bounded, and costs ~20% wall time on the current suite.
-        run: cargo test -p nix-ci-core --tests -- --test-threads=1
+        # N=4 parallelism: sqlx::test gives each test a private DB, and
+        # our pool is `max_connections=16`. N=4 worst-case = 64 open PG
+        # connections, well under Postgres default `max_connections=100`.
+        # Measured 2.4× speedup over serial; further parallelism (N=6+)
+        # gives diminishing returns (sqlx::test's per-test DB creation
+        # is serialized on PG's catalog lock) and risks exhausting PG's
+        # connection pool if a test holds its own 16 conns saturated
+        # (pg_faults::claim_path_live_under_pool_exhaustion does this).
+        # Drop back to --test-threads=2 if flakiness appears.
+        run: cargo test -p nix-ci-core --tests -- --test-threads=4
 
   miri:
     name: miri (UB + data-race detection on unit tests)
