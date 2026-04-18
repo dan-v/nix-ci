@@ -13,8 +13,9 @@ promises under overload.
 |-------|------------------------------------------------------------------------|---------------------------------------------|---------|
 | **L1** | Invariant logic under adversarial thread schedules                     | `crates/nix-ci-loom-checks/tests/invariants.rs` | ✅      |
 | **L2** | Event-ordering bugs on the **real** dispatcher (seed-replayable)       | `crates/nix-ci-core/tests/sim.rs`           | ✅ (200 seeds); 10 000 nightly |
-| **L3** | Latency / throughput regressions at 1000+ workers, 20K+ drvs           | `crates/nix-ci-core/tests/{scale,load}.rs`  | Nightly + main only |
+| **L3** | Latency / throughput regressions at 1000+ workers, 20K+ drvs           | `crates/nix-ci-core/tests/{scale,load,scale_xl}.rs`  | Nightly + main only |
 |        | Memory-bound cleanup (claims map, steps registry, fleet scan)          | `crates/nix-ci-core/tests/memory_bounds.rs` | ✅      |
+| **L3.5** | Port-pool ceiling + contracts (quarantine, refute) under real TCP    | `scripts/orbstack_harness/` + `crates/nix-ci-harness` | Manual / nightly |
 | **L4** | Degradation under PG outage + worker flood                             | `crates/nix-ci-core/tests/{degradation,pg_faults}.rs` | ✅ |
 | **L5** | Production shadow + canary rollout                                      | External (staging + CCI mirror)             | Continuous |
 
@@ -118,6 +119,53 @@ See [Degradation contract](#degradation-contract) below. Tests:
   exhaustion doesn't stall in-memory hot path.
 * `tests/pg_faults.rs::coordinator_survives_database_statement_timeout`
   — degraded PG produces bounded-time clean errors, never hangs.
+
+### L3.5 — out-of-process harness (OrbStack)
+
+Fills the gap between L3 (in-process, fake workers, single coordinator
+binding) and L5 (production). Builds the real coordinator binary and
+spawns N mock-worker containers that each run the real HTTP client
+loop. Drives two contract-shaped scenarios:
+
+* `wide-fleet` — 50 containers × 50 workers = **2500 concurrent
+  fleet-claim long-polls** against one coordinator, ingesting a
+  10k-drv deep-wide DAG. Specifically breaks past the
+  `tests/scale_xl.rs` header caveat:
+
+  > macOS ephemeral-port range is ~16k ports and HTTP/1.1 long-poll
+  > holds a connection for the whole wait_secs. 3000+ in-process
+  > workers × long-poll = TIME_WAIT storm exhausts the box.
+
+  Each container has its own port pool, so the coordinator is the
+  only thing under test — not the harness's own TCP stack.
+  Assertions: job reaches `Done`, zero failures, no
+  `overload_rejections`.
+
+* `sick-worker-contained` — 5 healthy + 3 sick (always-failing)
+  worker containers. The sick containers use `--shared-worker-id`
+  so all slots on a sick host share the same identity, modelling
+  "one bad machine, many slots." Assertions:
+  `nix_ci_worker_auto_quarantined_total > 0`, no `mock-healthy-*`
+  worker_id appears in `GET /admin/fence.auto_quarantined`,
+  `nix_ci_process_panics_total == 0`, job reaches terminal,
+  `POST /admin/refute` returns 200.
+
+Not a PR gate — invoked manually or nightly. The single-process L3
+tests stay the per-PR enforcement bar; L3.5 exercises contracts
+that can't be proven in-process.
+
+```sh
+cd rust && cargo build --release -p nix-ci -p nix-ci-harness
+../scripts/orbstack_harness/run.sh wide-fleet
+../scripts/orbstack_harness/run.sh sick-worker-contained
+```
+
+The harness orchestrates coordinator + mock-worker containers
+via docker (OrbStack), reuses the existing `nix-ci-pg` container
+for Postgres, and emits a JSON report under
+`scripts/orbstack_harness/out/report.json` with per-assertion
+pass/fail plus a snapshot of `/metrics`. See
+`scripts/orbstack_harness/README.md`.
 
 ### L5 — production shadow + canary (external)
 

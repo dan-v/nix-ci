@@ -1,0 +1,37 @@
+[package]
+name = "nix-ci-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# L3.5 scale-test harness: out-of-process mock workers + workload
+# driver, orchestrated as docker containers (OrbStack) so worker
+# count can exceed the single-process ephemeral-port ceiling that
+# caps `tests/scale_xl.rs` at ~1500.
+
+[lints]
+workspace = true
+
+[dependencies]
+nix-ci-core = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+rand = "0.8"
+
+[[bin]]
+name = "nix-ci-mock-worker"
+path = "src/bin/mock_worker.rs"
+
+[[bin]]
+name = "nix-ci-harness-driver"
+path = "src/bin/driver.rs"

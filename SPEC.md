@@ -63,6 +63,13 @@ days of nightly chaos-scale + property runs without a violation.
 - **S-SIM-SEEDS**: 10 000 nightly simulator seeds × 3000 events each
   produce zero invariant violations. Measured by
   `sim::sim_multiple_seeds_all_green` with `SIM_SEEDS=10000`.
+- **S-FLEET-CEILING-BROKEN**: 2500 concurrent fleet-claim long-polls
+  (50 containers × 50 workers) drain a 10k-drv deep-wide DAG in
+  under 10s wall, zero failures, zero `overload_rejections`. Proves
+  the coordinator holds at scales the single-process `scale_xl.rs`
+  harness cannot reach (macOS ephemeral-port ceiling). Measured by
+  `scripts/orbstack_harness/run.sh wide-fleet`; driver asserts
+  `job_reaches_done`, `zero_failures`, `no_overload_rejections`.
 
 ## Observability
 
@@ -146,6 +153,15 @@ days of nightly chaos-scale + property runs without a violation.
   a sick worker's cache poisoning without waiting out the TTL.
   Measured by `admin_refute::refute_by_output_path_deletes_entry`
   and `refute_by_drv_hash_removes_all_output_paths`.
+- **R-QUARANTINE-E2E**: End-to-end over real TCP with 5 healthy
+  + 3 sick worker containers (shared `worker_id` per container =
+  "sick host" model): the quarantine counter ticks, no healthy
+  container appears in `GET /admin/fence.auto_quarantined`, no
+  coordinator panic fires, the job reaches a terminal state, and
+  `POST /admin/refute` succeeds. Proves the unit-test contracts
+  (`R-WORKER-QUARANTINE`, `R-PANIC-ISOLATED`, `R-REFUTE-FALSE-POSITIVE`)
+  all hold under multi-host load. Measured by
+  `scripts/orbstack_harness/run.sh sick-worker-contained`.
 
 ## Deployability
 
