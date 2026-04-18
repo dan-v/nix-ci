@@ -22,9 +22,21 @@ pub async fn collect_failure_logs(
     artifacts_dir: &Path,
 ) {
     let log_dir = artifacts_dir.join("build_logs");
-    if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        tracing::warn!(error = %e, "artifacts: failed to create build_logs dir");
-        return;
+    // Synchronous mkdir: offload to the blocking pool so we don't
+    // block the async executor during the final post-run burst.
+    // Bounded — one mkdir per run.
+    let mkdir_dir = log_dir.clone();
+    let mkdir_res = tokio::task::spawn_blocking(move || std::fs::create_dir_all(&mkdir_dir)).await;
+    match mkdir_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "artifacts: failed to create build_logs dir");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "artifacts: mkdir task join failed");
+            return;
+        }
     }
 
     let originating: Vec<&DrvFailure> = snap
@@ -54,13 +66,21 @@ pub async fn collect_failure_logs(
             Err(msg) => format!("[log not available: {msg}]"),
         };
 
-        match std::fs::write(&path, &content) {
-            Ok(()) => {
+        // `fs::write` is synchronous; offload to the blocking pool so a
+        // slow disk doesn't stall the runtime during the final flush.
+        let write_path = path.clone();
+        let write_res =
+            tokio::task::spawn_blocking(move || std::fs::write(&write_path, &content)).await;
+        match write_res {
+            Ok(Ok(())) => {
                 written += 1;
                 tracing::debug!(drv = %failure.drv_name, path = %path.display(), "artifact: wrote failure log");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, drv = %failure.drv_name, "artifact: failed to write log");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, drv = %failure.drv_name, "artifact: write task join failed");
             }
         }
     }
@@ -112,13 +132,17 @@ fn unique_filename(drv_name: &str, used: &mut HashSet<String>) -> String {
     if used.insert(candidate.clone()) {
         return candidate;
     }
-    for i in 2.. {
+    for i in 2u64.. {
         let suffixed = format!("{base}-{i}.log");
         if used.insert(suffixed.clone()) {
             return suffixed;
         }
     }
-    unreachable!()
+    // `2u64..` has ~1.8e19 elements; the loop terminates on the first
+    // new suffix, which for any realistic `used` set is within a few
+    // iterations. Reaching here would mean the set contains 1.8e19
+    // pre-registered names, which is impossible in practice.
+    unreachable!("unique_filename exhausted u64 suffix range for base {base:?}")
 }
 
 /// Replace characters that are problematic in filenames and defuse
