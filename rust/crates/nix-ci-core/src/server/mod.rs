@@ -160,7 +160,7 @@ mod drain_tests {
         let h = tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(10)).await;
         });
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         drain_background_tasks([("ok", h)], Duration::from_secs(5)).await;
         assert!(start.elapsed() < Duration::from_millis(500));
     }
@@ -175,7 +175,7 @@ mod drain_tests {
         });
         let abort_flag = h.abort_handle();
         assert!(!abort_flag.is_finished());
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         drain_background_tasks([("stuck", h)], Duration::from_millis(100)).await;
         let elapsed = start.elapsed();
         assert!(

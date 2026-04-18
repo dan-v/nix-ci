@@ -47,7 +47,7 @@ pub async fn events(State(state): State<AppState>, Path(id): Path<JobId>) -> Res
             // claim has a started_at; we report wall-clock millis so
             // the runner can compute "elapsed = now_ms - started_at_ms".
             let now_wall = chrono::Utc::now().timestamp_millis();
-            let now_mono = std::time::Instant::now();
+            let now_mono = tokio::time::Instant::now();
             let mut in_flight: Vec<crate::types::DrvInFlight> = progress_state
                 .dispatcher
                 .claims

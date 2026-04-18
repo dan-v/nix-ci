@@ -83,7 +83,7 @@ async fn exhausted_step_terminal_fails_on_next_claim(pool: PgPool) {
             .claims
             .take(c1.claim_id)
             .expect("claim present");
-        *claim.deadline.lock() = std::time::Instant::now() - Duration::from_secs(5);
+        *claim.deadline.lock() = tokio::time::Instant::now() - Duration::from_secs(5);
         handle.dispatcher.claims.insert(claim);
     }
     nix_ci_core::durable::reaper::reap_expired_claims(&handle.dispatcher);
@@ -183,7 +183,7 @@ async fn exhausted_step_terminal_fails_on_fleet_claim(pool: PgPool) {
     // Expire it and reap.
     {
         let claim = handle.dispatcher.claims.take(c1.claim_id).unwrap();
-        *claim.deadline.lock() = std::time::Instant::now() - Duration::from_secs(5);
+        *claim.deadline.lock() = tokio::time::Instant::now() - Duration::from_secs(5);
         handle.dispatcher.claims.insert(claim);
     }
     nix_ci_core::durable::reaper::reap_expired_claims(&handle.dispatcher);

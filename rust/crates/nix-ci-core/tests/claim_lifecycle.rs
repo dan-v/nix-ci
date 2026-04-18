@@ -350,7 +350,7 @@ async fn claim_response_deadline_matches_config(pool: PgPool) {
         handle
             .dispatcher
             .claims
-            .expired_ids(std::time::Instant::now())
+            .expired_ids(tokio::time::Instant::now())
             .is_empty(),
         "freshly-issued claim must not be already past its in-memory deadline"
     );
@@ -375,7 +375,7 @@ async fn claim_longpoll_returns_204_after_wait_deadline(pool: PgPool) {
     // the job (separate test) and we need the submission to stay Live
     // so the long-poll can exercise its deadline.
 
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let res = client
         .claim(job.id, "x86_64-linux", &[], 1) // wait = 1 sec
         .await

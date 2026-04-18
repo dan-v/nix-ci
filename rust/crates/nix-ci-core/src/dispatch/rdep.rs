@@ -6,7 +6,8 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+
+use tokio::time::Instant;
 
 use super::step::{Step, StepHandle};
 use super::submission::Submission;

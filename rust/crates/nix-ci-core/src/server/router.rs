@@ -1,6 +1,6 @@
 //! Route table.
 
-use std::time::Instant;
+use tokio::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request};

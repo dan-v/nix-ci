@@ -18,7 +18,9 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -99,7 +101,7 @@ pub async fn claim(
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
 
-        let wait = tokio::time::sleep_until(deadline.into());
+        let wait = tokio::time::sleep_until(deadline);
         let notified = state.dispatcher.notify.notified();
         tokio::select! {
             () = notified => continue,
@@ -170,7 +172,7 @@ pub async fn claim_any(
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
 
-        let wait = tokio::time::sleep_until(deadline.into());
+        let wait = tokio::time::sleep_until(deadline);
         let notified = state.dispatcher.notify.notified();
         tokio::select! {
             () = notified => continue,

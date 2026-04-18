@@ -174,7 +174,7 @@ async fn without_extend_reaper_evicts_long_running_claim(pool: PgPool) {
             .claims
             .take(c.claim_id)
             .expect("claim present");
-        *claim.deadline.lock() = std::time::Instant::now() - Duration::from_secs(1);
+        *claim.deadline.lock() = tokio::time::Instant::now() - Duration::from_secs(1);
         handle.dispatcher.claims.insert(claim);
     }
     nix_ci_core::durable::reaper::reap_expired_claims(&handle.dispatcher);

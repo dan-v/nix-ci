@@ -52,7 +52,7 @@ async fn reaper_does_not_re_arm_step_finished_via_propagation(pool: PgPool) {
         .claims
         .take(c.claim_id)
         .expect("claim present");
-    *claim.deadline.lock() = std::time::Instant::now() - Duration::from_secs(10);
+    *claim.deadline.lock() = tokio::time::Instant::now() - Duration::from_secs(10);
     handle.dispatcher.claims.insert(claim);
 
     // Mark the step finished BEFORE the reaper runs — simulates
@@ -136,7 +136,7 @@ async fn reaper_rearms_many_concurrent_expired_claims(pool: PgPool) {
     assert_eq!(handle.dispatcher.claims.len(), N);
 
     // Force ALL claim deadlines to the past.
-    let past = std::time::Instant::now() - Duration::from_secs(10);
+    let past = tokio::time::Instant::now() - Duration::from_secs(10);
     for cid in &claim_ids {
         if let Some(claim) = handle.dispatcher.claims.take(*cid) {
             *claim.deadline.lock() = past;
@@ -209,7 +209,7 @@ async fn reaper_rearms_non_finished_expired_claim(pool: PgPool) {
         .claims
         .take(c.claim_id)
         .expect("claim present");
-    let past = std::time::Instant::now() - Duration::from_secs(10);
+    let past = tokio::time::Instant::now() - Duration::from_secs(10);
     *claim.deadline.lock() = past;
     handle.dispatcher.claims.insert(claim);
 

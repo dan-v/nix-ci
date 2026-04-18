@@ -6,9 +6,8 @@
 //! inserts into `failed_outputs`. No cross-table joins, no recursive
 //! CTEs.
 
-use std::time::Instant;
-
 use sqlx::PgPool;
+use tokio::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::observability::metrics::Metrics;

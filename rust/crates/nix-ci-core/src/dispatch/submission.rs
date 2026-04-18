@@ -4,11 +4,14 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::broadcast;
+// `tokio::time::Instant` for `Submission::created_at` — the fleet
+// scheduler's FIFO order uses it; paused-time tests can then pin
+// ordering deterministically. See `dispatch/claim.rs` for the rule.
+use tokio::time::Instant;
 
 use crate::types::{DrvFailure, DrvHash, EvalError, JobEvent, JobId};
 
@@ -781,7 +784,7 @@ mod tests {
         // would blow past this by orders of magnitude.
         let sub = Submission::new(JobId::new(), 8);
         let roots: Vec<_> = (0..10_000).map(|i| mk_step(&format!("r{i}"))).collect();
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         // 10k unique + 10k duplicates; dedup count must match.
         for s in &roots {
             sub.add_root(s.clone());

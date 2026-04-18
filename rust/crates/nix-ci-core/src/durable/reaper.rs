@@ -12,11 +12,14 @@
 //! (cancel / fail / check_and_publish_terminal / reap_stale_jobs)
 //! removes its own submission; a safety-net sweep only masked bugs.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::sync::watch;
-use tokio::time::interval;
+// `tokio::time::Instant` for the claim-deadline compare — matches
+// the scheduling-relevant clock `ActiveClaim.deadline` is written
+// against. See `dispatch/claim.rs` for the rule.
+use tokio::time::{interval, Instant};
 
 use crate::dispatch::Dispatcher;
 use crate::error::Result;

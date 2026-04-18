@@ -110,7 +110,7 @@ pub async fn submit_batch(
     let known_failed = writeback::failed_output_hits(&state.pool, &output_path_refs).await;
 
     // Phase 1: look up or create every Step.
-    let t_parse = std::time::Instant::now();
+    let t_parse = tokio::time::Instant::now();
     let mut primary: Vec<(_, Arc<Step>, bool)> = Vec::with_capacity(req.drvs.len());
     let mut errored: u32 = 0;
     for d in req.drvs {
@@ -169,7 +169,7 @@ pub async fn submit_batch(
     // (conservative upper bound). Now that Phase 1 has computed dedup
     // hits, release the deduped slots back to the counter so streams
     // with heavy cross-batch overlap don't spuriously trip the cap.
-    let t_reserve = std::time::Instant::now();
+    let t_reserve = tokio::time::Instant::now();
     let dedup_in_batch: u32 = primary
         .iter()
         .filter(|(_, _, is_new)| !*is_new)
@@ -190,7 +190,7 @@ pub async fn submit_batch(
         .observe(t_reserve.elapsed().as_secs_f64());
 
     // Phase 2: membership + edges.
-    let t_attach = std::time::Instant::now();
+    let t_attach = tokio::time::Instant::now();
     let mut new_drvs: u32 = 0;
     let mut dedup_skipped: u32 = 0;
     for (req_drv, step, is_new) in &primary {
@@ -230,7 +230,7 @@ pub async fn submit_batch(
         .observe(t_attach.elapsed().as_secs_f64());
 
     // Phase 3: arm fresh leaves.
-    let t_enqueue = std::time::Instant::now();
+    let t_enqueue = tokio::time::Instant::now();
     for (_, step, is_new) in &primary {
         if *is_new {
             arm_if_leaf(step);

@@ -4,9 +4,20 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
+// `tokio::time::Instant` is a zero-cost wrapper around
+// `std::time::Instant` in a running tokio runtime — identical perf
+// and semantics in production. Under `tokio::time::pause()` (tests,
+// deterministic-sim runners like turmoil) it returns the runtime's
+// virtual clock, which is what lets the reaper fire on simulated
+// time. Using it for every scheduling-relevant timestamp —
+// claim deadlines, started_at — preserves production behavior and
+// unlocks paused-time testing. Rule of thumb: in tokio code,
+// default to `tokio::time::Instant`; reserve `std::time::Instant`
+// for genuinely non-async contexts (none here).
+use tokio::time::Instant;
 
 use crate::types::{ClaimId, DrvHash, JobId};
 
