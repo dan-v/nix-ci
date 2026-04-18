@@ -4,10 +4,9 @@
 mod common;
 
 
-use nix_ci_core::client::CoordinatorClient;
+use nix_ci_core::client::{BuildLogUploadMeta, CoordinatorClient};
 use nix_ci_core::types::{
-    CreateJobRequest,
-    JobStatus,
+    ClaimId, CreateJobRequest, DrvHash, JobStatus,
 };
 use sqlx::PgPool;
 
@@ -56,28 +55,75 @@ async fn public_probes_bypass_auth(pool: PgPool) {
     }
 }
 
-/// A client with the matching token must succeed end-to-end. Also
-/// verifies CoordinatorClient::with_auth plumbs the header correctly.
+/// Every auth-required surface the client talks to must attach the
+/// bearer token. Covers `CoordinatorClient` methods (create/status/
+/// list_jobs/upload_log) and the SSE consumer path (`events_request`).
+///
+/// A broad guard: any future method that bypasses the shared `.auth()`
+/// helper (e.g. calls `self.http.get` directly) will 401 here. That
+/// class of bug silently disables log upload, job listing, or live
+/// event streaming against any auth-enabled coordinator.
 #[sqlx::test]
-async fn authenticated_client_reaches_mutating_endpoint(pool: PgPool) {
+async fn all_client_surfaces_attach_bearer_token(pool: PgPool) {
     use nix_ci_core::config::ServerConfig;
-    let token = "abc123";
+    let token = "the-right-token";
     let handle = common::spawn_server_with_cfg(pool, |cfg: &mut ServerConfig| {
         cfg.auth_bearer = Some(token.into());
     })
     .await;
     let client = CoordinatorClient::with_auth(&handle.base_url, Some(token.to_string()));
+
     let job = client
         .create_job(&CreateJobRequest::default())
         .await
-        .expect("authenticated create_job must succeed");
+        .expect("create_job must succeed");
     assert_eq!(
-        client
-            .status(job.id)
-            .await
-            .expect("authenticated status must succeed")
-            .status,
+        client.status(job.id).await.expect("status must succeed").status,
         JobStatus::Pending
+    );
+    client
+        .list_jobs("failed", None, None, 50)
+        .await
+        .expect("list_jobs must attach bearer token");
+
+    // upload_log: a 401 here means the client skipped `.auth()`.
+    // Any other error is fine — the bearer-auth layer runs before
+    // the body is parsed, so a legitimately-attached token gets past
+    // it regardless of payload validity.
+    let drv_hash = DrvHash::new("abc-test.drv".to_string());
+    let now = chrono::Utc::now();
+    let meta = BuildLogUploadMeta {
+        drv_hash: &drv_hash,
+        attempt: 1,
+        original_size: 3,
+        truncated: false,
+        success: false,
+        exit_code: Some(1),
+        started_at: now,
+        ended_at: now,
+    };
+    let gz = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        .to_vec();
+    if let Err(e) = client.upload_log(job.id, ClaimId::new(), meta, gz).await {
+        let msg = format!("{e}");
+        assert!(
+            !msg.contains("401") && !msg.to_lowercase().contains("unauthorized"),
+            "upload_log must attach bearer; got 401-like error: {msg}"
+        );
+    }
+
+    // SSE consumer path. `events_request` is the authed builder the
+    // SSE runner uses; any bypass here would make `nix-ci run` hang
+    // on a 401'd stream.
+    let resp = client
+        .events_request(job.id)
+        .send()
+        .await
+        .expect("events_request.send() must reach the server");
+    assert_ne!(
+        resp.status().as_u16(),
+        401,
+        "SSE events_request must attach bearer; got 401"
     );
 }
 

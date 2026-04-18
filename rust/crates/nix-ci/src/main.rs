@@ -98,11 +98,8 @@ struct ListCmd {
         default_value = "http://127.0.0.1:8080"
     )]
     coordinator: String,
-    /// Filter to failed jobs (default). Set --status=done or similar
-    /// to override.
-    #[arg(long, conflicts_with = "status", default_value_t = false)]
-    failed: bool,
-    /// Explicit status filter. Common values: failed, done, cancelled.
+    /// Status filter. Defaults to "failed" (the common operator query:
+    /// "what broke recently?"). Common values: failed, done, cancelled.
     #[arg(long)]
     status: Option<String>,
     /// Only consider jobs that finished within this lookback window
@@ -437,10 +434,6 @@ async fn show_cmd(coordinator: &str, id_or_ref: &str) -> anyhow::Result<()> {
 }
 
 async fn list_cmd(cmd: ListCmd) -> anyhow::Result<()> {
-    // The --failed flag is sugar for --status=failed; --status overrides
-    // when set. With neither flag, default to failed (the most common
-    // operator query is "what broke recently?").
-    let _ = cmd.failed;
     let status = cmd.status.clone().unwrap_or_else(|| "failed".to_string());
     let since = cmd
         .since

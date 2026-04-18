@@ -123,10 +123,10 @@ fn unique_filename(drv_name: &str, used: &mut HashSet<String>) -> String {
 
 /// Replace characters that are problematic in filenames and defuse
 /// bare `.` / `..` components so `Path::join(base, result)` cannot
-/// escape `base`. Nix drv_names are normally alphanumeric + `-` + `.`
-/// + `_`, but a hostile flake can declare a derivation whose `name`
-/// is `..` / `../../etc/passwd` / similar — left unsanitized, that
-/// becomes a traversal when the runner writes
+/// escape `base`. Nix drv_names are normally alphanumeric plus `-`,
+/// `.`, and `_`, but a hostile flake can declare a derivation whose
+/// `name` is `..` / `../../etc/passwd` / similar — left unsanitized,
+/// that becomes a traversal when the runner writes
 /// `<artifacts_dir>/build_logs/<name>.log`.
 fn sanitize_filename(s: &str) -> String {
     let sanitized: String = s
@@ -180,5 +180,31 @@ mod tests {
     fn sanitize_replaces_dangerous_chars() {
         assert_eq!(sanitize_filename("a/b:c*d"), "a_b_c_d");
         assert_eq!(sanitize_filename("normal-name_1.0"), "normal-name_1.0");
+    }
+
+    /// Hostile drv_names: bare `.` / `..` / empty would be interpreted
+    /// as path components by the filesystem. Embedded `..` in a longer
+    /// name is harmless (no separators). The sanitizer + unique_filename
+    /// must leave every result as a single in-dir filename, never a
+    /// component that escapes `base` when joined.
+    #[test]
+    fn unique_filename_stays_within_base_when_joined() {
+        for name in ["..", ".", "../../etc/passwd", "../../../tmp/pwn", ""] {
+            let mut used = HashSet::new();
+            let out = unique_filename(name, &mut used);
+            assert!(!out.contains('/'), "must not contain '/': {out:?} (from {name:?})");
+            assert!(!out.contains('\\'), "must not contain '\\': {out:?} (from {name:?})");
+            assert_ne!(out, ".log", "must not be bare `.log`: {out:?} (from {name:?})");
+            assert_ne!(out, "..log", "must not be bare `..log`: {out:?} (from {name:?})");
+
+            let base = std::path::PathBuf::from("/base/sub");
+            let joined = base.join(&out);
+            let parent = joined.parent().expect("joined path has parent");
+            assert_eq!(
+                parent,
+                std::path::Path::new("/base/sub"),
+                "join must stay in base; got {joined:?} (from drv_name {name:?})"
+            );
+        }
     }
 }

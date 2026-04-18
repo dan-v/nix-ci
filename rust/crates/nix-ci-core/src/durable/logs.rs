@@ -264,3 +264,56 @@ impl LogStore for PgLogStore {
             .unwrap_or(0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// In-memory LogStore returning a pre-seeded gzipped blob.
+    struct SeededStore {
+        gz: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl LogStore for SeededStore {
+        async fn put(&self, _meta: LogPutRequest, _gz: Vec<u8>) -> Result<()> {
+            unreachable!("not exercised")
+        }
+        async fn fetch_gz(&self, _job_id: JobId, _claim_id: ClaimId) -> Result<Option<Vec<u8>>> {
+            Ok(Some(self.gz.clone()))
+        }
+        async fn list_attempts(&self, _job_id: JobId, _drv_hash: &DrvHash) -> Result<Vec<LogRow>> {
+            Ok(Vec::new())
+        }
+        async fn prune_older_than(&self, _older_than: DateTime<Utc>) -> Result<u64> {
+            Ok(0)
+        }
+        async fn total_bytes(&self) -> Result<Option<u64>> {
+            Ok(None)
+        }
+        async fn row_count(&self) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Workers capture raw stderr bytes; decoding must not reject
+    /// non-UTF-8 sequences. Invalid bytes surface as U+FFFD; the
+    /// surrounding valid bytes are preserved verbatim.
+    #[tokio::test]
+    async fn fetch_decompressed_handles_non_utf8_payload() {
+        let raw: Vec<u8> = vec![b'e', b'r', b'r', b':', b' ', 0xFF, 0xFE, 0xFD, b'\n'];
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&raw).unwrap();
+        let gz = enc.finish().unwrap();
+
+        let store = SeededStore { gz };
+        let out = fetch_decompressed(&store, JobId::new(), ClaimId::new())
+            .await
+            .expect("fetch_decompressed must succeed")
+            .expect("store returned Some");
+        assert!(out.starts_with("err: "));
+        assert!(out.ends_with('\n'));
+        assert!(out.contains('\u{FFFD}'), "got: {out:?}");
+    }
+}

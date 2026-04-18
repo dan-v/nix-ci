@@ -409,6 +409,17 @@ async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Resul
     let _ = writeback::persist_terminal_snapshot(&state.pool, id, &snapshot).await?;
 
     if let Some(sub) = state.dispatcher.submissions.remove(id) {
+        // Mirror of the sibling terminal paths in `jobs::finish_in_memory`
+        // and `complete::check_and_publish_terminal`: record per-job size
+        // so `drvs_per_job` tracks every terminal transition uniformly.
+        // Over-cap jobs land in the low bucket (members.len() < cap at
+        // reject time, since we bailed before appending the batch) —
+        // distinguishable from successful jobs via `eval_error`.
+        state
+            .metrics
+            .inner
+            .drvs_per_job
+            .observe(sub.members.read().len() as f64);
         state.dispatcher.evict_claims_for(id);
         if sub.mark_terminal() {
             sub.publish(JobEvent::JobDone {

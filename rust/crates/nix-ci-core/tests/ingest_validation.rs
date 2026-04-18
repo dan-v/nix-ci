@@ -255,3 +255,21 @@ async fn ingest_batch_rejects_empty_system(pool: PgPool) {
     assert_eq!(resp.errored, 1);
     assert_eq!(resp.new_drvs, 0);
 }
+
+/// Per-job `claim_deadline_secs: Some(0)` would make every claim on
+/// the job expire immediately (deadline = now + 0s), burning worker
+/// cycles forever. `CreateJobRequest` validation must reject it.
+#[sqlx::test]
+async fn create_job_rejects_zero_claim_deadline(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let req = CreateJobRequest {
+        external_ref: Some("zero-deadline-probe".into()),
+        claim_deadline_secs: Some(0),
+        ..Default::default()
+    };
+    match client.create_job(&req).await.unwrap_err() {
+        nix_ci_core::Error::BadRequest(_) => {}
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}

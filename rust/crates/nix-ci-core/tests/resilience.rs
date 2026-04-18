@@ -344,6 +344,41 @@ async fn restart_cancels_in_flight_and_stale_complete_is_ignored(pool: PgPool) {
     }
 }
 
+/// After `clear_busy` flips a job to cancelled, `GET /jobs/{id}` must
+/// return a valid `JobStatusResponse` — not 500. The sentinel snapshot
+/// written by clear_busy previously contained `"id": null`, which
+/// failed serde deserialization on the read path with
+/// `invalid type: null, expected a formatted UUID string` and every
+/// operator query after a coordinator restart returned 500.
+#[sqlx::test]
+async fn clear_busy_sentinel_survives_round_trip_to_client(pool: PgPool) {
+    let handle = spawn_server(pool.clone()).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .expect("create_job");
+
+    nix_ci_core::durable::clear_busy(&pool)
+        .await
+        .expect("clear_busy");
+
+    // Drop the in-memory submission so the status handler falls through
+    // to the persisted snapshot (the post-restart shape).
+    handle.dispatcher.submissions.remove(job.id);
+
+    let snap = client
+        .status(job.id)
+        .await
+        .expect("status must return valid JSON (not 500)");
+    assert_eq!(snap.id, job.id);
+    assert_eq!(snap.status, JobStatus::Cancelled);
+    assert_eq!(
+        snap.eval_error.as_deref(),
+        Some("coordinator restarted; job aborted")
+    );
+}
+
 // ─── 4. Concurrent cross-job claim race ────────────────────────────────
 
 #[sqlx::test]
