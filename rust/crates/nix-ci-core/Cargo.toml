@@ -45,11 +45,33 @@ criterion = { version = "0.5", default-features = false, features = ["html_repor
 # wall clock. Unions with the lib's `full` tokio features at build
 # time; production binaries don't link test-util.
 tokio = { workspace = true, features = ["test-util"] }
+# Valkey/Redis client for the stateless-coordinator prototype bench.
+# `fred` chosen over `redis` for async-first design, automatic
+# pipelining, and Sentinel awareness — see docs/design-stateless-coordinator.md.
+fred = { version = "9", default-features = false, features = ["i-std", "i-scripts", "transactions", "sentinel-client"] }
+hdrhistogram = "7"
 
 [[bench]]
 name = "dispatcher"
 harness = false
 path = "benches/dispatcher.rs"
+
+# Head-to-head comparison: current in-memory single-node dispatcher
+# vs a stateless-coordinator prototype backed by Valkey. Binary harness
+# (not Criterion) because the interesting metric is end-to-end wall
+# time + claim-latency histogram under a concurrent-worker workload,
+# not per-op microbench.
+#
+# Run with:
+#   1. Start a Valkey instance on 127.0.0.1:6379 (in nix devshell:
+#      `valkey-server --daemonize yes --save '' --appendonly no`).
+#   2. cargo bench --bench valkey_vs_memory -- <scenario>
+#
+# Where <scenario> is e.g. `1k`, `10k`, `stress`.
+[[bench]]
+name = "valkey_vs_memory"
+harness = false
+path = "benches/valkey_vs_memory.rs"
 
 [features]
 default = []

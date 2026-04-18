@@ -78,6 +78,7 @@
               pkg-config
               openssl
               postgresql_16
+              valkey
               cachix
               nix
               nix-eval-jobs
