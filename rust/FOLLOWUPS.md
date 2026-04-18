@@ -4,6 +4,40 @@ Items identified during the review pass on branch `v3` that were
 deliberately **not** taken in that pass. Each has `what / why / scope /
 risk` so a future PR can decide whether to pick it up.
 
+## F-0. Simplification pass (April 2026) — deferred items
+
+A ruthless-simplification pass ran over the tree and produced the
+cuts described in `SIMPLIFICATION_REPORT.md`. The following items
+were considered and explicitly NOT cut:
+
+- **`tests/scale_xl.rs` + `docs/scale-xl-findings.md`.** Kept. Opt-in
+  diagnostic harness that found the single-writer bottleneck driving
+  commit 4fa7a1d. If a future hot-path change needs verification,
+  run with `--features scale-test`. Remove if it hasn't been
+  exercised for several quarters.
+- **Duplicate `validate_worker_id` in `server/claim.rs` and
+  `server/ops.rs`.** Signatures differ (`&Option<String>` vs `&str`)
+  and contracts differ (claim allows None/empty; fence requires
+  non-empty). Past triage already considered and deferred
+  consolidation; re-consider only if a third call site appears.
+- **Claim long-poll skeleton duplication** between per-job `claim`
+  and fleet `claim_any` in `server/claim.rs`. Different scan shape
+  (one submission vs all) makes a clean shared helper awkward. Left
+  as-is per the prior refactor-triage assessment.
+- **Trivial inline unit tests** (e.g.,
+  `submissions_is_empty_tracks_inserts`,
+  `is_empty_and_len_track_inserts_and_takes`, a few others). Flagged
+  as low-signal-low-cost; cutting them saves nothing meaningful.
+- **Table-driven consolidation** of the 7 `validate_catches_X`
+  tests in `tests/config_json.rs`. Would save ~60 LOC. Trivial win;
+  do it the next time this file gets touched.
+- **`append_eval_errors()` O(N²) attr dedup loop** in
+  `dispatch/submission.rs`. At the 500-cap this is 250K
+  comparisons; not hot, but a HashSet<String> would make it O(N).
+  Low priority.
+
+
+
 ## F-1. Install and wire review tooling into CI
 
 **What**: Install `cargo-audit`, `cargo-udeps` (nightly), and
