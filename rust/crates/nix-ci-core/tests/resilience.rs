@@ -1240,3 +1240,231 @@ async fn retry_skips_unsealed_submission(pool: PgPool) {
         "retry must not finalize an unsealed submission"
     );
 }
+
+// ─── 11. P-UPGRADE-SAFE: rolling upgrade preserves terminal rows ────
+
+/// The SPEC bar P-UPGRADE-SAFE: a rolling deploy (coordinator N → N+1,
+/// or just an in-place restart) must not corrupt any `jobs.result` or
+/// `failed_outputs` row that predates the deploy. Without an explicit
+/// regression guard, a bad migration, a bug in `clear_busy`, or an
+/// over-broad cleanup sweep could silently destroy durable state
+/// across every rollout — the worst failure mode for an "only broken
+/// builds break builds" coordinator, since no build is currently
+/// running but every historical result is lost.
+///
+/// Shape:
+///   1. Boot coordinator, create job with external_ref, ingest + seal
+///      + complete one drv → terminal Done. Read `jobs.result` JSONB
+///      from PG directly.
+///   2. Insert a `failed_outputs` row with `expires_at = now()+1h`.
+///   3. Drop the handle (simulated SIGTERM); spin up a fresh
+///      coordinator on the same PG (simulated rolling upgrade).
+///   4. Assert:
+///      * `jobs.result` for the terminal job is byte-identical to
+///        what was persisted pre-restart.
+///      * The `failed_outputs` row is still present and unexpired.
+///      * `GET /jobs/by-external-ref/<ref>` on the new coordinator
+///        returns the same snapshot clients would've seen before.
+///      * New job creation works end-to-end on the new coordinator.
+#[sqlx::test]
+async fn rolling_upgrade_preserves_terminal_rows(pool: PgPool) {
+    // ─── Phase 1: populate terminal state on "coordinator N" ────
+    let handle1 = spawn_server(pool.clone()).await;
+    let client1 = CoordinatorClient::new(&handle1.base_url);
+
+    let external_ref = "rolling-upgrade-fixture";
+    let job = client1
+        .create_job(&CreateJobRequest {
+            external_ref: Some(external_ref.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let leaf = drv_path("ru", "solo");
+    client1
+        .ingest_drv(job.id, &ingest(&leaf, "solo", &[], true))
+        .await
+        .unwrap();
+    client1.seal(job.id).await.unwrap();
+
+    let claim = client1
+        .claim(job.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("claim must issue");
+    client1
+        .complete(
+            job.id,
+            claim.claim_id,
+            &CompleteRequest {
+                success: true,
+                duration_ms: 42,
+                exit_code: Some(0),
+                error_category: None,
+                error_message: None,
+                log_tail: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(wait_for_terminal(&client1, job.id).await, JobStatus::Done);
+
+    // Snapshot `jobs` row pre-restart. `result` is the JSONB we must
+    // preserve byte-identically.
+    let (status_pre, done_at_pre, result_pre, sealed_pre): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT status, done_at, result, sealed FROM jobs WHERE id = $1",
+    )
+    .bind(job.id.0)
+    .fetch_one(&handle1.pool)
+    .await
+    .unwrap();
+    assert_eq!(status_pre, "done");
+    assert!(done_at_pre.is_some());
+    let result_pre = result_pre.expect("terminal job must have a result JSONB");
+    assert!(sealed_pre);
+
+    // Insert a failed_outputs row that must survive the restart.
+    // Expires_at = now()+1h so clear_busy's expired-row sweep doesn't
+    // clean it up.
+    let poisoned_path = "/nix/store/abc-poisoned";
+    let poisoned_hash = "abcfakefakefakefakefakefakefakefakefakefakefake";
+    sqlx::query(
+        "INSERT INTO failed_outputs (output_path, drv_hash, expires_at) \
+         VALUES ($1, $2, now() + interval '1 hour')",
+    )
+    .bind(poisoned_path)
+    .bind(poisoned_hash)
+    .execute(&handle1.pool)
+    .await
+    .unwrap();
+
+    // ─── Phase 2: simulated SIGTERM → fresh coordinator boot ───
+    // Drop the handle (oneshot shutdown) and give axum a moment to
+    // close out before binding a new listener on the same pool.
+    drop(handle1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let handle2 = spawn_server(pool.clone()).await;
+    let client2 = CoordinatorClient::new(&handle2.base_url);
+
+    // ─── Phase 3: pre-restart terminal rows must be byte-identical ─
+    let (status_post, done_at_post, result_post, sealed_post): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT status, done_at, result, sealed FROM jobs WHERE id = $1",
+    )
+    .bind(job.id.0)
+    .fetch_one(&handle2.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        status_post, status_pre,
+        "restart must not mutate jobs.status on terminal rows"
+    );
+    assert_eq!(
+        done_at_post, done_at_pre,
+        "restart must not mutate jobs.done_at on terminal rows"
+    );
+    assert_eq!(
+        sealed_post, sealed_pre,
+        "restart must not mutate jobs.sealed on terminal rows"
+    );
+    let result_post = result_post.expect("terminal job must still have a result JSONB");
+    assert_eq!(
+        result_post, result_pre,
+        "restart must not mutate jobs.result on terminal rows"
+    );
+
+    // ─── Phase 4: the failed_outputs row must survive ───
+    let surviving: Option<(String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT output_path, drv_hash, expires_at FROM failed_outputs WHERE output_path = $1",
+    )
+    .bind(poisoned_path)
+    .fetch_optional(&handle2.pool)
+    .await
+    .unwrap();
+    let (surviving_path, surviving_hash, surviving_expires) =
+        surviving.expect("failed_outputs row must survive rolling upgrade");
+    assert_eq!(surviving_path, poisoned_path);
+    assert_eq!(surviving_hash, poisoned_hash);
+    assert!(
+        surviving_expires > chrono::Utc::now(),
+        "failed_outputs expires_at must not be clobbered to the past"
+    );
+
+    // ─── Phase 5: client-facing lookups return the same snapshot ─
+    let snap_direct = client2.status(job.id).await.unwrap();
+    assert_eq!(snap_direct.id, job.id);
+    assert_eq!(snap_direct.status, JobStatus::Done);
+    // Serialized identity as the pre-restart persisted JSONB.
+    let snap_direct_json = serde_json::to_value(&snap_direct).unwrap();
+    assert_eq!(
+        snap_direct_json, result_pre,
+        "GET /jobs/{{id}} after restart must return the same snapshot the pre-restart coordinator persisted"
+    );
+
+    // `GET /jobs/by-external-ref/{ref}` — the CCI retry path.
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!(
+            "{}/jobs/by-external-ref/{external_ref}",
+            handle2.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], job.id.0.to_string());
+    assert_eq!(body["status"], "done");
+
+    // ─── Phase 6: new job creation works on the restarted coord ─
+    let new_job = client2
+        .create_job(&CreateJobRequest {
+            external_ref: Some("post-upgrade-new".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_ne!(new_job.id, job.id);
+    let new_leaf = drv_path("ru2", "fresh");
+    client2
+        .ingest_drv(new_job.id, &ingest(&new_leaf, "fresh", &[], true))
+        .await
+        .unwrap();
+    client2.seal(new_job.id).await.unwrap();
+    let new_claim = client2
+        .claim(new_job.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("fresh claim must issue");
+    client2
+        .complete(
+            new_job.id,
+            new_claim.claim_id,
+            &CompleteRequest {
+                success: true,
+                duration_ms: 5,
+                exit_code: Some(0),
+                error_category: None,
+                error_message: None,
+                log_tail: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_terminal(&client2, new_job.id).await,
+        JobStatus::Done
+    );
+}

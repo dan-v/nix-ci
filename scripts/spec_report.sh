@@ -75,6 +75,7 @@ BARS=(
     "P-NIXOS-COORDINATOR|coordinator nixosTest|nix flake check|coordinator-smoke"
     "P-NIXOS-WORKER|worker nixosTest|nix flake check|worker-smoke"
     "P-BEARER-AUTH|bearer-auth; unauth -> 401|edge_cases|unauthenticated_request_rejected_with_401"
+    "P-UPGRADE-SAFE|rolling upgrade preserves terminal rows|resilience|rolling_upgrade_preserves_terminal_rows"
 
     # H7 correctness hardening bars (added by this project, not
     # original SPEC but equally mission-critical).
