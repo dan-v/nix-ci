@@ -1442,6 +1442,8 @@ async fn rolling_upgrade_preserves_terminal_rows(pool: PgPool) {
     );
 
     // ─── Phase 6: new job creation works on the restarted coord ─
+    // Verify a FRESH job ingest → seal → complete → terminal path
+    // works end-to-end on the new coordinator, not just state reads.
     let new_job = client2
         .create_job(&CreateJobRequest {
             external_ref: Some("post-upgrade-new".into()),
@@ -1481,3 +1483,148 @@ async fn rolling_upgrade_preserves_terminal_rows(pool: PgPool) {
         JobStatus::Done
     );
 }
+
+// ─── 12. Runner SSE recovery across coordinator restart ─────────────
+
+/// C6 contract from the runner's point of view: when the coordinator
+/// is unavailable, `sse::print_events_with` must return `Err` in
+/// bounded time, never hang waiting for a `JobDone` that can't come.
+/// A runner that hangs here means a downstream CI job that never
+/// surfaces its failure, which is the worst UX regression — the user
+/// sees "pending" forever instead of "failed, retry."
+///
+/// Tested against a coordinator that's already gone (dead endpoint):
+/// reqwest connects to a refused port, outer reconnect loop burns the
+/// 5-attempt budget (1+2+3+4+5 = 15s of linear backoff), task returns
+/// `Err(Internal("SSE reconnect budget exhausted"))`.
+///
+/// Why not test "coord goes away mid-stream" in-process: when axum's
+/// serve task is aborted, per-connection tasks are NOT automatically
+/// aborted (they're spawned as siblings under the tokio runtime, not
+/// children). A mid-stream SSE TCP connection stays half-open until
+/// the OS garbage-collects the FD, so the in-process test would hang.
+/// The end-to-end `ha-failover` orbstack scenario (out-of-process,
+/// real TCP, real SIGKILL via `docker kill`) exercises the
+/// mid-stream path. Here we cover the narrower
+/// "coord-unavailable-to-client" surface, which is what matters for
+/// CCI's runner-restarted-by-re-trigger path.
+#[sqlx::test]
+async fn runner_sse_fails_cleanly_when_coord_unavailable(pool: PgPool) {
+    // Bind + immediately release a port so we have a known-refused
+    // address. The SSE client's reconnect loop hits ECONNREFUSED
+    // within microseconds per attempt.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    // Give the kernel a moment to fully release the port so the
+    // first connect attempt reliably refuses (vs. landing on a
+    // lingering TIME_WAIT).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = pool; // unused — we deliberately never create the coord.
+    let dead_url = format!("http://{addr}");
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let client = std::sync::Arc::new(CoordinatorClient::new(&dead_url));
+
+    let start = tokio::time::Instant::now();
+    let sse_task = tokio::spawn(nix_ci_core::runner::sse::print_events_with(
+        client,
+        nix_ci_core::types::JobId::new(),
+        None,
+        false,
+        tx,
+        rx,
+    ));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), sse_task)
+        .await
+        .expect("SSE must resolve within reconnect budget — not hang")
+        .expect("SSE task must not panic");
+    let elapsed = start.elapsed();
+
+    // Bound 1: resolves within ~budget (5 attempts × linear backoff
+    // 1+2+3+4+5 = 15s plus a small epsilon for tokio scheduling).
+    assert!(
+        elapsed < Duration::from_secs(18),
+        "SSE reconnect budget should bound at ~15s, took {elapsed:?}"
+    );
+    // Bound 2: also must not return too fast — a regression that
+    // dropped the reconnect loop entirely (returning on first
+    // failure) would be less resilient for genuinely flaky coordinators.
+    // At least one reconnect attempt's 1s sleep should have elapsed.
+    assert!(
+        elapsed > Duration::from_millis(500),
+        "SSE must attempt at least one reconnect before giving up, elapsed {elapsed:?}"
+    );
+    // Returns Err, not Ok(_) — we never observed a JobDone.
+    assert!(
+        outcome.is_err(),
+        "SSE against a dead endpoint must return Err, got {outcome:?}"
+    );
+    // Specifically an `Internal` error with an SSE-related message so
+    // the CCI logs explain what happened.
+    match outcome {
+        Err(nix_ci_core::Error::Internal(msg)) => {
+            assert!(
+                msg.contains("SSE"),
+                "error must identify the SSE path: got {msg}"
+            );
+        }
+        Err(e) => panic!("expected Error::Internal with SSE context, got {e:?}"),
+        Ok(_) => unreachable!("covered by the is_err assertion above"),
+    }
+}
+
+/// After a coordinator restart against the same Postgres, the old
+/// job must be cancelled (by `clear_busy` at boot) and observable
+/// via `/jobs/{id}` on the new coordinator. This is the durable side
+/// of the runner-SSE contract: the runner's SSE fails, CCI retries
+/// or surfaces the cancelled status, and the persisted terminal row
+/// is consistent.
+///
+/// Existing `restart_cancels_in_flight_and_stale_complete_is_ignored`
+/// and `rolling_upgrade_preserves_terminal_rows` cover adjacent
+/// parts; this asserts the narrow "SSE consumer can read the
+/// cancelled terminal snapshot from the new coordinator" path.
+#[sqlx::test]
+async fn runner_sse_consumer_reads_cancelled_terminal_after_restart(pool: PgPool) {
+    // Phase 1: create a live job on coord-A.
+    let handle_a = spawn_server(pool.clone()).await;
+    let client_a = CoordinatorClient::new(&handle_a.base_url);
+    let job = client_a
+        .create_job(&CreateJobRequest {
+            external_ref: Some("sse-cancel-after-restart".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let leaf = drv_path("sse2", "leaf");
+    client_a
+        .ingest_drv(job.id, &ingest(&leaf, "leaf", &[], true))
+        .await
+        .unwrap();
+
+    // Phase 2: tear down coord-A without completing the job.
+    drop(handle_a);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Phase 3: coord-B boots on same PG → clear_busy runs, flipping
+    // the old job to 'cancelled'.
+    let handle_b = spawn_server(pool.clone()).await;
+    let client_b = CoordinatorClient::new(&handle_b.base_url);
+
+    // Phase 4: runner's status lookup (what CCI does on retry) gets
+    // the cancelled snapshot, not a 500 or a hang.
+    let status = client_b
+        .status(job.id)
+        .await
+        .expect("status must return the persisted cancelled snapshot");
+    assert_eq!(status.status, JobStatus::Cancelled);
+    assert_eq!(
+        status.eval_error.as_deref(),
+        Some("coordinator restarted; job aborted"),
+        "the clear_busy sentinel must identify the cause"
+    );
+}
+

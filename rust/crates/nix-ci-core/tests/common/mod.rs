@@ -27,12 +27,25 @@ pub struct ServerHandle {
     /// this one is independent.
     pub state: AppState,
     shutdown: Option<oneshot::Sender<()>>,
+    /// Abort handle on the spawned axum task. Dropping the handle
+    /// fires the oneshot (graceful shutdown) AND aborts the task as
+    /// a belt-and-suspenders measure: if a test keeps a streaming
+    /// response open (SSE, long-poll), axum's graceful drain would
+    /// otherwise wait forever for the stream to close, pinning the
+    /// TCP listener and making subsequent tests that need the port
+    /// or that want to simulate a "hard coord death" impossible.
+    /// Production path uses the bounded `serve_with_timeout` in
+    /// `server::mod::run`; tests get this simpler abort-on-drop.
+    serve_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
+        }
+        if let Some(abort) = self.serve_abort.take() {
+            abort.abort();
         }
     }
 }
@@ -95,7 +108,7 @@ pub async fn spawn_server_with_cfg(
 
     let (tx, rx) = oneshot::channel::<()>();
     let router = build_router(state.clone());
-    tokio::spawn(async move {
+    let serve_task = tokio::spawn(async move {
         let _ = axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 let _ = rx.await;
@@ -112,6 +125,7 @@ pub async fn spawn_server_with_cfg(
         dispatcher,
         state,
         shutdown: Some(tx),
+        serve_abort: Some(serve_task.abort_handle()),
     }
 }
 
