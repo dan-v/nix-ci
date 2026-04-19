@@ -5,7 +5,10 @@ mod common;
 
 use common::{drv_path, ingest};
 use nix_ci_core::client::CoordinatorClient;
-use nix_ci_core::types::{CreateJobRequest, IngestBatchRequest, JobStatus};
+use nix_ci_core::types::{
+    CompleteRequest, CreateJobRequest, ErrorCategory, IngestBatchRequest, JobStatus,
+    MAX_LOG_TAIL_BYTES,
+};
 use sqlx::PgPool;
 
 /// When a batch would push a job's member count over `max_drvs_per_job`,
@@ -291,4 +294,138 @@ async fn ingest_rejects_oversized_attr(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.new_drvs, 1, "the good drv must still be ingested");
     assert_eq!(resp.errored, 1, "oversized attr must count as errored");
+}
+
+/// R-TERMINAL-JSONB-BOUNDED: a catastrophic-failure job whose workers
+/// upload realistic 64 KiB log_tails must produce a persisted
+/// `jobs.result` JSONB under 1 MiB. Without log_tail stripping past
+/// the triage head, 30 originating failures × 64 KiB tail = ~1.9 MiB
+/// of JSONB per row — over the bar and slow to re-read on every status
+/// poll.
+///
+/// The existing scale test `scale_failures_vec_under_catastrophic_job`
+/// submits `log_tail: None` from its mock worker, which hides this
+/// regression entirely. Real workers always attach a tail (see
+/// `runner::worker::handle_failure`), so this smaller variant with
+/// real tails is the per-PR enforcement gate.
+#[sqlx::test]
+async fn catastrophic_failure_snapshot_stays_under_1mib_with_real_log_tails(pool: PgPool) {
+    const N_FAILING: usize = 30;
+
+    let handle = common::spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+
+    // 30 independent leaf drvs — no shared deps, each fails on its own
+    // worker-reported BuildFailure. Shape is "bad overlay broke 30
+    // packages that all eval cleanly" — every attr has its own
+    // originating failure with a real log_tail.
+    let mut drvs = Vec::with_capacity(N_FAILING);
+    for i in 0..N_FAILING {
+        drvs.push(ingest(
+            &drv_path(&format!("fat{i:02}"), &format!("fat{i}")),
+            &format!("fat{i}"),
+            &[],
+            true,
+        ));
+    }
+    client
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    // 64 KiB of 'x' — matches what a realistic failing build's stderr
+    // would look like at the worker's tail cap.
+    let big_tail = "x".repeat(MAX_LOG_TAIL_BYTES);
+
+    // Claim + fail each drv with a real log_tail.
+    for _ in 0..N_FAILING {
+        let c = match client.claim(job.id, "x86_64-linux", &[], 5).await {
+            Ok(Some(c)) => c,
+            Ok(None) => panic!("drv must be claimable"),
+            Err(nix_ci_core::Error::Gone(_)) => break, // job went terminal early
+            Err(e) => panic!("unexpected claim error: {e}"),
+        };
+        let resp = client
+            .complete(
+                job.id,
+                c.claim_id,
+                &CompleteRequest {
+                    success: false,
+                    duration_ms: 1,
+                    exit_code: Some(1),
+                    error_category: Some(ErrorCategory::BuildFailure),
+                    error_message: Some(format!("{} failed", c.drv_hash)),
+                    log_tail: Some(big_tail.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        // A BuildFailure on the last drv terminalizes the job — that
+        // response is still Ok + ignored=false for the winning caller.
+        let _ = resp;
+    }
+
+    // Wait for terminal state.
+    let mut status = client.status(job.id).await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !status.status.is_terminal() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        status = client.status(job.id).await.unwrap();
+    }
+    assert_eq!(
+        status.status,
+        JobStatus::Failed,
+        "catastrophic-failure job must terminate Failed"
+    );
+
+    // Read the persisted JSONB directly — that's the thing the bar
+    // promises. An in-memory status response could look fine while the
+    // durable row is 32 MiB.
+    let row: (Option<serde_json::Value>,) =
+        sqlx::query_as("SELECT result FROM jobs WHERE id = $1")
+            .bind(job.id.0)
+            .fetch_one(&handle.pool)
+            .await
+            .unwrap();
+    let result = row.0.expect("terminal jobs must carry a result JSONB");
+    let failures = result
+        .get("failures")
+        .and_then(|v| v.as_array())
+        .expect("result.failures must be an array");
+    let result_bytes = serde_json::to_vec(&result).unwrap().len();
+
+    // Bar: < 1 MiB. Without the fix (every failure keeps its 64 KiB
+    // tail) we'd see ~30 × 64 KiB ≈ 1.92 MiB.
+    assert!(
+        result_bytes < 1_048_576,
+        "terminal JSONB is {result_bytes} bytes (> 1 MiB); log_tail stripping regressed"
+    );
+
+    // Lower-bound sanity: at least the first few failures kept their
+    // full tails so operators get real triage context. Without SOME
+    // tails the fix would have over-stripped.
+    let with_tail = failures
+        .iter()
+        .filter(|f| f.get("log_tail").is_some_and(|v| !v.is_null()))
+        .count();
+    assert!(
+        with_tail > 0,
+        "at least one failure in the snapshot must retain its log_tail for triage"
+    );
+    // Head is capped at 10 by the cap_failures implementation.
+    assert!(
+        with_tail <= 10,
+        "snapshot retained more tails than the head allows: {with_tail}"
+    );
 }

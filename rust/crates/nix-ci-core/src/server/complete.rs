@@ -431,27 +431,59 @@ fn compute_used_by_attrs(sub: &Arc<Submission>, s: &Arc<crate::dispatch::Step>) 
     hits
 }
 
+/// Upper bound on how many failures in a persisted terminal snapshot
+/// keep their full `log_tail`. Past this, `log_tail` is stripped to
+/// `None` before the snapshot is written to `jobs.result`.
+///
+/// Rationale: each `log_tail` is capped at `MAX_LOG_TAIL_BYTES` = 64
+/// KiB. With the existing `max_failures_in_result = 500` truncation,
+/// a catastrophic-failure job with every entry carrying a tail would
+/// produce a ~32 MiB JSONB row — far above the `R-TERMINAL-JSONB-BOUNDED`
+/// < 1 MiB bar. The scale test that claimed to prove the 1 MiB bound
+/// was submitting `log_tail: None` from its mock worker, which hid the
+/// real production shape where every worker does attach a tail.
+///
+/// Full logs remain available via the `build_logs` archive
+/// (`GET /jobs/{id}/claims/{claim_id}/log`) — the snapshot only needs
+/// enough context for first-line triage.
+const MAX_LOGTAILS_IN_RESULT: usize = 10;
+
 /// Cap the terminal `failures` snapshot to keep the `jobs.result`
-/// JSONB row bounded. If we truncate, we drop the tail and record a
-/// synthetic marker so callers see that they're looking at a partial
-/// list. SSE subscribers still get the full list (delivered in-memory
-/// via `JobDone`); only the durable snapshot is capped.
+/// JSONB row bounded:
+///   1. Truncate at `cap` entries + append a synthetic `<truncated>`
+///      marker so callers see they're looking at a partial list.
+///   2. Strip `log_tail` on every entry past `MAX_LOGTAILS_IN_RESULT`
+///      so a job with many originating failures doesn't balloon the
+///      persisted JSONB. The archive (`build_logs` table) still has
+///      the full bytes per attempt.
+///
+/// SSE subscribers still get the full list (delivered in-memory via
+/// `JobDone`, which bypasses this cap); only the durable snapshot is
+/// trimmed.
 pub(crate) fn cap_failures(mut all: Vec<DrvFailure>, cap: usize) -> Vec<DrvFailure> {
-    if all.len() <= cap {
-        return all;
+    if all.len() > cap {
+        let overflow = all.len() - cap;
+        all.truncate(cap);
+        all.push(DrvFailure {
+            drv_hash: crate::types::DrvHash::new("<truncated>".to_string()),
+            drv_name: "<truncated>".to_string(),
+            error_category: ErrorCategory::PropagatedFailure,
+            error_message: Some(format!(
+                "{overflow} additional failures truncated from snapshot"
+            )),
+            log_tail: None,
+            propagated_from: None,
+        });
     }
-    let overflow = all.len() - cap;
-    all.truncate(cap);
-    all.push(DrvFailure {
-        drv_hash: crate::types::DrvHash::new("<truncated>".to_string()),
-        drv_name: "<truncated>".to_string(),
-        error_category: ErrorCategory::PropagatedFailure,
-        error_message: Some(format!(
-            "{overflow} additional failures truncated from snapshot"
-        )),
-        log_tail: None,
-        propagated_from: None,
-    });
+    // Strip fat log_tails past the triage head. Propagated failures
+    // already carry `log_tail: None` (see `propagate_failure_inmem`),
+    // so this mainly trims originating failures that piled up past
+    // the head — e.g. a flake whose overlay breaks every package.
+    for (i, f) in all.iter_mut().enumerate() {
+        if i >= MAX_LOGTAILS_IN_RESULT {
+            f.log_tail = None;
+        }
+    }
     all
 }
 
@@ -796,5 +828,134 @@ mod tests {
         let out = log.unwrap();
         assert_eq!(out.len(), MAX_LOG_TAIL_BYTES);
         assert!(out.chars().all(|c| c == 'z'));
+    }
+
+    // ─── cap_failures: snapshot-size bounding ───────────────────
+
+    fn failure(name: &str, tail: Option<&str>) -> DrvFailure {
+        DrvFailure {
+            drv_hash: crate::types::DrvHash::new(format!("{name}.drv")),
+            drv_name: name.to_string(),
+            error_category: ErrorCategory::BuildFailure,
+            error_message: Some(format!("{name} failed")),
+            log_tail: tail.map(|s| s.to_string()),
+            propagated_from: None,
+        }
+    }
+
+    #[test]
+    fn cap_failures_under_cap_strips_tails_past_head() {
+        // Input has 15 failures, each with a 64 KiB log_tail. No
+        // truncation (cap=500), but only the first MAX_LOGTAILS_IN_RESULT
+        // (=10) entries should retain their tail — otherwise a 15 ×
+        // 64 KiB = 960 KiB snapshot would pass through unchanged.
+        let big = "x".repeat(MAX_LOG_TAIL_BYTES);
+        let input: Vec<DrvFailure> = (0..15)
+            .map(|i| failure(&format!("f{i}"), Some(&big)))
+            .collect();
+        let out = cap_failures(input, 500);
+        assert_eq!(out.len(), 15, "no truncation expected under cap");
+        for (i, f) in out.iter().enumerate() {
+            if i < MAX_LOGTAILS_IN_RESULT {
+                assert!(
+                    f.log_tail.is_some(),
+                    "entry {i} within head MUST retain tail"
+                );
+                assert_eq!(f.log_tail.as_deref().unwrap().len(), MAX_LOG_TAIL_BYTES);
+            } else {
+                assert!(
+                    f.log_tail.is_none(),
+                    "entry {i} past head MUST have tail stripped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cap_failures_over_cap_truncates_and_strips_tails() {
+        // 30-entry input with a small cap of 5. Result: 5 originals +
+        // 1 truncation marker. All 5 originals within head keep tail
+        // (head is 10 > 5, so every surviving original keeps its tail).
+        // The marker has tail=None by construction.
+        let input: Vec<DrvFailure> = (0..30)
+            .map(|i| failure(&format!("g{i}"), Some("short tail")))
+            .collect();
+        let out = cap_failures(input, 5);
+        assert_eq!(out.len(), 6, "5 originals + 1 marker");
+        for (i, f) in out.iter().take(5).enumerate() {
+            assert!(
+                f.log_tail.is_some(),
+                "original entry {i} within cap must keep tail"
+            );
+        }
+        assert_eq!(out[5].drv_name, "<truncated>");
+        assert!(out[5].log_tail.is_none());
+    }
+
+    #[test]
+    fn cap_failures_over_cap_and_over_head_truncates_then_strips() {
+        // cap=50, head=10. Input 60 entries all with 64 KiB tails.
+        // Expect: 50 originals + 1 marker. First 10 keep tails; next
+        // 40 have tail=None; marker has tail=None. Pathological
+        // pre-fix shape was 50 × 64 KiB = 3.2 MiB.
+        let big = "x".repeat(MAX_LOG_TAIL_BYTES);
+        let input: Vec<DrvFailure> = (0..60)
+            .map(|i| failure(&format!("h{i}"), Some(&big)))
+            .collect();
+        let out = cap_failures(input, 50);
+        assert_eq!(out.len(), 51);
+        let with_tail = out.iter().filter(|f| f.log_tail.is_some()).count();
+        assert_eq!(
+            with_tail, MAX_LOGTAILS_IN_RESULT,
+            "exactly MAX_LOGTAILS_IN_RESULT (={MAX_LOGTAILS_IN_RESULT}) entries must keep tail"
+        );
+        // Serialized JSONB stays bounded — simulate the write.
+        let bytes = serde_json::to_vec(&out).unwrap().len();
+        // Budget: 10 × 64 KiB = 640 KiB for tails + overhead for 51
+        // entries. Assert well under 1 MiB — the R-TERMINAL-JSONB-BOUNDED
+        // SPEC bar.
+        assert!(
+            bytes < 1_048_576,
+            "capped failures vec serialized to {bytes} bytes, must be < 1 MiB"
+        );
+        assert!(
+            bytes >= 640 * 1024,
+            "lower-bound sanity: we should still have ~10 full tails, got {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn cap_failures_preserves_head_order_and_semantics() {
+        // Regression guard: the ordering of the first N entries (which
+        // keep tails and are the ones operators see first on triage)
+        // must match the input order — we don't re-sort.
+        let input: Vec<DrvFailure> = ["alpha", "bravo", "charlie", "delta"]
+            .iter()
+            .map(|n| failure(n, Some("tail")))
+            .collect();
+        let out = cap_failures(input, 100);
+        let names: Vec<_> = out.iter().map(|f| f.drv_name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo", "charlie", "delta"]);
+        // All four within head; all keep tails.
+        assert!(out.iter().all(|f| f.log_tail.is_some()));
+    }
+
+    #[test]
+    fn cap_failures_empty_input_returns_empty() {
+        let out = cap_failures(Vec::new(), 500);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cap_failures_zero_logtails_unchanged() {
+        // Propagated-failure shape: every entry has log_tail=None
+        // already (from `propagate_failure_inmem`). No stripping
+        // needed, no truncation needed. Must round-trip identically.
+        let input: Vec<DrvFailure> = (0..50).map(|i| failure(&format!("p{i}"), None)).collect();
+        let out = cap_failures(input.clone(), 500);
+        assert_eq!(out.len(), 50);
+        for f in &out {
+            assert!(f.log_tail.is_none());
+        }
     }
 }
