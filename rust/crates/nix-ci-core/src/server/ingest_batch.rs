@@ -34,6 +34,20 @@ pub async fn submit_batch(
     Path(id): Path<crate::types::JobId>,
     Json(req): Json<IngestBatchRequest>,
 ) -> Result<Json<IngestBatchResponse>> {
+    // Drain: reject further ingest on existing jobs once the operator
+    // flipped the drain switch. Without this, a streaming submitter
+    // (`nix-ci run` feeding batches from `nix-eval-jobs` one attr at a
+    // time) keeps adding drvs during drain → new claims issue → the
+    // operator's `in_flight_claims → 0` convergence polling is chased
+    // by a moving target and SIGTERM is never safe. The submitter sees
+    // 503 and either waits for PG-available-again-after-restart or
+    // (for `nix-ci run`) exits cleanly so the orchestrator can record
+    // the run as cancelled/partial.
+    if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(crate::Error::ServiceUnavailable(format!(
+            "coordinator is draining; not accepting further ingest on job {id}"
+        )));
+    }
     // H3: track batch size distribution so slow-ingest incidents can be
     // attributed to a runaway submitter emitting unusually large batches.
     state

@@ -360,3 +360,84 @@ async fn drain_aborts_in_flight_fleet_claim_long_poll(pool: PgPool) {
     // on the long-poll behavior, not the rest of the client API.
     let _ = client;
 }
+
+/// Drain must reject further ingest on EXISTING jobs, not just block
+/// new job creation / new claims. A streaming submitter
+/// (`nix-ci run` feeding batches from `nix-eval-jobs`) would otherwise
+/// keep adding drvs during drain → new claims issue → the operator's
+/// `in_flight_claims → 0` convergence polling is chased by a moving
+/// target and SIGTERM is never safe.
+#[sqlx::test]
+async fn drain_rejects_further_ingest_on_existing_jobs(pool: PgPool) {
+    let handle = common::spawn_server(pool).await;
+    let client = CoordinatorClient::new(handle.base_url.clone());
+    let http = reqwest::Client::new();
+
+    // Job exists pre-drain with one drv already ingested.
+    let job = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some("drain-ingest".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    client
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs: vec![ingest(&drv_path("pre", "a"), "a", true)],
+                eval_errors: Vec::new(),
+            },
+        )
+        .await
+        .expect("pre-drain ingest must succeed");
+
+    // Flip drain.
+    let resp = http
+        .post(format!("{}/admin/drain", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // Post-drain: further ingest on the SAME job must be rejected.
+    // Without this, the streaming submitter would happily keep adding
+    // drvs (including ones we'd then try to claim, defeating drain).
+    //
+    // We use the raw HTTP client here to inspect the exact status +
+    // body: the `CoordinatorClient` wraps non-2xx uniformly as
+    // `Error::Internal(..)` with the body string, which would hide
+    // whether we got 503 or some other 5xx.
+    let post_drain = http
+        .post(format!("{}/jobs/{}/drvs/batch", handle.base_url, job.id))
+        .json(&IngestBatchRequest {
+            drvs: vec![ingest(&drv_path("post", "b"), "b", true)],
+            eval_errors: Vec::new(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        post_drain.status().as_u16(),
+        503,
+        "drain must reject further ingest with 503"
+    );
+    // The sanitized response body is the fixed
+    // `{"code":503,"error":"service unavailable"}` shape every 5xx
+    // uses — detailed messages live in server logs, not client
+    // responses. Just confirm we got the right 5xx class and can
+    // parse the shape.
+    let body = post_drain.text().await.unwrap();
+    assert!(
+        body.contains("\"code\":503"),
+        "expected fixed 503 error shape, got: {body}"
+    );
+
+    // Prove the new drv is NOT present — the ingest was rejected
+    // before any dispatcher mutation.
+    let status = client.status(job.id).await.unwrap();
+    assert_eq!(
+        status.counts.total, 1,
+        "post-drain ingest must not have grown members"
+    );
+}
