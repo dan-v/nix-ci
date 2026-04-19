@@ -18,7 +18,7 @@ network hops between coordinator and workers.
     cargo build --release -p nix-ci -p nix-ci-harness
   ```
 
-## Profiles
+## Profiles (run.sh)
 
 - `wide-fleet` — 50 containers × 50 mock workers (2500 fleet workers)
   claiming zero-duration work against a synthetic 10k-drv DAG.
@@ -29,21 +29,37 @@ network hops between coordinator and workers.
   counter increments, no coordinator panics, job reaches terminal,
   `/admin/refute` clears the failed-outputs cache.
 
+## Standalone scenarios
+
+- `ha-failover.sh` — two coordinator containers sharing a Postgres +
+  advisory-lock key. Primary (`coord-A`) serves; standby (`coord-B`)
+  blocks in `CoordinatorLock::acquire` with its :8080 port refused.
+  `docker kill --signal=KILL coord-A` — the hardest path, no graceful
+  shutdown at all — triggers lock release, standby unblocks, new
+  primary takes over. Assertions: failover under 10s, `clear_busy`
+  flips the pre-failover pending job to `cancelled`, new job on the
+  new primary reaches `Done` end-to-end. Standalone rather than a
+  `run.sh` profile because the topology (no workers, two coords) is
+  fundamentally different from the worker-heavy scenarios.
+
 ## Usage
 
 ```
 ./scripts/orbstack_harness/run.sh wide-fleet
 ./scripts/orbstack_harness/run.sh sick-worker-contained
+./scripts/orbstack_harness/ha-failover.sh
 ```
 
 Reports land under `scripts/orbstack_harness/out/`:
-- `report.json` — driver report, SLO pass/fail
+- `report.json` — run.sh driver report (wide-fleet, sick-worker)
+- `ha-failover.json` — ha-failover.sh assertions + failover latency
 - `worker-*.json` — per-container mock-worker summaries
 
 ## Teardown
 
-`run.sh` cleans up via EXIT trap. For stuck runs:
+Each script cleans up via EXIT trap. For stuck runs:
 
 ```
 ./scripts/orbstack_harness/run.sh teardown
+./scripts/orbstack_harness/ha-failover.sh teardown
 ```
