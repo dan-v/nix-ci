@@ -46,14 +46,16 @@ pub async fn events(State(state): State<AppState>, Path(id): Path<JobId>) -> Res
             // Build the in-flight list from this job's claims. Each
             // claim has a started_at; we report wall-clock millis so
             // the runner can compute "elapsed = now_ms - started_at_ms".
+            // `by_job` is O(claims for this job); `all().filter(..)` was
+            // O(total claims) and at 10K+ in-flight across many jobs
+            // this tick was hot.
             let now_wall = chrono::Utc::now().timestamp_millis();
             let now_mono = tokio::time::Instant::now();
             let mut in_flight: Vec<crate::types::DrvInFlight> = progress_state
                 .dispatcher
                 .claims
-                .all()
+                .by_job(progress_id)
                 .into_iter()
-                .filter(|c| c.job_id == progress_id)
                 .map(|c| {
                     let elapsed_ms = now_mono.saturating_duration_since(c.started_at).as_millis() as i64;
                     let drv_name = progress_state

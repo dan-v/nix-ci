@@ -476,7 +476,6 @@ async fn readyz_flips_503_when_claims_in_flight_hits_threshold(pool: PgPool) {
         cfg.max_claims_in_flight = Some(2);
     })
     .await;
-    let client = CoordinatorClient::new(handle.base_url.clone());
     let http = reqwest::Client::new();
 
     // Baseline: fresh coordinator, no claims → readyz is 200.

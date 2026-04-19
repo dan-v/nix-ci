@@ -104,16 +104,20 @@ impl Dispatcher {
     /// in the map until their deadline expires (potentially many
     /// minutes later), inflating the gauge and pinning the step's
     /// drv_hash. Returns the count evicted (for tests / metrics).
+    ///
+    /// O(claims for that job) via the `by_job` secondary index. The
+    /// prior implementation cloned every Arc in the primary map just
+    /// to find the matching subset — at 10K total claims across 100
+    /// jobs, that was 10K Arc clones per terminal transition.
     pub fn evict_claims_for(&self, job_id: crate::types::JobId) -> u64 {
-        let evicted: Vec<_> = self
+        let claim_ids: Vec<_> = self
             .claims
-            .all()
+            .by_job(job_id)
             .into_iter()
-            .filter(|c| c.job_id == job_id)
             .map(|c| c.claim_id)
             .collect();
         let mut n: u64 = 0;
-        for cid in evicted {
+        for cid in claim_ids {
             if self.claims.take(cid).is_some() {
                 self.metrics.inner.claims_in_flight.dec();
                 n += 1;

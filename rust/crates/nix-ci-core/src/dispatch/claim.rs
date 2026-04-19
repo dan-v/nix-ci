@@ -55,8 +55,20 @@ pub struct ActiveClaim {
     pub hard_deadline: Option<Instant>,
 }
 
+/// Dual-indexed claim store. `by_id` is the primary lookup by
+/// `claim_id`; `by_job` is a secondary `HashMap<JobId, HashSet<ClaimId>>`
+/// so per-job eviction and per-job iteration (SSE progress tick) are
+/// O(claims for that job) rather than O(total claims). At 10K
+/// in-flight claims across 100 jobs, the primary-only approach scanned
+/// 10K entries per cancel event; the dual-index version walks ~100.
+/// Both maps are maintained atomically under a single write lock.
 pub struct Claims {
-    inner: RwLock<HashMap<ClaimId, Arc<ActiveClaim>>>,
+    inner: RwLock<ClaimsInner>,
+}
+
+struct ClaimsInner {
+    by_id: HashMap<ClaimId, Arc<ActiveClaim>>,
+    by_job: HashMap<JobId, std::collections::HashSet<ClaimId>>,
 }
 
 /// Outcome when a caller tries to take a claim but the path-bound
@@ -82,16 +94,36 @@ impl Default for Claims {
 impl Claims {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(ClaimsInner {
+                by_id: HashMap::new(),
+                by_job: HashMap::new(),
+            }),
         }
     }
 
     pub fn insert(&self, claim: Arc<ActiveClaim>) {
-        self.inner.write().insert(claim.claim_id, claim);
+        let mut guard = self.inner.write();
+        guard
+            .by_job
+            .entry(claim.job_id)
+            .or_default()
+            .insert(claim.claim_id);
+        guard.by_id.insert(claim.claim_id, claim);
     }
 
     pub fn take(&self, claim_id: ClaimId) -> Option<Arc<ActiveClaim>> {
-        self.inner.write().remove(&claim_id)
+        let mut guard = self.inner.write();
+        let claim = guard.by_id.remove(&claim_id)?;
+        // Prune the by_job entry. If the set becomes empty, drop the
+        // outer map entry too — otherwise a million short-lived jobs
+        // would leave a million empty HashSets as residue.
+        if let Some(set) = guard.by_job.get_mut(&claim.job_id) {
+            set.remove(&claim_id);
+            if set.is_empty() {
+                guard.by_job.remove(&claim.job_id);
+            }
+        }
+        Some(claim)
     }
 
     /// Atomic take-if-job-matches. Returned value is `Ok(claim)` when
@@ -111,21 +143,33 @@ impl Claims {
         expected_job_id: JobId,
     ) -> std::result::Result<Arc<ActiveClaim>, ClaimJobMismatch> {
         let mut guard = self.inner.write();
-        match guard.get(&claim_id) {
+        match guard.by_id.get(&claim_id) {
             None => Err(ClaimJobMismatch::NotFound),
             Some(c) if c.job_id != expected_job_id => {
                 Err(ClaimJobMismatch::WrongJob { actual: c.job_id })
             }
-            Some(_) => Ok(guard.remove(&claim_id).expect("just checked present")),
+            Some(_) => {
+                let claim = guard
+                    .by_id
+                    .remove(&claim_id)
+                    .expect("just checked present");
+                if let Some(set) = guard.by_job.get_mut(&expected_job_id) {
+                    set.remove(&claim_id);
+                    if set.is_empty() {
+                        guard.by_job.remove(&expected_job_id);
+                    }
+                }
+                Ok(claim)
+            }
         }
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().len()
+        self.inner.read().by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().is_empty()
+        self.inner.read().by_id.is_empty()
     }
 
     /// Return every claim whose deadline has passed. The caller must
@@ -133,6 +177,7 @@ impl Claims {
     pub fn expired_ids(&self, now: Instant) -> Vec<ClaimId> {
         self.inner
             .read()
+            .by_id
             .values()
             .filter(|c| *c.deadline.lock() <= now)
             .map(|c| c.claim_id)
@@ -154,7 +199,7 @@ impl Claims {
     /// the reaper will evict on its next tick.
     pub fn extend(&self, claim_id: ClaimId, now: Instant) -> Option<Instant> {
         let guard = self.inner.read();
-        let claim = guard.get(&claim_id)?;
+        let claim = guard.by_id.get(&claim_id)?;
         let proposed = now + claim.deadline_window;
         let new_deadline = match claim.hard_deadline {
             Some(ceiling) if ceiling < proposed => ceiling,
@@ -178,11 +223,28 @@ impl Claims {
         now >= ceiling
     }
 
-    /// Snapshot every active claim. Used by the reaper to find claims
-    /// tied to a reaped job so they can be evicted immediately instead
-    /// of lingering until their deadline.
+    /// Snapshot every active claim. Used by the reaper for cross-job
+    /// scans (`expired_ids`) and by operator endpoints (`/claims`,
+    /// `/admin/debug/dispatcher-dump`). Callers that want per-job
+    /// claims should use `by_job` instead — it avoids cloning every
+    /// unrelated Arc in the map.
     pub fn all(&self) -> Vec<Arc<ActiveClaim>> {
-        self.inner.read().values().cloned().collect()
+        self.inner.read().by_id.values().cloned().collect()
+    }
+
+    /// Snapshot claims for one specific job. O(claims for that job)
+    /// via the secondary `by_job` index, vs O(total claims) for
+    /// `all().filter(|c| c.job_id == ..)`. Hot on the SSE progress
+    /// tick (runs every 10s per subscriber per live job) and on
+    /// per-job eviction paths.
+    pub fn by_job(&self, job_id: JobId) -> Vec<Arc<ActiveClaim>> {
+        let guard = self.inner.read();
+        let Some(set) = guard.by_job.get(&job_id) else {
+            return Vec::new();
+        };
+        set.iter()
+            .filter_map(|cid| guard.by_id.get(cid).cloned())
+            .collect()
     }
 }
 
@@ -377,5 +439,160 @@ mod tests {
             &claim,
             now + Duration::from_secs(120)
         ));
+    }
+
+    // ─── by_job secondary index ─────────────────────────────────
+
+    fn mk_claim_with_job(job_id: JobId) -> Arc<ActiveClaim> {
+        Arc::new(ActiveClaim {
+            claim_id: ClaimId::new(),
+            job_id,
+            drv_hash: DrvHash::new("drv-test.drv"),
+            attempt: 1,
+            deadline: Mutex::new(Instant::now() + Duration::from_secs(60)),
+            deadline_window: Duration::from_secs(60),
+            started_at: Instant::now(),
+            started_at_wall: chrono::Utc::now(),
+            worker_id: None,
+            hard_deadline: None,
+        })
+    }
+
+    #[test]
+    fn by_job_returns_empty_for_unknown_job() {
+        let c = Claims::new();
+        c.insert(mk_claim_with_job(JobId::new()));
+        assert!(
+            c.by_job(JobId::new()).is_empty(),
+            "unknown job_id must return empty, not all claims"
+        );
+    }
+
+    #[test]
+    fn by_job_returns_only_claims_for_that_job() {
+        // The whole point of the secondary index: a per-job query
+        // must not walk unrelated claims.
+        let c = Claims::new();
+        let job_a = JobId::new();
+        let job_b = JobId::new();
+        // 3 for A, 5 for B.
+        for _ in 0..3 {
+            c.insert(mk_claim_with_job(job_a));
+        }
+        for _ in 0..5 {
+            c.insert(mk_claim_with_job(job_b));
+        }
+
+        let a = c.by_job(job_a);
+        let b = c.by_job(job_b);
+        assert_eq!(a.len(), 3);
+        assert_eq!(b.len(), 5);
+        assert!(
+            a.iter().all(|cl| cl.job_id == job_a),
+            "by_job(A) must only return job A's claims"
+        );
+        assert!(
+            b.iter().all(|cl| cl.job_id == job_b),
+            "by_job(B) must only return job B's claims"
+        );
+    }
+
+    #[test]
+    fn take_maintains_by_job_index() {
+        // Removing a claim must also drop it from the secondary index,
+        // otherwise by_job() would surface phantom claim_ids whose
+        // primary-map entries have been removed.
+        let c = Claims::new();
+        let job = JobId::new();
+        let claim = mk_claim_with_job(job);
+        let cid = claim.claim_id;
+        c.insert(claim);
+        assert_eq!(c.by_job(job).len(), 1);
+        let taken = c.take(cid).expect("present");
+        assert_eq!(taken.claim_id, cid);
+        assert!(
+            c.by_job(job).is_empty(),
+            "take must remove the claim from by_job too"
+        );
+        // And the outer map entry should be gone (the set is empty
+        // after the only member is removed).
+        assert!(
+            !c.inner.read().by_job.contains_key(&job),
+            "empty set must be pruned from by_job to prevent map bloat"
+        );
+    }
+
+    #[test]
+    fn take_for_job_maintains_by_job_index() {
+        let c = Claims::new();
+        let job = JobId::new();
+        let claim = mk_claim_with_job(job);
+        let cid = claim.claim_id;
+        c.insert(claim);
+        let taken = c.take_for_job(cid, job).expect("match");
+        assert_eq!(taken.claim_id, cid);
+        assert!(c.by_job(job).is_empty());
+        assert!(!c.inner.read().by_job.contains_key(&job));
+    }
+
+    #[test]
+    fn take_for_job_mismatch_does_not_touch_by_job() {
+        // WrongJob is an error — the claim stays in the map AND in the
+        // secondary index. Without this guard the claim would vanish
+        // silently on a cross-job POST.
+        let c = Claims::new();
+        let owning_job = JobId::new();
+        let other_job = JobId::new();
+        let claim = mk_claim_with_job(owning_job);
+        let cid = claim.claim_id;
+        c.insert(claim);
+        let err = match c.take_for_job(cid, other_job) {
+            Err(e) => e,
+            Ok(_) => panic!("mismatch must not take the claim"),
+        };
+        match err {
+            ClaimJobMismatch::WrongJob { actual } => assert_eq!(actual, owning_job),
+            other => panic!("expected WrongJob, got {other:?}"),
+        }
+        // Claim still in both indexes — the correct owner can still complete.
+        assert!(c.take(cid).is_some());
+    }
+
+    #[test]
+    fn insert_take_stress_leaves_indexes_consistent() {
+        // Invariant: len() == sum over by_job of set lengths. Maintained
+        // under random insert/take interleaving.
+        let c = Claims::new();
+        let job_a = JobId::new();
+        let job_b = JobId::new();
+        let mut ids_a: Vec<ClaimId> = Vec::new();
+        let mut ids_b: Vec<ClaimId> = Vec::new();
+        for _ in 0..50 {
+            let ca = mk_claim_with_job(job_a);
+            ids_a.push(ca.claim_id);
+            c.insert(ca);
+            let cb = mk_claim_with_job(job_b);
+            ids_b.push(cb.claim_id);
+            c.insert(cb);
+        }
+        // Remove first 30 of each.
+        for cid in ids_a.drain(..30) {
+            c.take(cid);
+        }
+        for cid in ids_b.drain(..30) {
+            c.take(cid);
+        }
+        // 20 each remain.
+        assert_eq!(c.len(), 40);
+        assert_eq!(c.by_job(job_a).len(), 20);
+        assert_eq!(c.by_job(job_b).len(), 20);
+        // Invariant: sum of secondary sets == primary len.
+        let guard = c.inner.read();
+        let secondary_sum: usize = guard.by_job.values().map(|s| s.len()).sum();
+        assert_eq!(
+            secondary_sum,
+            guard.by_id.len(),
+            "secondary index must sum to primary index size"
+        );
     }
 }
