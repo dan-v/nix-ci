@@ -495,6 +495,9 @@ async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Resul
         failures: Vec::new(),
         eval_error: Some(reason.to_string()),
         eval_errors,
+        // No failures, no attribution: the over-cap rejection is
+        // the whole story and it's structural, not worker-related.
+        suspected_worker_infra: None,
     };
     // Terminal write is idempotent (done_at IS NULL guard). If the job
     // was already forced terminal by a concurrent oversized batch, we

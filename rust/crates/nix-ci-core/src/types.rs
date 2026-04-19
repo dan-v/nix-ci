@@ -394,6 +394,16 @@ pub struct DrvFailure {
     pub error_message: Option<String>,
     pub log_tail: Option<String>,
     pub propagated_from: Option<DrvHash>,
+    /// Which worker reported this failure. Populated for originating
+    /// failures (the worker that ran the build); `None` for propagated
+    /// failures (the drv never ran) and for failures synthesised
+    /// outside a claim path (e.g. `terminal_fail_exhausted` after
+    /// max_retries_exceeded without a final claim). Load-bearing for
+    /// the `suspected_worker_infra` terminal-time heuristic that tells
+    /// operators "this job's failures look like one bad host, not a
+    /// real build issue."
+    #[serde(default)]
+    pub worker_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +423,22 @@ pub struct JobStatusResponse {
     /// backward compatibility with older clients / test fixtures.
     #[serde(default)]
     pub eval_errors: Vec<EvalError>,
+    /// `Some(worker_id)` when a terminal-time heuristic flags the
+    /// job's originating failures as consistent with one worker being
+    /// infra-broken (vs. genuine drv bugs).
+    ///
+    /// Conditions, computed at terminal time:
+    ///   - at least 3 originating failures (not enough signal below that);
+    ///   - all of them in `{Transient, DiskFull}` (`BuildFailure` is
+    ///     deterministic: a drv that exits code 1 on one host genuinely
+    ///     broke, regardless of which host saw it);
+    ///   - strict majority (more than 50%) from a single `worker_id`.
+    ///
+    /// Operators use this to answer "did my user's code break or did
+    /// my fleet break?" in one glance. `None` on unattributed / sparse
+    /// / mixed-category / fan-out-attributed failures.
+    #[serde(default)]
+    pub suspected_worker_infra: Option<String>,
 }
 
 /// One in-flight build, included in `Progress` events so clients can

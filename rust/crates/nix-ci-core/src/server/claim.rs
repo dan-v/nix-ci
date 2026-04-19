@@ -480,6 +480,12 @@ async fn terminal_fail_exhausted(state: &AppState, step: &Arc<Step>) -> Result<(
         error_message: Some(msg.clone()),
         log_tail: None,
         propagated_from: None,
+        // No single worker owns the max-retries-exceeded terminal —
+        // this synth failure fires when a claim expired (reaper path)
+        // without any worker reporting, so there's no honest
+        // attribution. `None` keeps the infra-suspicion heuristic
+        // from blaming a random worker.
+        worker_id: None,
     };
     for sub in &subs {
         sub.record_failure(failure.clone());

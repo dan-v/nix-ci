@@ -338,3 +338,178 @@ async fn propagated_failures_count_matches_rdep_closure(pool: PgPool) {
         "propagated_failures metric != 2 in:\n{body}"
     );
 }
+
+/// End-to-end for the `suspected_worker_infra` terminal heuristic:
+/// 4-of-5 originating DiskFull failures from the same worker_id
+/// must flag that host in `GET /jobs/{id}.suspected_worker_infra`.
+///
+/// Configured with `max_attempts=1` so a single infra-like failure
+/// terminalizes each drv — gets us into the
+/// `!can_retry → handle_failure terminal` path where the DrvFailure's
+/// `worker_id` is populated from the claim.
+///
+/// This proves the value round-trips from /complete → Submission's
+/// record_failure → terminal JSONB snapshot → /jobs/{id} response,
+/// complementing the unit tests in `server::complete::tests::suspicion_*`
+/// which cover the heuristic logic in isolation.
+#[sqlx::test]
+async fn suspected_worker_infra_fires_on_single_host_infra_burst(pool: PgPool) {
+    let handle = common::spawn_server_with_cfg(pool, |cfg| {
+        cfg.max_attempts = 1;
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+
+    let leaves: Vec<_> = (0..5)
+        .map(|i| drv_path(&format!("siw{i}"), &format!("siw{i}")))
+        .collect();
+    let drvs: Vec<_> = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, d)| ingest(d, &format!("siw{i}"), &[], true))
+        .collect();
+    client
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let sick_host = "sick-host-a";
+    for i in 0..5 {
+        let worker = if i < 4 { sick_host } else { "healthy-host" };
+        let c = client
+            .claim_as_worker(job.id, "x86_64-linux", &[], 3, Some(worker))
+            .await
+            .unwrap()
+            .expect("claim");
+        client
+            .complete(
+                job.id,
+                c.claim_id,
+                &CompleteRequest {
+                    success: false,
+                    duration_ms: 1,
+                    exit_code: Some(1),
+                    error_category: Some(ErrorCategory::DiskFull),
+                    error_message: Some(format!("siw{i}: disk full")),
+                    log_tail: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Wait for terminal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let s = client.status(job.id).await.unwrap();
+        if s.status.is_terminal() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("job never terminalized");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let terminal = client.status(job.id).await.unwrap();
+    assert_eq!(terminal.status, JobStatus::Failed);
+    assert_eq!(
+        terminal.suspected_worker_infra.as_deref(),
+        Some(sick_host),
+        "4-of-5 originating DiskFull from one host must flag that host; \
+         failures={:?}",
+        terminal.failures
+    );
+}
+
+/// Counter-test: 5 BuildFailure failures all from the same host
+/// must NOT flag suspected_worker_infra. BuildFailure is
+/// deterministic — the drv genuinely failed to compile — so
+/// attributing it to the worker would mislead the operator into
+/// chasing infra when the bug is in the build script.
+#[sqlx::test]
+async fn suspected_worker_infra_stays_none_for_buildfailure_cluster(pool: PgPool) {
+    let handle = common::spawn_server_with_cfg(pool, |cfg| {
+        cfg.max_attempts = 1;
+    })
+    .await;
+    let client = CoordinatorClient::new(&handle.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+
+    let leaves: Vec<_> = (0..5)
+        .map(|i| drv_path(&format!("bf{i}"), &format!("bf{i}")))
+        .collect();
+    let drvs: Vec<_> = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, d)| ingest(d, &format!("bf{i}"), &[], true))
+        .collect();
+    client
+        .ingest_batch(
+            job.id,
+            &IngestBatchRequest {
+                drvs,
+                eval_errors: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    for i in 0..5 {
+        let c = client
+            .claim_as_worker(job.id, "x86_64-linux", &[], 3, Some("host-a"))
+            .await
+            .unwrap()
+            .expect("claim");
+        client
+            .complete(
+                job.id,
+                c.claim_id,
+                &CompleteRequest {
+                    success: false,
+                    duration_ms: 1,
+                    exit_code: Some(1),
+                    error_category: Some(ErrorCategory::BuildFailure),
+                    error_message: Some(format!("bf{i}: builder failed")),
+                    log_tail: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let s = client.status(job.id).await.unwrap();
+        if s.status.is_terminal() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("job never terminalized");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let terminal = client.status(job.id).await.unwrap();
+    assert_eq!(terminal.status, JobStatus::Failed);
+    assert!(
+        terminal.suspected_worker_infra.is_none(),
+        "BuildFailure cluster must NOT flag a host; got {:?}",
+        terminal.suspected_worker_infra
+    );
+}

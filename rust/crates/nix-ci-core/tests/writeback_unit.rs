@@ -178,6 +178,7 @@ fn snapshot(id: JobId, status: JobStatus) -> JobStatusResponse {
         failures: vec![],
         eval_error: None,
         eval_errors: vec![],
+        suspected_worker_infra: None,
     }
 }
 

@@ -176,6 +176,10 @@ async fn auto_fail_on_seal(state: &AppState, id: JobId, reason: &str) -> Result<
         failures: Vec::new(),
         eval_error: Some(reason.to_string()),
         eval_errors,
+        // No originating failures on the seal-time auto-fail path
+        // (cycle at seal, no worker ever ran) — heuristic can't
+        // attribute anything.
+        suspected_worker_infra: None,
     };
     let _ = writeback::persist_terminal_snapshot_observed(
         &state.pool,
@@ -235,18 +239,28 @@ fn build_terminal_snapshot(
     status: JobStatus,
     eval_error: Option<String>,
 ) -> JobStatusResponse {
-    let (counts, failures, sealed, eval_errors) = match state.dispatcher.submissions.get(id) {
-        Some(sub) => (
-            sub.live_counts(),
-            crate::server::complete::cap_failures(
-                sub.failures.read().clone(),
-                state.cfg.max_failures_in_result,
-            ),
-            sub.is_sealed(),
-            sub.eval_errors.read().clone(),
-        ),
-        None => (JobCounts::default(), Vec::new(), false, Vec::new()),
-    };
+    // Heuristic is computed against the UNCAPPED failures list so
+    // truncation doesn't bias attribution. cap_failures is applied
+    // only to the serialized `failures` field for JSONB size bounds.
+    let (counts, failures, suspected_worker_infra, sealed, eval_errors) =
+        match state.dispatcher.submissions.get(id) {
+            Some(sub) => {
+                let full = sub.failures.read().clone();
+                let suspected = crate::server::complete::suspected_worker_infra(&full);
+                let capped = crate::server::complete::cap_failures(
+                    full,
+                    state.cfg.max_failures_in_result,
+                );
+                (
+                    sub.live_counts(),
+                    capped,
+                    suspected,
+                    sub.is_sealed(),
+                    sub.eval_errors.read().clone(),
+                )
+            }
+            None => (JobCounts::default(), Vec::new(), None, false, Vec::new()),
+        };
     JobStatusResponse {
         id,
         status,
@@ -255,6 +269,7 @@ fn build_terminal_snapshot(
         failures,
         eval_error,
         eval_errors,
+        suspected_worker_infra,
     }
 }
 
@@ -339,13 +354,15 @@ pub async fn status(
 /// Callers that want every failure can still get it at terminal time
 /// via `jobs.result` (written before any in-memory truncation).
 fn response_from_live(sub: &Arc<Submission>, max_failures: usize) -> JobStatusResponse {
-    let failures = {
+    // Take-then-clone keeps the read-lock scope tight. Compute the
+    // heuristic against the full failures list before truncating for
+    // the same reason as the terminal-snapshot path: truncation must
+    // not bias attribution.
+    let (failures, suspected_worker_infra) = {
         let guard = sub.failures.read();
-        // Take-then-clone keeps the read-lock scope tight. We
-        // deliberately don't add a "+1 truncation marker" entry here
-        // because the callers get the live counts (`counts.failed`)
-        // which already tells them the true count.
-        guard.iter().take(max_failures).cloned().collect()
+        let suspected = crate::server::complete::suspected_worker_infra(&guard);
+        let capped: Vec<_> = guard.iter().take(max_failures).cloned().collect();
+        (capped, suspected)
     };
     JobStatusResponse {
         id: sub.id,
@@ -355,6 +372,7 @@ fn response_from_live(sub: &Arc<Submission>, max_failures: usize) -> JobStatusRe
         failures,
         eval_error: None,
         eval_errors: sub.eval_errors.read().clone(),
+        suspected_worker_infra,
     }
 }
 

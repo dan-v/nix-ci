@@ -215,6 +215,7 @@ async fn handle_failure(
         error_message: req.error_message.clone(),
         log_tail: req.log_tail.clone(),
         propagated_from: None,
+        worker_id: claim.worker_id.clone(),
     };
     for sub in &subs {
         sub.record_failure(failure.clone());
@@ -432,6 +433,61 @@ fn compute_used_by_attrs(sub: &Arc<Submission>, s: &Arc<crate::dispatch::Step>) 
     hits
 }
 
+/// Minimum originating-failure count before the
+/// `suspected_worker_infra` heuristic even considers attributing the
+/// job's failures to one worker. 1-of-1 or 2-of-2 attribution is
+/// statistically meaningless — a single transient failure on a single
+/// host could happen to any worker. Three is the smallest sample where
+/// "majority from one worker" is plausible evidence.
+const MIN_FAILURES_FOR_INFRA_SUSPICION: usize = 3;
+
+/// Detect whether a job's originating failures look like one
+/// worker's infra problem rather than a genuine build issue. Returns
+/// `Some(worker_id)` when the signal is strong; `None` otherwise.
+///
+/// Contract:
+///   1. Only considers originating failures (propagated_from.is_none()).
+///      Propagated failures have no worker attribution and would
+///      dilute the signal.
+///   2. Only counts failures in {Transient, DiskFull} — the "infra-
+///      looking" categories. BuildFailure is deterministic: a drv
+///      that fails to compile is the user's problem, not the fleet's.
+///   3. Needs at least `MIN_FAILURES_FOR_INFRA_SUSPICION` failures.
+///   4. Requires > 50% from a single `worker_id`.
+///
+/// This is a hint, not ground truth. Operators triage by eyeballing
+/// the attributed worker; the signal is "look here first."
+pub(crate) fn suspected_worker_infra(failures: &[DrvFailure]) -> Option<String> {
+    let infra_origins: Vec<&DrvFailure> = failures
+        .iter()
+        .filter(|f| f.propagated_from.is_none())
+        .filter(|f| {
+            matches!(
+                f.error_category,
+                ErrorCategory::Transient | ErrorCategory::DiskFull
+            )
+        })
+        .filter(|f| f.worker_id.as_deref().is_some_and(|w| !w.is_empty()))
+        .collect();
+    if infra_origins.len() < MIN_FAILURES_FOR_INFRA_SUSPICION {
+        return None;
+    }
+    // Count by worker_id.
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &infra_origins {
+        let w = f.worker_id.as_deref().unwrap();
+        *counts.entry(w).or_default() += 1;
+    }
+    let (worker, n) = counts.iter().max_by_key(|(_, &n)| n)?;
+    // Strict majority — 50/50 ties are inconclusive ("maybe either
+    // host, maybe neither").
+    if *n * 2 > infra_origins.len() {
+        Some((*worker).to_string())
+    } else {
+        None
+    }
+}
+
 /// Upper bound on how many failures in a persisted terminal snapshot
 /// keep their full `log_tail`. Past this, `log_tail` is stripped to
 /// `None` before the snapshot is written to `jobs.result`.
@@ -474,6 +530,7 @@ pub(crate) fn cap_failures(mut all: Vec<DrvFailure>, cap: usize) -> Vec<DrvFailu
             )),
             log_tail: None,
             propagated_from: None,
+            worker_id: None,
         });
     }
     // Strip fat log_tails past the triage head. Propagated failures
@@ -525,6 +582,12 @@ pub(super) fn propagate_failure_inmem(root: &Arc<crate::dispatch::Step>, origin:
                 error_message: Some(format!("dep failed: {origin}")),
                 log_tail: None,
                 propagated_from: Some(origin.clone()),
+                // Propagated failures never ran on any worker — no
+                // attribution. The infra-suspicion heuristic
+                // deliberately excludes PropagatedFailure from its
+                // numerator so this field is unused there, but
+                // keeping it `None` is the honest shape.
+            worker_id: None,
             });
             // Per-submission count for the runner's progress display.
             sub.propagated_failed.fetch_add(1, Ordering::Relaxed);
@@ -598,6 +661,11 @@ pub(super) async fn check_and_publish_terminal(
 
     let counts = sub.live_counts();
     let failures_full = sub.failures.read().clone();
+    // Compute the heuristic against the FULL failures list (pre-cap),
+    // not the truncated snapshot: truncation drops the tail entries
+    // and could bias attribution if we computed against the capped
+    // view. `failures_full` preserves every originating failure.
+    let suspected_worker_infra = suspected_worker_infra(&failures_full);
     let failures = cap_failures(failures_full.clone(), state.cfg.max_failures_in_result);
     let snapshot = JobStatusResponse {
         id: sub.id,
@@ -607,6 +675,7 @@ pub(super) async fn check_and_publish_terminal(
         failures: failures.clone(),
         eval_error: None,
         eval_errors: eval_errors_snapshot,
+        suspected_worker_infra,
     };
     let _ = writeback::persist_terminal_snapshot_observed(
         &state.pool,
@@ -850,6 +919,7 @@ mod tests {
             error_message: Some(format!("{name} failed")),
             log_tail: tail.map(|s| s.to_string()),
             propagated_from: None,
+            worker_id: None,
         }
     }
 
@@ -967,5 +1037,161 @@ mod tests {
         for f in &out {
             assert!(f.log_tail.is_none());
         }
+    }
+
+    // ─── suspected_worker_infra heuristic ──────────────────────
+
+    fn transient_from(name: &str, worker: Option<&str>) -> DrvFailure {
+        DrvFailure {
+            drv_hash: crate::types::DrvHash::new(format!("{name}.drv")),
+            drv_name: name.to_string(),
+            error_category: ErrorCategory::Transient,
+            error_message: Some("transient".into()),
+            log_tail: None,
+            propagated_from: None,
+            worker_id: worker.map(|s| s.to_string()),
+        }
+    }
+
+    fn diskfull_from(name: &str, worker: Option<&str>) -> DrvFailure {
+        let mut f = transient_from(name, worker);
+        f.error_category = ErrorCategory::DiskFull;
+        f
+    }
+
+    fn buildfailure_from(name: &str, worker: Option<&str>) -> DrvFailure {
+        let mut f = transient_from(name, worker);
+        f.error_category = ErrorCategory::BuildFailure;
+        f
+    }
+
+    fn propagated(name: &str, origin: &str) -> DrvFailure {
+        DrvFailure {
+            drv_hash: crate::types::DrvHash::new(format!("{name}.drv")),
+            drv_name: name.to_string(),
+            error_category: ErrorCategory::PropagatedFailure,
+            error_message: Some(format!("dep {origin} failed")),
+            log_tail: None,
+            propagated_from: Some(crate::types::DrvHash::new(format!("{origin}.drv"))),
+            worker_id: None,
+        }
+    }
+
+    #[test]
+    fn suspicion_empty_is_none() {
+        assert!(suspected_worker_infra(&[]).is_none());
+    }
+
+    #[test]
+    fn suspicion_below_minimum_is_none() {
+        // Two failures from the same worker — all infra-looking, all
+        // attributed, but below `MIN_FAILURES_FOR_INFRA_SUSPICION`.
+        // Too sparse to call.
+        let fs = vec![
+            transient_from("a", Some("w1")),
+            transient_from("b", Some("w1")),
+        ];
+        assert!(suspected_worker_infra(&fs).is_none());
+    }
+
+    #[test]
+    fn suspicion_strict_majority_returns_worker() {
+        // 3 of 4 from w1 — strict majority > 50%.
+        let fs = vec![
+            transient_from("a", Some("w1")),
+            transient_from("b", Some("w1")),
+            transient_from("c", Some("w1")),
+            transient_from("d", Some("w2")),
+        ];
+        assert_eq!(suspected_worker_infra(&fs), Some("w1".to_string()));
+    }
+
+    #[test]
+    fn suspicion_exact_fifty_fifty_is_none() {
+        // 50/50 split — no majority. Returning either worker would be
+        // wrong; returning None is the honest answer.
+        let fs = vec![
+            transient_from("a", Some("w1")),
+            transient_from("b", Some("w1")),
+            transient_from("c", Some("w2")),
+            transient_from("d", Some("w2")),
+        ];
+        assert!(suspected_worker_infra(&fs).is_none());
+    }
+
+    #[test]
+    fn suspicion_excludes_buildfailure_from_denominator() {
+        // Three Transient from w1 — strong signal. Plus ten
+        // BuildFailures elsewhere. BuildFailure is a deterministic
+        // drv bug, not infra; excluded from both numerator and
+        // denominator. Expect Some("w1") — the w1 Transient cluster
+        // IS the infra signal.
+        let mut fs = vec![
+            transient_from("a", Some("w1")),
+            transient_from("b", Some("w1")),
+            transient_from("c", Some("w1")),
+        ];
+        for i in 0..10 {
+            fs.push(buildfailure_from(&format!("bad{i}"), Some("w2")));
+        }
+        assert_eq!(suspected_worker_infra(&fs), Some("w1".to_string()));
+    }
+
+    #[test]
+    fn suspicion_excludes_propagated_from_denominator() {
+        // 3 Transient from w1 (infra) + 20 propagated drvs (no
+        // worker attribution). Propagated must not dilute the signal.
+        let mut fs = vec![
+            transient_from("a", Some("w1")),
+            transient_from("b", Some("w1")),
+            transient_from("c", Some("w1")),
+        ];
+        for i in 0..20 {
+            fs.push(propagated(&format!("p{i}"), "a"));
+        }
+        assert_eq!(suspected_worker_infra(&fs), Some("w1".to_string()));
+    }
+
+    #[test]
+    fn suspicion_mixed_categories_from_same_worker_counts() {
+        // Transient + DiskFull both infra-looking; both count in
+        // numerator.
+        let fs = vec![
+            transient_from("a", Some("w1")),
+            diskfull_from("b", Some("w1")),
+            transient_from("c", Some("w1")),
+        ];
+        assert_eq!(suspected_worker_infra(&fs), Some("w1".to_string()));
+    }
+
+    #[test]
+    fn suspicion_missing_worker_id_excluded_from_consideration() {
+        // 3 failures, all from w1 in terms of intent — but one has
+        // no worker_id attribution. The attribution check requires
+        // `worker_id.is_some() && !is_empty()` so the anonymous
+        // failure drops out of the numerator entirely. Without it we
+        // have 2 attributed failures, below the minimum.
+        let fs = vec![
+            transient_from("a", Some("w1")),
+            transient_from("b", Some("w1")),
+            transient_from("c", None),
+        ];
+        assert!(suspected_worker_infra(&fs).is_none());
+    }
+
+    #[test]
+    fn suspicion_empty_worker_id_is_excluded() {
+        // An empty-string worker_id (degraded client) must not
+        // silently win the majority — it's the "I have no identity"
+        // bucket, which is distinct from "w1".
+        let fs = vec![
+            transient_from("a", Some("")),
+            transient_from("b", Some("")),
+            transient_from("c", Some("")),
+        ];
+        assert!(
+            suspected_worker_infra(&fs).is_none(),
+            "empty worker_id must not be attributable"
+        );
     }
 }

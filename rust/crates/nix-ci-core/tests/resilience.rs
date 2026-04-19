@@ -1428,6 +1428,19 @@ async fn rolling_upgrade_preserves_terminal_rows(pool: PgPool) {
     assert_eq!(body["id"], job.id.0.to_string());
     assert_eq!(body["status"], "done");
 
+    // Proof that suspected_worker_infra round-trips through the
+    // JSONB on the operator's lookup path — even with no infra
+    // attribution (healthy run), the field must be present as
+    // `null` in the persisted snapshot so older clients don't
+    // deserialize-fail. `#[serde(default)]` gives us that for
+    // free; this is a guard against a future PR that removes the
+    // default.
+    assert!(
+        snap_direct.suspected_worker_infra.is_none(),
+        "healthy job must have no infra suspicion: {:?}",
+        snap_direct.suspected_worker_infra
+    );
+
     // ─── Phase 6: new job creation works on the restarted coord ─
     let new_job = client2
         .create_job(&CreateJobRequest {
