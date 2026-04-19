@@ -622,10 +622,214 @@ async fn cleanup_sweep_emits_log_metrics(pool: PgPool) {
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let store: Arc<dyn LogStore> = Arc::new(PgLogStore::new(pool.clone()));
     let metrics = nix_ci_core::observability::metrics::Metrics::new();
-    nix_ci_core::durable::cleanup::sweep(&pool, 7, 14, store.as_ref(), &metrics)
+    nix_ci_core::durable::cleanup::sweep(&pool, 7, 14, None, store.as_ref(), &metrics)
         .await
         .unwrap();
     let body = metrics.render();
     assert!(body.contains("nix_ci_build_logs_bytes_total"));
     assert!(body.contains("nix_ci_build_logs_rows_total"));
+}
+
+// ─── Byte-ceiling prune ───────────────────────────────────────────
+
+/// Helper: insert a build_logs row with a blob of the given size and a
+/// specific stored_at so ordering is deterministic. The `content` field
+/// in the gz column isn't required to be real gzip — `prune_to_byte_ceiling`
+/// only measures `octet_length(log_gz)`.
+async fn insert_log_row_with_blob(
+    pool: &PgPool,
+    job_id: nix_ci_core::types::JobId,
+    claim_id: ClaimId,
+    drv_hash: &DrvHash,
+    attempt: i32,
+    stored_at: chrono::DateTime<Utc>,
+    blob_bytes: usize,
+) {
+    let blob: Vec<u8> = vec![b'x'; blob_bytes];
+    sqlx::query(
+        r#"
+        INSERT INTO build_logs (
+            claim_id, job_id, drv_hash, attempt, success, exit_code,
+            started_at, ended_at, original_size, truncated, log_gz, stored_at
+        )
+        VALUES ($1, $2, $3, $4, FALSE, 1, now(), now(), $5, FALSE, $6, $7)
+        "#,
+    )
+    .bind(claim_id.0)
+    .bind(job_id.0)
+    .bind(drv_hash.as_str())
+    .bind(attempt)
+    .bind(blob_bytes as i32)
+    .bind(blob)
+    .bind(stored_at)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Table under cap: prune_to_byte_ceiling is a no-op and returns 0.
+/// Guards against a bug where the function always runs the expensive
+/// DELETE even on healthy systems.
+#[sqlx::test]
+async fn prune_to_byte_ceiling_under_cap_is_noop(pool: PgPool) {
+    let h = spawn_server(pool.clone()).await;
+    let store = PgLogStore::new(pool.clone());
+    let job = nix_ci_core::client::CoordinatorClient::new(&h.base_url)
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+
+    let drv_hash = DrvHash::new("test".to_string());
+    insert_log_row_with_blob(
+        &pool,
+        job.id,
+        ClaimId::new(),
+        &drv_hash,
+        1,
+        Utc::now(),
+        1024,
+    )
+    .await;
+
+    // Cap comfortably larger than the single 1 KiB row.
+    let pruned = store.prune_to_byte_ceiling(100 * 1024).await.unwrap();
+    assert_eq!(pruned, 0, "cap not exceeded, nothing must be pruned");
+    // Row still there.
+    let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM build_logs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.0, 1);
+}
+
+/// Table over cap: oldest rows pruned until under. Prune is measured
+/// on `octet_length(log_gz)`, not `pg_total_relation_size`, so the cap
+/// can be asserted tightly without waiting for autovacuum.
+#[sqlx::test]
+async fn prune_to_byte_ceiling_over_cap_drops_oldest(pool: PgPool) {
+    let h = spawn_server(pool.clone()).await;
+    let store = PgLogStore::new(pool.clone());
+    let job = nix_ci_core::client::CoordinatorClient::new(&h.base_url)
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let drv_hash = DrvHash::new("test".to_string());
+
+    // Three rows of 2 KiB each, stored_at spaced 1h apart. Total 6 KiB.
+    let base = Utc::now() - chrono::Duration::hours(3);
+    let c1 = ClaimId::new();
+    let c2 = ClaimId::new();
+    let c3 = ClaimId::new();
+    for (cid, offset) in [(c1, 0), (c2, 1), (c3, 2)] {
+        insert_log_row_with_blob(
+            &pool,
+            job.id,
+            cid,
+            &drv_hash,
+            1,
+            base + chrono::Duration::hours(offset),
+            2048,
+        )
+        .await;
+    }
+
+    // Cap at 3 KiB — only the newest row's 2 KiB fits; the other two
+    // must be pruned.
+    let pruned = store.prune_to_byte_ceiling(3 * 1024).await.unwrap();
+    assert_eq!(pruned, 2, "two oldest rows must be pruned");
+
+    // Surviving row is the newest (c3).
+    let surviving: Vec<(sqlx::types::Uuid,)> =
+        sqlx::query_as("SELECT claim_id FROM build_logs ORDER BY stored_at DESC")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(surviving.len(), 1);
+    assert_eq!(surviving[0].0, c3.0, "newest row must survive");
+
+    // Sanity: post-prune byte sum is under the cap.
+    let sum: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT COALESCE(sum(octet_length(log_gz)), 0) FROM build_logs")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    let total: i64 = sum.and_then(|(v,)| v).unwrap_or(0);
+    assert!(
+        total <= 3 * 1024,
+        "post-prune sum {total} must be <= cap 3072"
+    );
+}
+
+/// End-to-end through cleanup::sweep with max_build_logs_bytes set:
+/// the cap kicks in after time-based retention runs, the counter
+/// metric ticks for pruned rows, and the surviving set is the
+/// newest-first ordering. Guards against a future refactor that
+/// forgets to wire max_build_logs_bytes into the sweep call.
+#[sqlx::test]
+async fn cleanup_sweep_enforces_max_build_logs_bytes(pool: PgPool) {
+    let h = spawn_server(pool.clone()).await;
+    let store: Arc<dyn LogStore> = Arc::new(PgLogStore::new(pool.clone()));
+    let metrics = nix_ci_core::observability::metrics::Metrics::new();
+
+    let job = nix_ci_core::client::CoordinatorClient::new(&h.base_url)
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let drv_hash = DrvHash::new("test".to_string());
+
+    // Five rows of 1 KiB, within the time retention window.
+    let base = Utc::now() - chrono::Duration::hours(1);
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let cid = ClaimId::new();
+        ids.push(cid);
+        insert_log_row_with_blob(
+            &pool,
+            job.id,
+            cid,
+            &drv_hash,
+            1,
+            base + chrono::Duration::minutes(i as i64),
+            1024,
+        )
+        .await;
+    }
+
+    // Cap at 2 KiB — 3 rows must be pruned.
+    nix_ci_core::durable::cleanup::sweep(
+        &pool,
+        7,
+        14,
+        Some(2 * 1024),
+        store.as_ref(),
+        &metrics,
+    )
+    .await
+    .unwrap();
+
+    // Exactly 2 newest rows remain.
+    let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM build_logs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.0, 2, "cap should prune 3 of 5 rows");
+
+    // Counter exposes how many we pruned — operators alert on this
+    // as "some job emitted fatter logs than expected."
+    let rendered = metrics.render();
+    assert!(
+        rendered.contains("nix_ci_build_logs_byte_ceiling_prunes_total 3"),
+        "byte-ceiling prune counter must reflect the 3 pruned rows; got:\n{rendered}"
+    );
+
+    // Sweep with NO cap must not touch surviving rows (positive case:
+    // None disables the guard).
+    nix_ci_core::durable::cleanup::sweep(&pool, 7, 14, None, store.as_ref(), &metrics)
+        .await
+        .unwrap();
+    let rows_after_noop: (i64,) = sqlx::query_as("SELECT count(*) FROM build_logs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows_after_noop.0, 2, "no cap = no pruning");
 }

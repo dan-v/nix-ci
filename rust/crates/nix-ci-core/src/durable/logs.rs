@@ -89,6 +89,15 @@ pub trait LogStore: Send + Sync + 'static {
     /// deleted. Used by the cleanup loop.
     async fn prune_older_than(&self, older_than: DateTime<Utc>) -> Result<u64>;
 
+    /// Byte-based pruning. If `sum(data-bytes-of-stored-blobs)` exceeds
+    /// `max_bytes`, delete oldest rows until the sum drops back under
+    /// the cap. Returns the number of rows deleted. Used by the cleanup
+    /// loop's disk guard. Implementations MUST measure against their
+    /// own data-bytes metric (not `pg_total_relation_size` for the PG
+    /// backend — that can't drop without autovacuum, so pruning
+    /// decisions against it never converge).
+    async fn prune_to_byte_ceiling(&self, max_bytes: u64) -> Result<u64>;
+
     /// Best-effort byte-size of the table (for the
     /// `nix_ci_build_logs_bytes_total` gauge). Implementations that
     /// can't answer cheaply may return `None`.
@@ -237,6 +246,57 @@ impl LogStore for PgLogStore {
         Ok(r.rows_affected())
     }
 
+    async fn prune_to_byte_ceiling(&self, max_bytes: u64) -> Result<u64> {
+        // Measure data bytes via octet_length(log_gz). This is the
+        // data-only sum; unlike pg_total_relation_size it drops
+        // immediately on DELETE without needing autovacuum, so a cap
+        // decision made against it converges in a single cleanup tick.
+        //
+        // Fast check first — on every tick this is the common path
+        // (we're under the cap). Avoids the expensive CTE below.
+        let sum_row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT COALESCE(sum(octet_length(log_gz))::bigint, 0) FROM build_logs")
+                .fetch_optional(&self.pool)
+                .await?;
+        let current: i64 = sum_row.and_then(|(v,)| v).unwrap_or(0);
+        if current <= 0 {
+            return Ok(0);
+        }
+        // `max_bytes` fits in i64 for the foreseeable future (≤ 8 EiB).
+        // Compare in i64 to avoid signed/unsigned churn; overflow is
+        // trivially avoided — if `max_bytes > i64::MAX` the cast
+        // saturates at i64::MAX and we simply never prune, which is
+        // the right behavior (cap is effectively off).
+        let cap: i64 = max_bytes.min(i64::MAX as u64) as i64;
+        if current <= cap {
+            return Ok(0);
+        }
+
+        // Over the cap. Keep the newest rows whose cumulative size fits
+        // under `cap`; delete the rest. Single pass via a window
+        // function — two-stage CTE so `DELETE` can reference the keep
+        // set without scanning the whole table twice.
+        let r = sqlx::query(
+            r#"
+            WITH ranked AS (
+                SELECT claim_id,
+                       SUM(octet_length(log_gz))
+                         OVER (ORDER BY stored_at DESC, claim_id DESC) AS running_bytes
+                FROM build_logs
+            ),
+            keep AS (
+                SELECT claim_id FROM ranked WHERE running_bytes <= $1
+            )
+            DELETE FROM build_logs
+            WHERE claim_id NOT IN (SELECT claim_id FROM keep)
+            "#,
+        )
+        .bind(cap)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
     async fn total_bytes(&self) -> Result<Option<u64>> {
         // pg_total_relation_size includes TOAST + indexes, which is
         // what we actually care about for "how much disk does this
@@ -287,6 +347,9 @@ mod tests {
             Ok(Vec::new())
         }
         async fn prune_older_than(&self, _older_than: DateTime<Utc>) -> Result<u64> {
+            Ok(0)
+        }
+        async fn prune_to_byte_ceiling(&self, _max_bytes: u64) -> Result<u64> {
             Ok(0)
         }
         async fn total_bytes(&self) -> Result<Option<u64>> {

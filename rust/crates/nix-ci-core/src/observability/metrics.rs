@@ -166,6 +166,13 @@ pub struct MetricsInner {
     /// this > 0 as a PG-availability signal, not a bug — the retry is
     /// the fix.
     pub terminal_writeback_retry_finalized: Counter,
+    /// Rows pruned by the build_logs byte-ceiling guard. Non-zero
+    /// means we're pruning under the `max_build_logs_bytes` cap
+    /// before the time-based retention cutoff would have — i.e.
+    /// some job emitted fatter logs than expected. Counts per row,
+    /// not per tick, so a single over-cap burst shows up as a
+    /// proportional spike.
+    pub build_logs_byte_ceiling_prunes: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -501,6 +508,12 @@ impl Metrics {
             "Submissions finalized by the periodic terminal-writeback retry sweep (recovered from a prior failed terminal write).",
             terminal_writeback_retry_finalized.clone(),
         );
+        let build_logs_byte_ceiling_prunes = Counter::default();
+        registry.register(
+            "nix_ci_build_logs_byte_ceiling_prunes",
+            "Rows pruned by the build_logs byte-ceiling guard (max_build_logs_bytes).",
+            build_logs_byte_ceiling_prunes.clone(),
+        );
 
         // Process-global panic counter. Cloned into the per-instance
         // registry so `/metrics` surfaces any panic in this process,
@@ -552,6 +565,7 @@ impl Metrics {
                 worker_auto_quarantined,
                 claims_hard_ceiling_reaped,
                 terminal_writeback_retry_finalized,
+                build_logs_byte_ceiling_prunes,
             }),
         }
     }

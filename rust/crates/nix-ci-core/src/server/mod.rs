@@ -73,6 +73,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         Duration::from_secs(cfg.cleanup_interval_secs),
         cfg.retention_days,
         cfg.build_log_retention_days,
+        cfg.max_build_logs_bytes,
         log_store.clone(),
         metrics.clone(),
         shutdown_rx.clone(),

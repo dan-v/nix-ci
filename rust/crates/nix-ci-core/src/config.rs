@@ -87,6 +87,19 @@ pub struct ServerConfig {
     /// the fattest bytes per row — typically you want shorter log
     /// retention than job-metadata retention.
     pub build_log_retention_days: u32,
+    /// Soft byte ceiling on total `build_logs` size. On each cleanup
+    /// tick, if `sum(octet_length(log_gz))` exceeds this, the oldest
+    /// rows are pruned until the sum is back under the cap. Uses
+    /// `octet_length` (untoasted data bytes) rather than
+    /// `pg_total_relation_size` so pruning decisions are deterministic
+    /// without waiting for autovacuum. Set to `None` to disable the
+    /// byte cap entirely (time-based retention still applies).
+    ///
+    /// Default: 50 GiB. At typical ~500 KiB compressed per failure,
+    /// that's ~100k failed-build logs — comfortably above any
+    /// realistic retention horizon, but protects the disk from a
+    /// pathological verbose-logger run.
+    pub max_build_logs_bytes: Option<u64>,
     /// Soft warning threshold for per-submission member count. When a
     /// live submission's member count crosses this, the dispatcher
     /// emits a `WARN` log line so an operator can spot a runaway job
@@ -251,6 +264,10 @@ impl Default for ServerConfig {
             max_failures_in_result: 500,
             graceful_shutdown_secs: 60,
             build_log_retention_days: 7,
+            // 50 GiB. A ~500 KiB avg compressed per failed-build log
+            // puts this at ~100k failures' worth — well above any
+            // realistic retention horizon but a hard disk guard.
+            max_build_logs_bytes: Some(50 * 1024 * 1024 * 1024),
             submission_warn_threshold: 200_000,
             max_drvs_per_job: Some(2_000_000),
             failed_outputs_ttl_secs: 60 * 60, // 1h
@@ -446,6 +463,13 @@ impl ServerConfig {
                     "max_claim_lifetime_secs ({m}) must be >= claim_deadline_secs ({}) — otherwise the ceiling fires before the first lease extension",
                     self.claim_deadline_secs
                 ));
+            }
+        }
+        if let Some(b) = self.max_build_logs_bytes {
+            if b == 0 {
+                errors.push(
+                    "max_build_logs_bytes, when set, must be > 0 (use null to disable)".into(),
+                );
             }
         }
 

@@ -11,11 +11,13 @@ use crate::durable::logs::LogStore;
 use crate::error::Result;
 use crate::observability::metrics::Metrics;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     pool: PgPool,
     tick: Duration,
     retention_days: u32,
     build_log_retention_days: u32,
+    max_build_logs_bytes: Option<u64>,
     log_store: Arc<dyn LogStore>,
     metrics: Metrics,
     mut shutdown: watch::Receiver<bool>,
@@ -35,6 +37,7 @@ pub async fn run(
             &pool,
             retention_days,
             build_log_retention_days,
+            max_build_logs_bytes,
             log_store.as_ref(),
             &metrics,
         )
@@ -52,6 +55,7 @@ pub async fn sweep(
     pool: &PgPool,
     retention_days: u32,
     build_log_retention_days: u32,
+    max_build_logs_bytes: Option<u64>,
     log_store: &dyn LogStore,
     metrics: &Metrics,
 ) -> Result<()> {
@@ -85,6 +89,27 @@ pub async fn sweep(
     let pruned = log_store.prune_older_than(cutoff).await?;
     if pruned > 0 {
         tracing::info!(n = pruned, "pruned old build logs");
+    }
+
+    // Disk-guard: if the total-bytes ceiling is configured and we're
+    // over it, drop oldest rows until under. Runs AFTER time-based
+    // retention so a healthy system (well under the ceiling) pays
+    // only the cheap size query in `prune_to_byte_ceiling`. A
+    // runaway verbose-logger burst that blows through the time
+    // retention is caught here before the disk fills.
+    if let Some(cap) = max_build_logs_bytes {
+        let byte_pruned = log_store.prune_to_byte_ceiling(cap).await?;
+        if byte_pruned > 0 {
+            tracing::warn!(
+                n = byte_pruned,
+                cap_bytes = cap,
+                "pruned oldest build logs to stay under max_build_logs_bytes"
+            );
+            metrics
+                .inner
+                .build_logs_byte_ceiling_prunes
+                .inc_by(byte_pruned);
+        }
     }
 
     // Refresh capacity gauges. Cheap (planner stats + pg_total_relation_size).
