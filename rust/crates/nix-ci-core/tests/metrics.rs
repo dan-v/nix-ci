@@ -254,3 +254,86 @@ async fn admin_snapshot_counts_scale_linearly_with_members(pool: PgPool) {
     assert_eq!(status.counts.done, 2);
     assert_eq!(status.counts.pending, 3);
 }
+
+/// Every terminal-writing handler (/fail, /cancel, auto_fail_on_seal,
+/// auto_fail_oversized, /complete's last-drv path) must route its PG
+/// UPDATE through `timed_acquire` so `pg_pool_acquire_duration_seconds`
+/// reflects real pool pressure on those paths. Before this fix, only
+/// the /complete path observed the histogram — pool starvation on
+/// /fail or /cancel was silent to the operator dashboard that alerts
+/// on rising pool-acquire p99.
+///
+/// We exercise /fail as the simplest of the fixed paths and assert the
+/// histogram's `_count` grew by at least one. The `scrape_metric`
+/// helper accepts the full OpenMetrics `_count` suffix directly.
+#[sqlx::test]
+async fn fail_observes_pg_pool_acquire_duration_histogram(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    let before = common::scrape_metric(
+        &handle.base_url,
+        "nix_ci_pg_pool_acquire_duration_seconds_count",
+        &[],
+    )
+    .await
+    .unwrap_or(0.0);
+
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{}/jobs/{}/fail", handle.base_url, job.id))
+        .json(&serde_json::json!({"message": "observed"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "fail endpoint must succeed");
+
+    let after = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_pg_pool_acquire_duration_seconds_count",
+        &[],
+    )
+    .await;
+    assert!(
+        after >= before + 1.0,
+        "expected at least one new pg_pool_acquire observation on /fail; \
+         before={before}, after={after}"
+    );
+}
+
+/// Same property for /cancel.
+#[sqlx::test]
+async fn cancel_observes_pg_pool_acquire_duration_histogram(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    let before = common::scrape_metric(
+        &handle.base_url,
+        "nix_ci_pg_pool_acquire_duration_seconds_count",
+        &[],
+    )
+    .await
+    .unwrap_or(0.0);
+
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    client.cancel(job.id).await.unwrap();
+
+    let after = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_pg_pool_acquire_duration_seconds_count",
+        &[],
+    )
+    .await;
+    assert!(
+        after >= before + 1.0,
+        "expected at least one new pg_pool_acquire observation on /cancel; \
+         before={before}, after={after}"
+    );
+}

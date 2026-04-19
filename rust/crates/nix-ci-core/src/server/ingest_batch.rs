@@ -485,7 +485,13 @@ async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Resul
     // Terminal write is idempotent (done_at IS NULL guard). If the job
     // was already forced terminal by a concurrent oversized batch, we
     // still return PayloadTooLarge to the caller — same outcome.
-    let _ = writeback::persist_terminal_snapshot(&state.pool, id, &snapshot).await?;
+    let _ = writeback::persist_terminal_snapshot_observed(
+        &state.pool,
+        &state.metrics,
+        id,
+        &snapshot,
+    )
+    .await?;
 
     if let Some(sub) = state.dispatcher.submissions.remove(id) {
         // Mirror of the sibling terminal paths in `jobs::finish_in_memory`
