@@ -4,6 +4,68 @@ Items identified during the review pass on branch `v3` that were
 deliberately **not** taken in that pass. Each has `what / why / scope /
 risk` so a future PR can decide whether to pick it up.
 
+## Status markers
+
+- **ADDRESSED** — landed; linked to the relevant commit/test.
+- **DEFERRED** — intentionally not taken; rationale below.
+- **OPEN** — still a candidate; not yet evaluated.
+
+## Addressed by the production-readiness pass (April 2026)
+
+See [CHANGELOG](./CHANGELOG.md) for the full list; the audit-flagged
+items closed in that pass:
+
+- **ADDRESSED: Overload shedding + auto-quarantine off by default.**
+  Both now default to operationally-tuned values; explicit `null`
+  preserves the opt-out. Commit `04a3a37`.
+- **ADDRESSED: No cap on `build_logs` byte growth.** New
+  `max_build_logs_bytes` (default 50 GiB) + byte-ceiling pruning
+  in the cleanup loop. Commit `0c0ebb0`.
+- **ADDRESSED: No per-job log attribution.** New
+  `build_log_bytes_per_job` histogram + per-submission warn
+  threshold. Commit `73c62f2`.
+- **ADDRESSED: `/readyz` didn't reflect dispatcher health.** Now
+  returns 503 on drain + overload. Commit `3e3324a`.
+- **ADDRESSED: `evict_claims_for` O(total claims).** Secondary
+  `by_job` index makes it O(claims-for-that-job); SSE progress
+  tick benefits too. Commit `f3808c2`.
+- **ADDRESSED: `failed_outputs` had no worker attribution.** New
+  `worker_id` column + `/admin/refute?worker_id=X`. Commit `713815e`.
+- **ADDRESSED: Per-job user couldn't tell infra from code.** New
+  `JobStatusResponse.suspected_worker_infra` heuristic. Commit `6c67b6c`.
+- **ADDRESSED: No HA failover test.** Three-layer coverage —
+  in-process SSE failure contract, nixosTest, orbstack real-TCP
+  + SIGKILL. Commits `8c64b61`, `4d32dac`, `9e75a9b`.
+- **ADDRESSED: No HA deployment docs.** See
+  [`docs/deployment-ha.md`](../docs/deployment-ha.md). Commit `9b635c1`.
+- **ADDRESSED: Drain didn't reject new ingest on existing jobs.**
+  Commit `5140411`.
+- **ADDRESSED: `auto_fail_*` paths bypassed pool-acquire
+  histogram.** All four now use `_observed`. Commit `27d9f83`.
+- **ADDRESSED: `cap_failures` didn't strip `log_tail`.** Past
+  first 10 entries, `log_tail` is `None`. Commit `0d6e4cf`.
+- **ADDRESSED: Axum graceful drain unbounded.** Wrapped in
+  `tokio::time::timeout(graceful_shutdown_secs, ..)` with
+  abort_handle. Default bumped 30s → 60s. Commit `78e04a2`.
+- **ADDRESSED: Terminal-write wedge on PG outage.** Periodic
+  retry sweep on `reaper_interval_secs`. Commit `2a50c9c`.
+- **ADDRESSED: Claim loop didn't re-check draining after wake.**
+  Commit `ea6600e`.
+- **ADDRESSED: No rolling-upgrade test.** New
+  `rolling_upgrade_preserves_terminal_rows` in resilience.rs +
+  wired into `spec_report.sh` as `P-UPGRADE-SAFE`. Commit `88233f2`.
+- **ADDRESSED: No runner-SSE-across-restart test.** Two new tests
+  in resilience.rs codifying the fail-loud-in-bounded-time
+  contract. Commit `8c64b61`.
+- **ADDRESSED: No ingest fuzz.** 100-batch randomized test with
+  mixed valid+malformed inputs. Commit `ece9331`.
+- **ADDRESSED: No shadow-mode tooling.** `nix-ci-compare` CLI
+  + `docs/shadow-mode.md`. Commit `0d0829c`.
+
+## Still open / deferred
+
+
+
 ## F-0. Simplification pass (April 2026) — deferred items
 
 A ruthless-simplification pass ran over the tree and produced the

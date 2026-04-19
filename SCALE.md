@@ -170,11 +170,16 @@ pass/fail plus a snapshot of `/metrics`. See
 ### L5 — production shadow + canary (external)
 
 * **Shadow**: tee a slice of real CCI traffic into a staging coordinator;
-  compare outcomes (ground truth = existing CCI path).
+  compare outcomes (ground truth = existing CCI path). See
+  [`docs/shadow-mode.md`](docs/shadow-mode.md) for the pattern and the
+  `nix-ci-compare` CLI that produces divergence reports.
 * **Canary**: 1 % → 10 % → 50 % → 100 %, with automated rollback on
   SLO breach (claim p99, completion rate, 5xx rate).
 * Prometheus alerts align with SPEC bars (claim-p99 > 200ms for 5min,
   pg_pool_idle=0 for 30s+, RSS growth rate, `overload_rejections`).
+* HA deployment (primary/standby via `pg_advisory_lock`): see
+  [`docs/deployment-ha.md`](docs/deployment-ha.md). Failover measured
+  at ~1 second in `scripts/orbstack_harness/ha-failover.sh`.
 
 ## Degradation contract
 
