@@ -35,3 +35,7 @@ path = "src/bin/mock_worker.rs"
 [[bin]]
 name = "nix-ci-harness-driver"
 path = "src/bin/driver.rs"
+
+[[bin]]
+name = "nix-ci-compare"
+path = "src/bin/compare.rs"

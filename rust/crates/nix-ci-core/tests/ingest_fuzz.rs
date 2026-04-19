@@ -73,7 +73,8 @@ fn random_drv(rng: &mut StdRng, idx: usize, max_deps: usize) -> IngestDrvRequest
     // (so the coordinator auto-creates placeholder steps). Most are
     // 0-2 deps; occasionally 5-10 to exercise fan-in.
     let n_deps = if rng.gen_bool(0.1) {
-        rng.gen_range(5..=max_deps.min(10).max(5))
+        let hi = max_deps.clamp(5, 10);
+        rng.gen_range(5..=hi)
     } else {
         rng.gen_range(0..=2)
     };
@@ -117,7 +118,7 @@ fn random_invalid_drv(rng: &mut StdRng, idx: usize) -> IngestDrvRequest {
         1 => d.drv_name = String::new(),           // empty name
         2 => d.system = String::new(),             // empty system
         3 => d.drv_path = "no-slash-no-drv".into(), // unparseable path
-        4 => d.drv_path = format!("/nix/store/no-hyphen.drv"),
+        4 => d.drv_path = "/nix/store/no-hyphen.drv".to_string(),
         5 => {
             // input_drvs wildly oversized (above `max_input_drvs_per_drv`).
             d.input_drvs = (0..5000)
