@@ -43,9 +43,15 @@ async fn refute_by_output_path_deletes_entry(pool: PgPool) {
     // Seed: insert a failed output directly via the durable layer.
     let drv_hash = DrvHash::new("drvhash-1");
     let output = "/nix/store/abc-hello".to_string();
-    writeback::insert_failed_outputs(&pool, &drv_hash, std::slice::from_ref(&output), 3600)
-        .await
-        .unwrap();
+    writeback::insert_failed_outputs(
+        &pool,
+        &drv_hash,
+        std::slice::from_ref(&output),
+        3600,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Sanity: it's present.
     let hits = writeback::failed_output_hits(&pool, &[output.as_str()]).await;
@@ -78,7 +84,7 @@ async fn refute_by_drv_hash_removes_all_output_paths(pool: PgPool) {
         "/nix/store/p1-out".to_string(),
         "/nix/store/p2-dev".to_string(),
     ];
-    writeback::insert_failed_outputs(&pool, &drv_hash, &outs, 3600)
+    writeback::insert_failed_outputs(&pool, &drv_hash, &outs, 3600, None)
         .await
         .unwrap();
 
@@ -130,6 +136,125 @@ async fn refute_for_unknown_entry_is_idempotent(pool: PgPool) {
     .await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body["rows_affected"].as_u64(), Some(0));
+}
+
+#[sqlx::test]
+async fn refute_by_worker_id_bulk_deletes_that_workers_entries(pool: PgPool) {
+    // Operator story: host `sick-host-a` returned a burst of false
+    // BuildFailures that poisoned the cache. Rather than refute each
+    // drv_hash / output_path individually, operator refutes by
+    // worker_id → every row that worker owns is cleared in one call.
+    // Rows from other workers MUST survive.
+    let handle = spawn_server(pool.clone()).await;
+
+    let drv_a = DrvHash::new("a-drv");
+    let drv_b = DrvHash::new("b-drv");
+    let drv_c = DrvHash::new("c-drv");
+
+    // Two rows from the suspected-sick worker, one from a healthy one,
+    // one with no worker attribution (legacy / pre-migration shape).
+    writeback::insert_failed_outputs(
+        &pool,
+        &drv_a,
+        &["/nix/store/a-out".to_string()],
+        3600,
+        Some("sick-host-a"),
+    )
+    .await
+    .unwrap();
+    writeback::insert_failed_outputs(
+        &pool,
+        &drv_b,
+        &["/nix/store/b-out".to_string()],
+        3600,
+        Some("sick-host-a"),
+    )
+    .await
+    .unwrap();
+    writeback::insert_failed_outputs(
+        &pool,
+        &drv_c,
+        &["/nix/store/c-out".to_string()],
+        3600,
+        Some("healthy-host-z"),
+    )
+    .await
+    .unwrap();
+    writeback::insert_failed_outputs(
+        &pool,
+        &DrvHash::new("legacy-drv"),
+        &["/nix/store/legacy-out".to_string()],
+        3600,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Refute by worker_id=sick-host-a.
+    let url = format!("{}/admin/refute", handle.base_url);
+    let (status, body) = post_json(
+        &url,
+        serde_json::json!({
+            "worker_id": "sick-host-a",
+        }),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["rows_affected"].as_u64(),
+        Some(2),
+        "exactly two sick-host-a rows must be deleted"
+    );
+
+    // The sick worker's entries are gone; the other two survive.
+    let all: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT output_path, worker_id FROM failed_outputs ORDER BY output_path")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let paths: Vec<&str> = all.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["/nix/store/c-out", "/nix/store/legacy-out"],
+        "only the non-sick rows must remain: got {all:?}"
+    );
+    // Legacy (NULL worker_id) row survives — refute by worker_id must
+    // NOT touch unattributed rows.
+    let legacy = all
+        .iter()
+        .find(|(p, _)| p == "/nix/store/legacy-out")
+        .expect("legacy row must survive");
+    assert!(
+        legacy.1.is_none(),
+        "legacy row's worker_id stays NULL: {legacy:?}"
+    );
+}
+
+/// insert_failed_outputs must actually persist the worker_id column
+/// for new rows. Guard against a future refactor dropping the bind.
+#[sqlx::test]
+async fn insert_failed_outputs_persists_worker_id_column(pool: PgPool) {
+    let _handle = spawn_server(pool.clone()).await;
+    let drv = DrvHash::new("persist-worker-id");
+    let path = "/nix/store/persist-worker-out".to_string();
+    writeback::insert_failed_outputs(
+        &pool,
+        &drv,
+        std::slice::from_ref(&path),
+        3600,
+        Some("worker-xyz"),
+    )
+    .await
+    .unwrap();
+
+    let row: (Option<String>,) = sqlx::query_as(
+        "SELECT worker_id FROM failed_outputs WHERE output_path = $1",
+    )
+    .bind(&path)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0.as_deref(), Some("worker-xyz"));
 }
 
 #[sqlx::test]

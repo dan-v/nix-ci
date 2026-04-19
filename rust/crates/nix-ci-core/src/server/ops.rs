@@ -465,10 +465,23 @@ pub async fn admin_refute(
             )));
         }
     }
-    if req.output_paths.is_empty() && req.drv_hash.is_none() {
+    if req.output_paths.is_empty() && req.drv_hash.is_none() && req.worker_id.is_none() {
         return Err(crate::Error::BadRequest(
-            "specify at least one of: drv_hash, output_paths".into(),
+            "specify at least one of: drv_hash, output_paths, worker_id".into(),
         ));
+    }
+    if let Some(w) = req.worker_id.as_deref() {
+        if w.is_empty() {
+            return Err(crate::Error::BadRequest(
+                "worker_id, when set, must be non-empty".into(),
+            ));
+        }
+        if w.len() > state.cfg.max_identifier_bytes {
+            return Err(crate::Error::BadRequest(format!(
+                "worker_id length {} exceeds max_identifier_bytes",
+                w.len()
+            )));
+        }
     }
 
     let drv_hash_ref = req.drv_hash.as_ref();
@@ -476,12 +489,14 @@ pub async fn admin_refute(
         &state.pool,
         drv_hash_ref,
         &req.output_paths,
+        req.worker_id.as_deref(),
     )
     .await?;
 
     tracing::warn!(
         drv_hash = ?req.drv_hash,
         paths = req.output_paths.len(),
+        worker_id = ?req.worker_id,
         rows_affected,
         "admin: refuted failed_outputs entries"
     );
@@ -491,14 +506,21 @@ pub async fn admin_refute(
 #[derive(serde::Deserialize)]
 pub struct RefuteRequest {
     /// Remove every cached failed-output entry whose `drv_hash`
-    /// matches. Optional; when combined with `output_paths` both
-    /// filters contribute (union).
+    /// matches. Optional; unioned with `output_paths` and `worker_id`.
     #[serde(default)]
     pub drv_hash: Option<crate::types::DrvHash>,
     /// Specific output paths to remove. Empty when refuting by
-    /// `drv_hash` alone.
+    /// `drv_hash` or `worker_id` alone.
     #[serde(default)]
     pub output_paths: Vec<String>,
+    /// Remove every cached failed-output entry that was reported by
+    /// this worker. Primary operator escape hatch when a sick host's
+    /// BuildFailure reports poisoned the cache: one call bulk-deletes
+    /// every row that worker owns instead of walking them per-drv.
+    /// Silently does nothing if no rows match — a worker_id without
+    /// recent cache entries is a valid state (healthy worker).
+    #[serde(default)]
+    pub worker_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]

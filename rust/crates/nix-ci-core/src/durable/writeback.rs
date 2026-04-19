@@ -226,13 +226,20 @@ async fn transition_job_terminal_observed(
 /// pick per-deployment TTLs (short for flaky overlays, long for stable
 /// channels) without a migration. The column still defaults to 1h for
 /// backwards compatibility with manually-inserted rows.
+///
+/// `worker_id` records which worker reported the underlying
+/// BuildFailure. Stored nullable so rows from older clients (without
+/// a worker_id) still insert cleanly; operators can later bulk-delete
+/// by worker_id via `/admin/refute?worker_id=X` if they suspect a
+/// single host's false positives poisoned the cache.
 pub async fn insert_failed_outputs(
     pool: &PgPool,
     drv_hash: &DrvHash,
     output_paths: &[String],
     ttl_secs: u64,
+    worker_id: Option<&str>,
 ) -> Result<()> {
-    insert_failed_outputs_inner(pool, None, drv_hash, output_paths, ttl_secs).await
+    insert_failed_outputs_inner(pool, None, drv_hash, output_paths, ttl_secs, worker_id).await
 }
 
 /// Observed variant: records pool-acquire wait time on the hot
@@ -243,8 +250,17 @@ pub async fn insert_failed_outputs_observed(
     drv_hash: &DrvHash,
     output_paths: &[String],
     ttl_secs: u64,
+    worker_id: Option<&str>,
 ) -> Result<()> {
-    insert_failed_outputs_inner(pool, Some(metrics), drv_hash, output_paths, ttl_secs).await
+    insert_failed_outputs_inner(
+        pool,
+        Some(metrics),
+        drv_hash,
+        output_paths,
+        ttl_secs,
+        worker_id,
+    )
+    .await
 }
 
 async fn insert_failed_outputs_inner(
@@ -253,6 +269,7 @@ async fn insert_failed_outputs_inner(
     drv_hash: &DrvHash,
     output_paths: &[String],
     ttl_secs: u64,
+    worker_id: Option<&str>,
 ) -> Result<()> {
     if output_paths.is_empty() {
         return Ok(());
@@ -261,9 +278,12 @@ async fn insert_failed_outputs_inner(
         std::iter::repeat_n(drv_hash.as_str(), output_paths.len()).collect();
     let path_refs: Vec<&str> = output_paths.iter().map(String::as_str).collect();
     let ttl: f64 = ttl_secs as f64;
+    // worker_id is the same for every row in one insert batch (one
+    // worker reports one drv failure) — passed as a scalar, so
+    // `$4::text` broadcasts across the UNNEST rows.
     let query = r#"
-        INSERT INTO failed_outputs (output_path, drv_hash, expires_at)
-        SELECT output_path, drv_hash, now() + make_interval(secs => $3)
+        INSERT INTO failed_outputs (output_path, drv_hash, expires_at, worker_id)
+        SELECT output_path, drv_hash, now() + make_interval(secs => $3), $4
         FROM UNNEST($1::text[], $2::text[]) AS t(output_path, drv_hash)
         ON CONFLICT (output_path) DO NOTHING
         "#;
@@ -273,6 +293,7 @@ async fn insert_failed_outputs_inner(
             .bind(&path_refs)
             .bind(&drv_hash_refs)
             .bind(ttl)
+            .bind(worker_id)
             .execute(&mut *conn)
             .await?;
     } else {
@@ -280,6 +301,7 @@ async fn insert_failed_outputs_inner(
             .bind(&path_refs)
             .bind(&drv_hash_refs)
             .bind(ttl)
+            .bind(worker_id)
             .execute(pool)
             .await?;
     }
@@ -293,36 +315,48 @@ async fn insert_failed_outputs_inner(
 ///
 /// Returns the number of rows deleted — callers surface it so the
 /// operator can tell their `/admin/refute` call actually hit
-/// something (empty `output_paths` + `drv_hash` unspecified is a
-/// 0-row no-op, which is fine for idempotency).
+/// something (all three filters absent is a 0-row no-op, which is
+/// fine for idempotency).
 ///
-/// `output_paths` deletes specific entries; `drv_hash` deletes every
-/// entry pointing at a derivation (useful when a single failed
-/// drv's outputs are distributed across many paths). Passing both
-/// deletes the union.
+/// Three filters, ORed together:
+///   * `output_paths` — delete specific entries.
+///   * `drv_hash` — delete every entry for a derivation (useful when
+///     one drv's outputs are spread across many paths).
+///   * `worker_id` — bulk-delete every entry reported by a specific
+///     worker. Primary operator escape hatch when a sick host's
+///     false positives poisoned the cache.
+///
+/// Any combination is valid; the union is deleted.
 pub async fn delete_failed_outputs(
     pool: &PgPool,
     drv_hash: Option<&DrvHash>,
     output_paths: &[String],
+    worker_id: Option<&str>,
 ) -> Result<u64> {
-    if drv_hash.is_none() && output_paths.is_empty() {
+    if drv_hash.is_none() && output_paths.is_empty() && worker_id.is_none() {
         return Ok(0);
     }
-    // Two-arm WHERE so a caller can refute by drv_hash, by path,
-    // or both in one call. `COALESCE` on empty arrays lets the
-    // `$2 = ANY($2)` arm be "absent" without a separate query.
+    // Three-arm WHERE: paths, drv_hash, worker_id. `$2`/`$4` bool
+    // guards mean the drv_hash / worker_id arm is only evaluated
+    // when the caller passed a value, so an empty-array paths +
+    // no-drv_hash + worker_id-only call deletes strictly by worker.
     let paths_ref: Vec<&str> = output_paths.iter().map(String::as_str).collect();
     let drv_hash_str = drv_hash.map(|h| h.as_str()).unwrap_or("");
     let has_drv_hash = drv_hash.is_some();
+    let worker_id_str = worker_id.unwrap_or("");
+    let has_worker_id = worker_id.is_some();
     let query = r#"
         DELETE FROM failed_outputs
         WHERE (output_path = ANY($1::text[]))
            OR ($2 AND drv_hash = $3)
+           OR ($4 AND worker_id = $5)
         "#;
     let result = sqlx::query(query)
         .bind(&paths_ref)
         .bind(has_drv_hash)
         .bind(drv_hash_str)
+        .bind(has_worker_id)
+        .bind(worker_id_str)
         .execute(pool)
         .await?;
     Ok(result.rows_affected())

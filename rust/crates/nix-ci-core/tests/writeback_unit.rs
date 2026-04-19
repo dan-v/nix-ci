@@ -243,7 +243,7 @@ async fn insert_failed_outputs_empty_slice_is_noop(pool: PgPool) {
     // miss if the branch gets refactored away.
     migrate(&pool).await;
     let drv = DrvHash::new("abc-empty.drv");
-    insert_failed_outputs(&pool, &drv, &[], 60).await.unwrap();
+    insert_failed_outputs(&pool, &drv, &[], 60, None).await.unwrap();
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM failed_outputs")
         .fetch_one(&pool)
         .await
@@ -259,13 +259,13 @@ async fn insert_failed_outputs_on_conflict_is_noop(pool: PgPool) {
         "/nix/store/out-a-fail".to_string(),
         "/nix/store/out-b-fail".to_string(),
     ];
-    insert_failed_outputs(&pool, &drv, &paths, 3600)
+    insert_failed_outputs(&pool, &drv, &paths, 3600, None)
         .await
         .unwrap();
     // Re-insert the same paths: ON CONFLICT DO NOTHING must keep the
     // row count at 2. Without the guard, the second insert would
     // either error or duplicate the row.
-    insert_failed_outputs(&pool, &drv, &paths, 3600)
+    insert_failed_outputs(&pool, &drv, &paths, 3600, None)
         .await
         .unwrap();
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM failed_outputs")
@@ -297,7 +297,7 @@ async fn failed_output_hits_returns_only_unexpired_matches(pool: PgPool) {
     // Insert a live row (long TTL) and a manually-expired row via
     // direct SQL — the helper doesn't expose an expire-override path
     // so we dip into raw SQL for the expired case.
-    insert_failed_outputs(&pool, &drv, std::slice::from_ref(&live_path), 3600)
+    insert_failed_outputs(&pool, &drv, std::slice::from_ref(&live_path), 3600, None)
         .await
         .unwrap();
     sqlx::query(

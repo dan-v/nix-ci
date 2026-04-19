@@ -253,6 +253,7 @@ async fn handle_failure(
             step.drv_hash(),
             &[output_path],
             state.cfg.failed_outputs_ttl_secs,
+            claim.worker_id.as_deref(),
         )
         .await
         {

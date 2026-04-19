@@ -1,0 +1,18 @@
+-- Attribute a failed_outputs cache entry to the worker that reported
+-- the underlying BuildFailure. Without this, an operator faced with a
+-- poisoned cache entry (suspected sick worker left behind a false-
+-- positive failed_outputs row) has no way to bulk-delete rows
+-- originating from one suspect host — they can only refute by
+-- drv_hash or output_path, one row at a time.
+--
+-- Nullable: pre-migration rows (and rows from workers that reported
+-- via older clients with no worker_id) get NULL. The
+-- `/admin/refute?worker_id=X` filter treats NULL as "not this
+-- worker" — i.e. unattributed rows are not affected.
+--
+-- No index: refute is a manual operator action, not a hot query.
+-- pg_stat_user_tables will show a sequential scan; fine for this
+-- cardinality. If refute-by-worker becomes frequent we'd add
+-- `CREATE INDEX CONCURRENTLY failed_outputs_worker_id_idx ON
+-- failed_outputs (worker_id) WHERE worker_id IS NOT NULL`.
+ALTER TABLE failed_outputs ADD COLUMN worker_id TEXT;
