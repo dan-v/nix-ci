@@ -159,6 +159,13 @@ pub struct MetricsInner {
     /// heartbeat. Decoupled from `claims_expired`, which only
     /// counts deadline-window expiries without extension.
     pub claims_hard_ceiling_reaped: Counter,
+    /// Submissions finalized by the periodic terminal-writeback retry
+    /// sweep. A non-zero rate means the coordinator recovered from an
+    /// earlier failed terminal write (typically a transient PG outage
+    /// at the moment of the final `/complete`). Operators alert on
+    /// this > 0 as a PG-availability signal, not a bug — the retry is
+    /// the fix.
+    pub terminal_writeback_retry_finalized: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -488,6 +495,12 @@ impl Metrics {
             "Claims force-re-armed because they exceeded max_claim_lifetime_secs despite lease extensions.",
             claims_hard_ceiling_reaped.clone(),
         );
+        let terminal_writeback_retry_finalized = Counter::default();
+        registry.register(
+            "nix_ci_terminal_writeback_retry_finalized",
+            "Submissions finalized by the periodic terminal-writeback retry sweep (recovered from a prior failed terminal write).",
+            terminal_writeback_retry_finalized.clone(),
+        );
 
         // Process-global panic counter. Cloned into the per-instance
         // registry so `/metrics` surfaces any panic in this process,
@@ -538,6 +551,7 @@ impl Metrics {
                 overload_rejections,
                 worker_auto_quarantined,
                 claims_hard_ceiling_reaped,
+                terminal_writeback_retry_finalized,
             }),
         }
     }

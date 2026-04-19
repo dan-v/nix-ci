@@ -625,6 +625,69 @@ pub(super) async fn check_and_publish_terminal(
     Ok(())
 }
 
+/// Scan live submissions for any that are sealed, have all members
+/// finished, but whose terminal writeback never completed — e.g.
+/// because the PG UPDATE in [`check_and_publish_terminal`] failed and
+/// the original `/complete` handler returned 500. Without this sweep,
+/// such a submission sits in memory with all work done but never
+/// publishes `JobDone` and never persists `jobs.result`; the runner
+/// waits on SSE forever and the CI run eventually times out externally,
+/// turning a successful build into a heartbeat-reap `cancelled`.
+///
+/// Re-invokes [`check_and_publish_terminal`] on each candidate. Safe
+/// to call concurrently with live `/complete` retries: the terminal
+/// PG write is guarded by `done_at IS NULL` and [`Submission::mark_terminal`]
+/// is a CAS, so only one call actually persists and publishes.
+///
+/// Returns the count of submissions that this call successfully
+/// transitioned to terminal. Errors from individual persists are
+/// logged but don't abort the sweep (PG could still be down — we'll
+/// try again on the next tick).
+#[doc(hidden)]
+pub async fn retry_pending_terminal_writebacks(state: &AppState) -> u64 {
+    let mut finalized: u64 = 0;
+    for sub in state.dispatcher.submissions.all() {
+        if !sub.is_sealed() {
+            continue;
+        }
+        if sub.is_terminal() {
+            continue;
+        }
+        let total = sub.members.read().len() as u32;
+        let done = sub.done_count.load(Ordering::Acquire);
+        let failed = sub.failed_count.load(Ordering::Acquire);
+        if done + failed < total {
+            continue;
+        }
+        // Candidate: sealed + all counters terminal + !terminal flag.
+        // check_and_publish_terminal does its own re-checks + write.
+        match check_and_publish_terminal(state, &sub).await {
+            Ok(()) => {
+                if sub.is_terminal() {
+                    finalized += 1;
+                    state
+                        .metrics
+                        .inner
+                        .terminal_writeback_retry_finalized
+                        .inc();
+                    tracing::warn!(
+                        job_id = %sub.id,
+                        "retry_pending_terminal_writebacks: finalized previously-wedged submission"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    job_id = %sub.id,
+                    error = %e,
+                    "retry_pending_terminal_writebacks: persist still failing; will retry next tick"
+                );
+            }
+        }
+    }
+    finalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -929,3 +929,314 @@ async fn terminal_writeback_idempotent_under_race(pool: PgPool) {
         JobStatus::Cancelled
     );
 }
+
+// ─── 10. Terminal-writeback retry sweep ────────────────────────────────
+
+/// The wedge this test guards against: a `/complete` that crosses the
+/// last-drv-of-job boundary while the PG UPDATE for `jobs.result` fails
+/// (transient PG outage, network blip, `statement_timeout` fire).
+/// `check_and_publish_terminal` propagates the error BEFORE CAS'ing
+/// `sub.mark_terminal()`, so the submission sits in memory with:
+///   * `sub.is_sealed() == true`
+///   * all members `finished`
+///   * `sub.terminal == false`
+///   * `jobs.status == 'pending'` and `jobs.result IS NULL` in PG
+///
+/// With no retry sweep, nothing re-fires `check_and_publish_terminal`
+/// for this submission and the runner's SSE waits forever — eventually
+/// the CI run times out externally and a successful build is recorded
+/// as `cancelled`.
+///
+/// The retry sweep
+/// (`server::complete::retry_pending_terminal_writebacks`) scans live
+/// submissions once per reaper tick for this exact shape and re-invokes
+/// `check_and_publish_terminal`, which persists on the second try once
+/// PG recovers. Idempotent against a racing live `/complete` (both go
+/// through the `done_at IS NULL` guard and `mark_terminal` CAS).
+///
+/// Reaches the wedge state deterministically by:
+///   1. Creating + ingesting + sealing normally.
+///   2. Manually flipping each toplevel's `finished` bit and bumping
+///      `sub.done_count` (mimicking what a `/complete` handler does
+///      before `check_and_publish_terminal`).
+///   3. Leaving `sub.terminal = false` and `jobs.result = NULL`.
+///
+/// Then invokes the retry function directly and asserts:
+///   * the PG row transitioned to `done` with a non-NULL `result`;
+///   * `sub.is_terminal() == true`;
+///   * the submission was removed from the in-memory map;
+///   * the `terminal_writeback_retry_finalized` counter ticked on
+///     `/metrics`.
+#[sqlx::test]
+async fn retry_finalizes_wedged_submission_after_failed_terminal_write(pool: PgPool) {
+    use std::sync::atomic::Ordering;
+
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    // Baseline: jobs_terminal{status="done"} counter must not be
+    // double-bumped — this test finalizes through the retry path, which
+    // reuses the normal terminal accounting, so one (and only one)
+    // transition should count.
+    let counter_name = "nix_ci_jobs_terminal_total";
+    let counter_labels = &[("status", "done")];
+    let counter_before =
+        common::scrape_metric(&handle.base_url, counter_name, counter_labels)
+            .await
+            .unwrap_or(0.0);
+
+    let job = client
+        .create_job(&CreateJobRequest {
+            external_ref: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Two-leaf submission so we can cover the all-toplevels-finished
+    // scan path (the counter fast-exit alone would pass a single-drv
+    // case with less work).
+    let leaf_a = drv_path("wed_a", "a");
+    let leaf_b = drv_path("wed_b", "b");
+    client
+        .ingest_drv(job.id, &ingest(&leaf_a, "a", &[], true))
+        .await
+        .unwrap();
+    client
+        .ingest_drv(job.id, &ingest(&leaf_b, "b", &[], true))
+        .await
+        .unwrap();
+
+    // Seal while nothing is done yet. check_and_publish_terminal fires
+    // inside the seal handler but fast-exits on done+failed < total, so
+    // we're in a "sealed, nothing finished" state after this call.
+    client.seal(job.id).await.unwrap();
+
+    // Pull the live submission to mutate it directly. This is what a
+    // successful `/complete` would do — flip each step's `finished`
+    // and bump `sub.done_count` — except we SKIP the subsequent call
+    // to `check_and_publish_terminal`, which is what the wedge looks
+    // like after a failed PG write.
+    let sub = handle
+        .dispatcher
+        .submissions
+        .get(job.id)
+        .expect("submission must be live after seal");
+    for leaf in [&leaf_a, &leaf_b] {
+        let hash = nix_ci_core::types::drv_hash_from_path(leaf).unwrap();
+        let step = handle
+            .dispatcher
+            .steps
+            .get(&hash)
+            .expect("step must exist post-ingest");
+        step.finished.store(true, Ordering::Release);
+        sub.done_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    // Sanity: we're genuinely in the wedge state before the retry runs.
+    assert!(sub.is_sealed());
+    assert!(
+        !sub.is_terminal(),
+        "precondition: sub.terminal must be false for the wedge simulation"
+    );
+    let counts = sub.live_counts();
+    assert_eq!(counts.total, 2);
+    assert_eq!(counts.done, 2);
+    let (status_pre, done_at_pre, result_pre): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+    ) = sqlx::query_as("SELECT status, done_at, result FROM jobs WHERE id = $1")
+        .bind(job.id.0)
+        .fetch_one(&handle.pool)
+        .await
+        .unwrap();
+    assert_eq!(status_pre, "pending", "PG row is still pending pre-retry");
+    assert!(done_at_pre.is_none());
+    assert!(result_pre.is_none());
+
+    // Run the sweep. This is what the background task calls on every
+    // reaper_interval_secs tick.
+    nix_ci_core::server::complete::retry_pending_terminal_writebacks(&handle.state).await;
+
+    // Post-condition 1: PG row transitioned to done with a terminal
+    // snapshot.
+    let (status_post, done_at_post, result_post): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+    ) = sqlx::query_as("SELECT status, done_at, result FROM jobs WHERE id = $1")
+        .bind(job.id.0)
+        .fetch_one(&handle.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status_post, "done",
+        "retry sweep must have persisted terminal status"
+    );
+    assert!(
+        done_at_post.is_some(),
+        "retry sweep must have set done_at"
+    );
+    assert!(
+        result_post.is_some(),
+        "retry sweep must have persisted the JobStatusResponse snapshot"
+    );
+
+    // Post-condition 2: in-memory terminal flag + submission removal.
+    // mark_terminal was CAS'd true; submission dropped from the map.
+    assert!(
+        sub.is_terminal(),
+        "retry sweep must have CAS'd the in-memory terminal flag"
+    );
+    assert!(
+        handle.dispatcher.submissions.get(job.id).is_none(),
+        "retry sweep must remove the finalized submission from the dispatcher map"
+    );
+
+    // Post-condition 3: /metrics exposes the retry counter so operators
+    // can alert on PG availability without having to scrape the logs.
+    let retry_counter =
+        common::scrape_metric(&handle.base_url, "nix_ci_terminal_writeback_retry_finalized_total", &[])
+            .await
+            .expect(
+                "nix_ci_terminal_writeback_retry_finalized_total must be present after the retry sweep finalized one submission",
+            );
+    assert_eq!(retry_counter, 1.0);
+
+    // Post-condition 4: normal jobs_terminal accounting — exactly one
+    // done transition. A double-bump would mean the retry path was
+    // accidentally summing with a live /complete (which can't happen
+    // here because we never called /complete, but we assert it so the
+    // property holds if the test shape is ever generalized).
+    let counter_after =
+        common::scrape_metric_expect(&handle.base_url, counter_name, counter_labels).await;
+    assert_eq!(
+        counter_after - counter_before,
+        1.0,
+        "retry sweep must bump jobs_terminal{{status=done}} exactly once"
+    );
+
+    // Post-condition 5: the client-facing status endpoint returns the
+    // terminal snapshot (reading from the persisted JSONB since the
+    // submission is gone from memory). End-to-end proof that the
+    // recovery is observable by callers.
+    let snap = client.status(job.id).await.unwrap();
+    assert_eq!(snap.status, JobStatus::Done);
+}
+
+/// The retry sweep must be idempotent: calling it twice in a row on the
+/// already-recovered submission must not double-bump counters or
+/// produce spurious log spam. Regression guard against the sweep
+/// mistakenly re-entering `check_and_publish_terminal` after the
+/// submission is already removed from the dispatcher map (in which
+/// case `submissions.all()` returns an empty set and the function is a
+/// no-op — exactly the contract).
+#[sqlx::test]
+async fn retry_is_idempotent_once_finalized(pool: PgPool) {
+    use std::sync::atomic::Ordering;
+
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let leaf = drv_path("wedidm", "solo");
+    client
+        .ingest_drv(job.id, &ingest(&leaf, "solo", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    // Wedge state.
+    let sub = handle.dispatcher.submissions.get(job.id).unwrap();
+    let hash = nix_ci_core::types::drv_hash_from_path(&leaf).unwrap();
+    let step = handle.dispatcher.steps.get(&hash).unwrap();
+    step.finished.store(true, Ordering::Release);
+    sub.done_count.fetch_add(1, Ordering::AcqRel);
+
+    // First sweep: finalizes, counter goes 0 → 1.
+    nix_ci_core::server::complete::retry_pending_terminal_writebacks(&handle.state).await;
+    let after_first = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_terminal_writeback_retry_finalized_total",
+        &[],
+    )
+    .await;
+    assert_eq!(after_first, 1.0);
+
+    // Second sweep: submission is gone, must be a no-op.
+    nix_ci_core::server::complete::retry_pending_terminal_writebacks(&handle.state).await;
+    let after_second = common::scrape_metric_expect(
+        &handle.base_url,
+        "nix_ci_terminal_writeback_retry_finalized_total",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        after_second, 1.0,
+        "retry sweep on an empty candidate set must not touch the counter"
+    );
+}
+
+/// Defence in depth: a non-sealed submission must never be touched by
+/// the retry sweep, even if its counters happen to satisfy
+/// `done + failed >= total` (possible when a submission has zero
+/// members because nothing has been ingested yet — `0 >= 0` is true).
+/// A sealed check is the contract for "no more drvs coming"; without
+/// it a pre-seal empty submission would be force-finalized, breaking
+/// the "create job, ingest batches, seal" sequence.
+#[sqlx::test]
+async fn retry_skips_unsealed_submission(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let client = CoordinatorClient::new(&handle.base_url);
+
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    // Note: NO seal, NO ingest. Submission exists in the dispatcher
+    // map with zero members — counter math is `0 done + 0 failed >= 0
+    // total`, which technically passes the sweep's fast-path check.
+    // The explicit is_sealed guard is the thing that saves us.
+    let before_sub = handle
+        .dispatcher
+        .submissions
+        .get(job.id)
+        .expect("submission must be registered at create time");
+    assert!(!before_sub.is_sealed());
+
+    // Run the sweep.
+    nix_ci_core::server::complete::retry_pending_terminal_writebacks(&handle.state).await;
+
+    // Submission must still be live, not prematurely terminalized.
+    let after_sub = handle
+        .dispatcher
+        .submissions
+        .get(job.id)
+        .expect("submission must NOT be removed by a sweep on an unsealed job");
+    assert!(!after_sub.is_terminal());
+
+    // PG row stays pending too.
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM jobs WHERE id = $1")
+        .bind(job.id.0)
+        .fetch_one(&handle.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "pending");
+
+    // Counter must not have ticked.
+    let counter = common::scrape_metric(
+        &handle.base_url,
+        "nix_ci_terminal_writeback_retry_finalized_total",
+        &[],
+    )
+    .await
+    .unwrap_or(0.0);
+    assert_eq!(
+        counter, 0.0,
+        "retry must not finalize an unsealed submission"
+    );
+}

@@ -21,6 +21,11 @@ pub struct ServerHandle {
     pub base_url: String,
     pub pool: PgPool,
     pub dispatcher: Dispatcher,
+    /// Full AppState clone. Tests that need to invoke handler-internal
+    /// functions directly (e.g. `retry_pending_terminal_writebacks`)
+    /// pass this in. The server's axum task holds its own clone, so
+    /// this one is independent.
+    pub state: AppState,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -89,7 +94,7 @@ pub async fn spawn_server_with_cfg(
     let base_url = format!("http://{addr}");
 
     let (tx, rx) = oneshot::channel::<()>();
-    let router = build_router(state);
+    let router = build_router(state.clone());
     tokio::spawn(async move {
         let _ = axum::serve(listener, router)
             .with_graceful_shutdown(async move {
@@ -105,6 +110,7 @@ pub async fn spawn_server_with_cfg(
         base_url,
         pool,
         dispatcher,
+        state,
         shutdown: Some(tx),
     }
 }

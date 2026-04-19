@@ -77,6 +77,19 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         metrics.clone(),
         shutdown_rx.clone(),
     ));
+    // Terminal-writeback retry sweep: a `/complete` that crossed the
+    // last-drv-of-job boundary while PG was unreachable leaves the
+    // submission with all members finished but `terminal=false` and no
+    // `jobs.result` row. The runner's SSE would otherwise wait forever.
+    // Ticks at the reaper interval (same cadence as the other recovery
+    // sweeps) and re-invokes `check_and_publish_terminal` on any wedged
+    // submission. Idempotent against concurrent live `/complete` calls
+    // via `mark_terminal` CAS and `done_at IS NULL` guard.
+    let terminal_retry_task = tokio::spawn(run_terminal_writeback_retry(
+        state.clone(),
+        Duration::from_secs(cfg.reaper_interval_secs),
+        shutdown_rx.clone(),
+    ));
 
     let app = build_router(state);
     let listener = TcpListener::bind(cfg.listen).await?;
@@ -98,7 +111,11 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .map_err(|e| crate::Error::Internal(format!("axum serve: {e}")))?;
 
     drain_background_tasks(
-        [("reaper", reaper_task), ("cleanup", cleanup_task)],
+        [
+            ("reaper", reaper_task),
+            ("cleanup", cleanup_task),
+            ("terminal_writeback_retry", terminal_retry_task),
+        ],
         Duration::from_secs(cfg.graceful_shutdown_secs),
     )
     .await;
@@ -126,6 +143,40 @@ where
         {
             tracing::warn!(task = %name, "shutdown: task overran drain; aborting");
             abort.abort();
+        }
+    }
+}
+
+/// Periodic sweep that finds sealed submissions whose terminal writeback
+/// failed mid-`/complete` (e.g. transient PG outage) and retries.
+/// Without this loop a submission with all members finished but a
+/// failed terminal-persist stays in memory forever — workers and the
+/// runner's SSE are stuck waiting for a `JobDone` event that never
+/// fires, and the CI run eventually times out externally, flipping a
+/// successful build to `cancelled`.
+async fn run_terminal_writeback_retry(
+    state: AppState,
+    tick: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(tick);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // first fire is immediate — skip
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.changed() => {
+                tracing::info!("terminal_writeback_retry: shutdown");
+                return;
+            }
+        }
+        let finalized =
+            crate::server::complete::retry_pending_terminal_writebacks(&state).await;
+        if finalized > 0 {
+            tracing::warn!(
+                finalized,
+                "terminal_writeback_retry: recovered submissions whose terminal writeback had previously failed"
+            );
         }
     }
 }
