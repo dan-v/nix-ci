@@ -305,6 +305,112 @@ async fn fail_observes_pg_pool_acquire_duration_histogram(pool: PgPool) {
     );
 }
 
+/// /metrics must stay coherent under concurrent scrape + concurrent
+/// traffic. The endpoint takes a `parking_lot::Mutex<Registry>` for
+/// encoding; concurrent scrapes serialize on that lock, and
+/// concurrent writes (to counters/gauges) go via independent atomics.
+/// The test guards against two failure modes:
+///   * Torn reads: a scrape returning partial / invalid OpenMetrics
+///     text because another scrape was mid-encode. Impossible with
+///     Mutex serialization, but we validate the surface.
+///   * Scrape-vs-mutate deadlock: a scrape holds the registry lock
+///     while the traffic path tries to register a new metric family.
+///     All our families are registered at startup — not at runtime —
+///     so this is structurally impossible, but the test exercises
+///     the shape to lock it in as a contract.
+///
+/// Shape: 50 concurrent scrapes interleaved with 50 concurrent
+/// job-create calls. Every scrape response must parse as valid
+/// Prometheus text and contain at least one expected family.
+#[sqlx::test]
+async fn metrics_scrape_survives_concurrent_scrapes_and_traffic(pool: PgPool) {
+    let handle = spawn_server(pool).await;
+    let base = handle.base_url.clone();
+    let client = CoordinatorClient::new(&base);
+
+    // Warm up: one job so there's some per-job histogram data.
+    let _ = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+
+    let mut scrape_tasks = tokio::task::JoinSet::new();
+    let mut traffic_tasks = tokio::task::JoinSet::new();
+
+    // 50 concurrent scrapes. reqwest::Client is cheap to reuse but
+    // cloning via base_url also works; prefer the simple shape.
+    for i in 0..50 {
+        let url = format!("{base}/metrics");
+        scrape_tasks.spawn(async move {
+            let resp = reqwest::get(&url).await.unwrap_or_else(|e| {
+                panic!("scrape {i} failed: {e}");
+            });
+            let status = resp.status();
+            let body = resp.text().await.unwrap();
+            (i, status, body)
+        });
+    }
+
+    // 50 concurrent job creates — exercises jobs_created counter +
+    // pool_acquire histogram while the scrapes are hitting /metrics.
+    for i in 0..50 {
+        let c = CoordinatorClient::new(&base);
+        traffic_tasks.spawn(async move {
+            c.create_job(&CreateJobRequest {
+                external_ref: Some(format!("metrics-race-{i}")),
+                ..Default::default()
+            })
+            .await
+        });
+    }
+
+    // Drain scrapes.
+    while let Some(res) = scrape_tasks.join_next().await {
+        let (idx, status, body) = res.expect("scrape task must not panic");
+        assert_eq!(status.as_u16(), 200, "scrape {idx} status != 200");
+
+        // Structural: OpenMetrics format has `# HELP`, `# TYPE`, and
+        // a numeric-value-per-line shape. We assert the hallmarks
+        // are there — a truncated / corrupt body would be missing.
+        assert!(
+            body.contains("# HELP"),
+            "scrape {idx} body missing # HELP header; first 200B: {:?}",
+            &body[..body.len().min(200)]
+        );
+        assert!(
+            body.contains("# TYPE"),
+            "scrape {idx} body missing # TYPE header"
+        );
+        // A handful of metric families we know must be registered.
+        for expected in [
+            "nix_ci_jobs_created",
+            "nix_ci_claims_in_flight",
+            "nix_ci_submissions_active",
+        ] {
+            assert!(
+                body.contains(expected),
+                "scrape {idx} body missing expected family {expected}"
+            );
+        }
+        // OpenMetrics ends every scrape with `# EOF\n` (prometheus-client
+        // convention). A torn encode would break this.
+        assert!(
+            body.trim_end().ends_with("# EOF"),
+            "scrape {idx} body missing # EOF terminator"
+        );
+    }
+
+    // Drain traffic — all 50 creates must succeed (no 5xx from
+    // scrape contention).
+    let mut created = 0;
+    while let Some(res) = traffic_tasks.join_next().await {
+        let r = res.expect("create-job task must not panic");
+        r.expect("create_job must succeed under scrape contention");
+        created += 1;
+    }
+    assert_eq!(created, 50);
+}
+
 /// Same property for /cancel.
 #[sqlx::test]
 async fn cancel_observes_pg_pool_acquire_duration_histogram(pool: PgPool) {
