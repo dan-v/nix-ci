@@ -64,6 +64,14 @@
               inherit pkgs system;
               inherit self;
             };
+            # Three-node VM test (db + two coordinators) proving the
+            # advisory-lock primary/standby contract: only one of two
+            # identically-configured coordinators serves at a time, and
+            # failover on primary stop is automatic within seconds.
+            coordinator-ha-failover = import ./nix/checks/coordinator-ha-failover.nix {
+              inherit pkgs system;
+              inherit self;
+            };
           };
 
           devShells.default = pkgs.mkShell {
