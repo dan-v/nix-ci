@@ -69,6 +69,7 @@ pub async fn upload_log(
         )));
     }
 
+    let upload_bytes = body.len() as u64;
     let req = LogPutRequest {
         job_id,
         claim_id,
@@ -85,6 +86,45 @@ pub async fn upload_log(
     if q.truncated {
         state.metrics.inner.build_logs_truncated_total.inc();
     }
+
+    // Accumulate gzipped upload bytes against the submission so
+    // `build_log_bytes_per_job` has something to observe at terminal,
+    // and the per-job warn threshold can fire on the first crossing.
+    // No-op when the submission is already gone (terminal) — the
+    // upload still lands, we just skip the live accounting since the
+    // terminal histogram fires only once per submission.
+    if let Some(sub) = state.dispatcher.submissions.get(job_id) {
+        use std::sync::atomic::Ordering;
+        let prev = sub
+            .log_bytes_accumulated
+            .fetch_add(upload_bytes, Ordering::AcqRel);
+        let new_total = prev.saturating_add(upload_bytes);
+        if let Some(threshold) = state.cfg.build_log_bytes_per_job_warn {
+            // Only emit the warn if this upload is the one that CROSSED
+            // the threshold, via CAS on the one-shot flag. Subsequent
+            // uploads on the same over-threshold job stay quiet.
+            if new_total >= threshold
+                && sub
+                    .warned_log_bytes
+                    .compare_exchange(
+                        false,
+                        true,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                tracing::warn!(
+                    job_id = %job_id,
+                    log_bytes = new_total,
+                    threshold,
+                    "submission crossed build_log_bytes_per_job_warn threshold"
+                );
+                state.metrics.inner.submission_log_bytes_warn_total.inc();
+            }
+        }
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 

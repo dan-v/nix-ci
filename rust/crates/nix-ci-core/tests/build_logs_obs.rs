@@ -833,3 +833,285 @@ async fn cleanup_sweep_enforces_max_build_logs_bytes(pool: PgPool) {
         .unwrap();
     assert_eq!(rows_after_noop.0, 2, "no cap = no pruning");
 }
+
+// ─── Per-job log-bytes accumulator + WARN threshold ──────────────
+
+/// Drive one log upload and assert the submission's
+/// `log_bytes_accumulated` grew by the upload size. This is the
+/// in-memory counter the histogram reads at terminal time and the
+/// per-job WARN fires against.
+#[sqlx::test]
+async fn upload_log_grows_per_submission_byte_accumulator(pool: PgPool) {
+    let h = spawn_server(pool.clone()).await;
+    let client = CoordinatorClient::new(&h.base_url);
+    let job = client
+        .create_job(&CreateJobRequest {
+            external_ref: Some("logs-accum".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let drv = drv_path("accum", "d");
+    let drv_hash = DrvHash::new("accum-d.drv".to_string());
+    client
+        .ingest_drv(job.id, &ingest(&drv, "d", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let c = client
+        .claim(job.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("claim");
+
+    // Baseline accumulator is 0.
+    let sub = h.dispatcher.submissions.get(job.id).expect("live sub");
+    assert_eq!(
+        sub.log_bytes_accumulated
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+
+    let payload = "x".repeat(8 * 1024); // 8 KiB raw
+    let gz_bytes = gz(&payload);
+    let uploaded = gz_bytes.len() as u64;
+    client
+        .upload_log(
+            job.id,
+            c.claim_id,
+            BuildLogUploadMeta {
+                drv_hash: &drv_hash,
+                attempt: c.attempt,
+                original_size: payload.len() as u32,
+                truncated: false,
+                success: false,
+                exit_code: Some(1),
+                started_at: Utc::now() - chrono::Duration::seconds(1),
+                ended_at: Utc::now(),
+            },
+            gz_bytes,
+        )
+        .await
+        .unwrap();
+
+    let accumulated = sub
+        .log_bytes_accumulated
+        .load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        accumulated, uploaded,
+        "accumulator must match the gzipped upload body size"
+    );
+}
+
+/// Crossing `build_log_bytes_per_job_warn` mid-flight must emit the
+/// one-shot WARN metric tick. Subsequent uploads on the same
+/// already-over-threshold job must NOT tick again (CAS guard).
+#[sqlx::test]
+async fn log_bytes_warn_fires_once_per_submission(pool: PgPool) {
+    // Threshold must be smaller than the wire-bytes of the gzipped
+    // upload. `"a".repeat(8 * 1024)` compresses to ~50 bytes (RLE);
+    // set a 32-byte threshold so the first upload definitely crosses
+    // regardless of the specific gzip output size.
+    let h = spawn_server_with_cfg(pool.clone(), |cfg| {
+        cfg.build_log_bytes_per_job_warn = Some(32);
+    })
+    .await;
+    let client = CoordinatorClient::new(&h.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let drv_a = drv_path("warn_a", "a");
+    let drv_b = drv_path("warn_b", "b");
+    let dh_a = DrvHash::new("warn_a-a.drv".to_string());
+    let dh_b = DrvHash::new("warn_b-b.drv".to_string());
+    client
+        .ingest_drv(job.id, &ingest(&drv_a, "a", &[], true))
+        .await
+        .unwrap();
+    client
+        .ingest_drv(job.id, &ingest(&drv_b, "b", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    // Upload 1: crosses the threshold, should tick the counter.
+    let c1 = client
+        .claim(job.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("claim 1");
+    let payload_1 = "a".repeat(8 * 1024);
+    client
+        .upload_log(
+            job.id,
+            c1.claim_id,
+            BuildLogUploadMeta {
+                drv_hash: &dh_a,
+                attempt: c1.attempt,
+                original_size: payload_1.len() as u32,
+                truncated: false,
+                success: false,
+                exit_code: Some(1),
+                started_at: Utc::now() - chrono::Duration::seconds(5),
+                ended_at: Utc::now(),
+            },
+            gz(&payload_1),
+        )
+        .await
+        .unwrap();
+    // Complete the claim so its drv terminalizes (won't block further claim).
+    client
+        .complete(
+            job.id,
+            c1.claim_id,
+            &nix_ci_core::types::CompleteRequest {
+                success: false,
+                duration_ms: 1,
+                exit_code: Some(1),
+                error_category: Some(nix_ci_core::types::ErrorCategory::BuildFailure),
+                error_message: Some("a failed".into()),
+                log_tail: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let warn_count_after_first = common::scrape_metric(
+        &h.base_url,
+        "nix_ci_submission_log_bytes_warn_total",
+        &[],
+    )
+    .await
+    .unwrap_or(0.0);
+    assert_eq!(
+        warn_count_after_first, 1.0,
+        "first over-threshold upload must tick the warn counter exactly once"
+    );
+
+    // Upload 2 on the SAME job: already over threshold, CAS guard
+    // must keep the counter at 1.
+    let c2 = client
+        .claim(job.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("claim 2");
+    let payload_2 = "b".repeat(8 * 1024);
+    client
+        .upload_log(
+            job.id,
+            c2.claim_id,
+            BuildLogUploadMeta {
+                drv_hash: &dh_b,
+                attempt: c2.attempt,
+                original_size: payload_2.len() as u32,
+                truncated: false,
+                success: false,
+                exit_code: Some(1),
+                started_at: Utc::now() - chrono::Duration::seconds(5),
+                ended_at: Utc::now(),
+            },
+            gz(&payload_2),
+        )
+        .await
+        .unwrap();
+
+    let warn_count_after_second = common::scrape_metric_expect(
+        &h.base_url,
+        "nix_ci_submission_log_bytes_warn_total",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        warn_count_after_second, 1.0,
+        "a second upload on the same over-threshold job must not re-fire the warn"
+    );
+}
+
+/// At terminal time, the per-submission accumulator is folded into the
+/// `build_log_bytes_per_job` histogram. End-to-end through the
+/// catastrophic-fail path: one upload, fail the drv, read the histogram.
+#[sqlx::test]
+async fn build_log_bytes_per_job_histogram_observed_at_terminal(pool: PgPool) {
+    let h = spawn_server(pool.clone()).await;
+    let client = CoordinatorClient::new(&h.base_url);
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+    let drv = drv_path("hist", "d");
+    let drv_hash = DrvHash::new("hist-d.drv".to_string());
+    client
+        .ingest_drv(job.id, &ingest(&drv, "d", &[], true))
+        .await
+        .unwrap();
+    client.seal(job.id).await.unwrap();
+
+    let c = client
+        .claim(job.id, "x86_64-linux", &[], 3)
+        .await
+        .unwrap()
+        .expect("claim");
+    let payload = "h".repeat(16 * 1024); // 16 KiB raw
+    client
+        .upload_log(
+            job.id,
+            c.claim_id,
+            BuildLogUploadMeta {
+                drv_hash: &drv_hash,
+                attempt: c.attempt,
+                original_size: payload.len() as u32,
+                truncated: false,
+                success: false,
+                exit_code: Some(1),
+                started_at: Utc::now() - chrono::Duration::seconds(5),
+                ended_at: Utc::now(),
+            },
+            gz(&payload),
+        )
+        .await
+        .unwrap();
+
+    // Now fail the drv — terminal path fires, histogram gets one obs.
+    client
+        .complete(
+            job.id,
+            c.claim_id,
+            &nix_ci_core::types::CompleteRequest {
+                success: false,
+                duration_ms: 1,
+                exit_code: Some(1),
+                error_category: Some(nix_ci_core::types::ErrorCategory::BuildFailure),
+                error_message: Some("boom".into()),
+                log_tail: None,
+            },
+        )
+        .await
+        .unwrap();
+    // Wait up to 1s for terminal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let s = client.status(job.id).await.unwrap();
+        if s.status.is_terminal() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("job never terminalized");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Histogram _count must be >= 1 (one observation recorded).
+    let count = common::scrape_metric(
+        &h.base_url,
+        "nix_ci_build_log_bytes_per_job_count",
+        &[],
+    )
+    .await
+    .unwrap_or(0.0);
+    assert!(
+        count >= 1.0,
+        "build_log_bytes_per_job must have at least one observation after terminal, got {count}"
+    );
+}

@@ -641,6 +641,15 @@ pub(super) async fn check_and_publish_terminal(
         .inner
         .drvs_per_job
         .observe(sub.members.read().len() as f64);
+    // Per-job log bytes, observed once per submission at terminal.
+    // Paired with `drvs_per_job` — one obs per job, not per upload —
+    // so p99 answers "what's our biggest log-producing job look like?"
+    // and operators tune `build_log_bytes_per_job_warn` against it.
+    state
+        .metrics
+        .inner
+        .build_log_bytes_per_job
+        .observe(sub.log_bytes_accumulated.load(Ordering::Acquire) as f64);
 
     // Drop the in-memory submission. Existing SSE subscribers keep
     // their receiver until the broadcast Sender is dropped with the

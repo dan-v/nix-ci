@@ -519,6 +519,10 @@ async fn auto_fail_oversized(state: &AppState, id: JobId, reason: &str) -> Resul
             .inner
             .drvs_per_job
             .observe(sub.members.read().len() as f64);
+        state.metrics.inner.build_log_bytes_per_job.observe(
+            sub.log_bytes_accumulated
+                .load(std::sync::atomic::Ordering::Acquire) as f64,
+        );
         state.dispatcher.evict_claims_for(id);
         if sub.mark_terminal() {
             sub.publish(JobEvent::JobDone {

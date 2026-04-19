@@ -173,6 +173,17 @@ pub struct MetricsInner {
     /// not per tick, so a single over-cap burst shows up as a
     /// proportional spike.
     pub build_logs_byte_ceiling_prunes: Counter,
+    /// Per-job cumulative build-log bytes, observed at terminal time.
+    /// Complements `drvs_per_job` with the log-archive dimension. p99
+    /// answers "what does our biggest log-producing job look like?"
+    /// and is the natural place to tune
+    /// `build_log_bytes_per_job_warn` from.
+    pub build_log_bytes_per_job: Histogram,
+    /// Submissions that crossed the `build_log_bytes_per_job_warn`
+    /// threshold while live. One increment per submission, not per
+    /// upload — CAS'd on first cross. Operators alert on "runaway
+    /// verbose job" without waiting for terminal.
+    pub submission_log_bytes_warn_total: Counter,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, prometheus_client::encoding::EncodeLabelSet)]
@@ -514,6 +525,30 @@ impl Metrics {
             "Rows pruned by the build_logs byte-ceiling guard (max_build_logs_bytes).",
             build_logs_byte_ceiling_prunes.clone(),
         );
+        // Buckets span 1 KiB (single trivial build) → 5 GiB (pathological
+        // verbose-logger run), geometric-ish. Wide enough to cover the
+        // full range operators want to graph.
+        let build_log_bytes_per_job = Histogram::new([
+            1_024.0,
+            10_240.0,
+            102_400.0,
+            1_048_576.0,         // 1 MiB
+            10_485_760.0,        // 10 MiB
+            104_857_600.0,       // 100 MiB
+            1_073_741_824.0,     // 1 GiB
+            5_368_709_120.0,     // 5 GiB
+        ]);
+        registry.register(
+            "nix_ci_build_log_bytes_per_job",
+            "Per-submission cumulative gzipped build-log bytes, observed at terminal time.",
+            build_log_bytes_per_job.clone(),
+        );
+        let submission_log_bytes_warn_total = Counter::default();
+        registry.register(
+            "nix_ci_submission_log_bytes_warn",
+            "Submissions that crossed build_log_bytes_per_job_warn while live (one per sub).",
+            submission_log_bytes_warn_total.clone(),
+        );
 
         // Process-global panic counter. Cloned into the per-instance
         // registry so `/metrics` surfaces any panic in this process,
@@ -566,6 +601,8 @@ impl Metrics {
                 claims_hard_ceiling_reaped,
                 terminal_writeback_retry_finalized,
                 build_logs_byte_ceiling_prunes,
+                build_log_bytes_per_job,
+                submission_log_bytes_warn_total,
             }),
         }
     }

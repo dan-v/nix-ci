@@ -123,6 +123,18 @@ pub struct Submission {
     /// a single `WARN` log line (and metrics counter) per oversized
     /// submission rather than one per ingest batch.
     pub warned_oversized: AtomicBool,
+    /// Cumulative bytes of gzipped build logs uploaded against this
+    /// submission. Incremented on each `POST /.../log` upload. Surfaced
+    /// at terminal time into the `build_log_bytes_per_job` histogram,
+    /// giving operators the retrospective "which jobs have the fattest
+    /// logs" view the archive-size gauge can't answer at per-job
+    /// granularity.
+    pub log_bytes_accumulated: std::sync::atomic::AtomicU64,
+    /// Set the first time `log_bytes_accumulated` crosses the
+    /// configured warn threshold, so a pathological verbose-logger
+    /// submission emits exactly one `WARN` log line while the job is
+    /// still live (vs. one per upload — which would spam).
+    pub warned_log_bytes: AtomicBool,
     /// Running count of drvs reserved for this submission by
     /// in-flight ingest batches. Used by the per-job drv-cap check to
     /// race-safely reserve slots before membership mutation: two
@@ -177,6 +189,8 @@ impl Submission {
             propagated_failed: AtomicU32::new(0),
             transient_retries: AtomicU32::new(0),
             warned_oversized: AtomicBool::new(false),
+            log_bytes_accumulated: std::sync::atomic::AtomicU64::new(0),
+            warned_log_bytes: AtomicBool::new(false),
             reserved_drvs: AtomicU32::new(0),
             done_count: AtomicU32::new(0),
             failed_count: AtomicU32::new(0),

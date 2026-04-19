@@ -87,6 +87,16 @@ pub struct ServerConfig {
     /// the fattest bytes per row — typically you want shorter log
     /// retention than job-metadata retention.
     pub build_log_retention_days: u32,
+    /// Per-job soft warn threshold on cumulative uploaded build log
+    /// bytes. When a submission's `log_bytes_accumulated` crosses this,
+    /// a single `WARN` log line fires so operators can spot a runaway
+    /// verbose-logger job while it's still live. Not a hard cap — the
+    /// `max_build_logs_bytes` table-wide guard (below) is the
+    /// disk-enforcement lever. Set `None` to disable the warn. Default
+    /// 100 MiB — a well-behaved failing job sits well below (even with
+    /// hundreds of 500 KiB failed-log uploads); crossing it is a strong
+    /// "someone added `set -x` to every builder" signal.
+    pub build_log_bytes_per_job_warn: Option<u64>,
     /// Soft byte ceiling on total `build_logs` size. On each cleanup
     /// tick, if `sum(octet_length(log_gz))` exceeds this, the oldest
     /// rows are pruned until the sum is back under the cap. Uses
@@ -264,6 +274,12 @@ impl Default for ServerConfig {
             max_failures_in_result: 500,
             graceful_shutdown_secs: 60,
             build_log_retention_days: 7,
+            // 100 MiB per-job warn threshold. A failing job with ~200
+            // 500 KiB failed-log uploads crosses it; typical jobs stay
+            // well below. Crossing surfaces a single WARN log line so
+            // operators catch "some builder script went verbose" before
+            // it compounds across many jobs.
+            build_log_bytes_per_job_warn: Some(100 * 1024 * 1024),
             // 50 GiB. A ~500 KiB avg compressed per failed-build log
             // puts this at ~100k failures' worth — well above any
             // realistic retention horizon but a hard disk guard.
@@ -469,6 +485,14 @@ impl ServerConfig {
             if b == 0 {
                 errors.push(
                     "max_build_logs_bytes, when set, must be > 0 (use null to disable)".into(),
+                );
+            }
+        }
+        if let Some(b) = self.build_log_bytes_per_job_warn {
+            if b == 0 {
+                errors.push(
+                    "build_log_bytes_per_job_warn, when set, must be > 0 (use null to disable)"
+                        .into(),
                 );
             }
         }

@@ -292,6 +292,13 @@ fn finish_in_memory(state: &AppState, id: JobId, status: JobStatus, failures: Ve
         .inner
         .drvs_per_job
         .observe(sub.members.read().len() as f64);
+    // Mirror: log-bytes observation at terminal, so cancel/fail paths
+    // contribute to `build_log_bytes_per_job` alongside the graceful
+    // check_and_publish_terminal path.
+    state.metrics.inner.build_log_bytes_per_job.observe(
+        sub.log_bytes_accumulated
+            .load(std::sync::atomic::Ordering::Acquire) as f64,
+    );
     state.dispatcher.wake();
 }
 
