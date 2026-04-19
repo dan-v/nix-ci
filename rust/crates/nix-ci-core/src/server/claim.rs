@@ -92,6 +92,17 @@ pub async fn claim(
         if sub.is_terminal() {
             return Err(Error::Gone(format!("job {id} is terminal")));
         }
+        // `POST /admin/drain` flips the flag and wakes the dispatcher.
+        // Without this re-check, a long-poll that was already waiting
+        // when drain started would continue issuing claims (if any
+        // become runnable via notify) until its own deadline, silently
+        // violating the drain contract and inflating `claims_in_flight`
+        // past the operator's cutover point. The handler-entry check
+        // above catches workers that ARRIVE during drain; this catches
+        // workers ALREADY WAITING when drain starts.
+        if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
 
         let now_ms = Utc::now().timestamp_millis();
         if let Some(step) = sub.pop_runnable(&systems_vec, &features_vec, now_ms) {
@@ -172,6 +183,17 @@ pub async fn claim_any(
     }
 
     loop {
+        // See claim() for the rationale: re-check draining every
+        // iteration so a long-poll that was already waiting when
+        // drain started exits cleanly on the next notify wake-up
+        // instead of racing to issue a new claim. Particularly
+        // important for fleet workers, which keep polling across
+        // many jobs — a missed drain signal here means the whole
+        // fleet keeps pulling work past the operator's cutover.
+        if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+
         match scan_fleet_once(&state, &systems_vec, &features_vec, start, &q.worker).await? {
             FleetScan::Issued(r) => return Ok(r),
             FleetScan::RestartScan => continue,

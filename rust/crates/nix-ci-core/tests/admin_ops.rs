@@ -243,3 +243,120 @@ async fn fence_rejects_empty_worker_id(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
 }
+
+/// Per-job claim long-poll that was already waiting when drain started
+/// must exit with 204 promptly (not hang until its own deadline).
+///
+/// `drain_blocks_new_jobs_and_claims` above covers the handler-entry
+/// check — a request that ARRIVES during drain gets 204 fast. This
+/// covers the inside-the-loop check: `admin_drain_start` flips the
+/// flag and calls `dispatcher.wake()`; the long-poll's `notify` arm
+/// fires and on the next loop iteration the draining re-check returns
+/// 204. Without the inside-the-loop check, the claim would keep
+/// looping (pop_runnable + sleep) until its deadline, silently
+/// violating the drain contract — operators poll `in_flight_claims`
+/// to decide when to SIGTERM, but a waiting long-poll could issue a
+/// new claim post-drain if one became runnable.
+#[sqlx::test]
+async fn drain_aborts_in_flight_per_job_claim_long_poll(pool: PgPool) {
+    let handle = common::spawn_server(pool).await;
+    let client = CoordinatorClient::new(handle.base_url.clone());
+    let http = reqwest::Client::new();
+
+    // Create a job; ingest nothing — so pop_runnable returns None and
+    // the claim is forced into its long-poll sleep arm.
+    let job = client
+        .create_job(&CreateJobRequest::default())
+        .await
+        .unwrap();
+
+    // Start a 10s long-poll BEFORE drain. Without our fix, this would
+    // hang until the 10s deadline even after drain fires.
+    let claim_client = CoordinatorClient::new(handle.base_url.clone());
+    let claim_task = tokio::spawn(async move {
+        let t = std::time::Instant::now();
+        let result = claim_client
+            .claim(job.id, "x86_64-linux", &[], 10)
+            .await;
+        (t.elapsed(), result)
+    });
+
+    // Let the long-poll enter its sleep.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Trigger drain. admin_drain_start flips `state.draining` and calls
+    // `dispatcher.wake()` which fires `notify_waiters`.
+    let resp = http
+        .post(format!("{}/admin/drain", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // The long-poll must resolve well before its 10s deadline.
+    let (elapsed, result) = tokio::time::timeout(Duration::from_secs(3), claim_task)
+        .await
+        .expect("claim task must finish promptly after drain")
+        .expect("claim task must not panic");
+    match result {
+        Ok(None) => {}
+        Ok(Some(c)) => panic!(
+            "drain must not let an in-flight long-poll issue a claim: {c:?}"
+        ),
+        Err(e) => panic!("unexpected claim error: {e}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "drain must short-circuit a pre-drain long-poll to 204 quickly (took {elapsed:?}); \
+         without the inside-the-loop re-check, this would sleep to the 10s deadline"
+    );
+}
+
+/// Fleet counterpart: a `/claim` (fleet mode) long-poll that was
+/// already waiting when drain started must exit with 204 promptly.
+/// Fleet workers long-poll with no job context, so the same
+/// inside-the-loop draining re-check in `claim_any` protects them.
+#[sqlx::test]
+async fn drain_aborts_in_flight_fleet_claim_long_poll(pool: PgPool) {
+    let handle = common::spawn_server(pool).await;
+    let client = CoordinatorClient::new(handle.base_url.clone());
+    let http = reqwest::Client::new();
+
+    // No submissions at all — fleet claim sees empty sorted list and
+    // goes straight to long-poll.
+    let claim_client = CoordinatorClient::new(handle.base_url.clone());
+    let claim_task = tokio::spawn(async move {
+        let t = std::time::Instant::now();
+        let result = claim_client.claim_any("x86_64-linux", &[], 10).await;
+        (t.elapsed(), result)
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let resp = http
+        .post(format!("{}/admin/drain", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let (elapsed, result) = tokio::time::timeout(Duration::from_secs(3), claim_task)
+        .await
+        .expect("fleet claim task must finish promptly after drain")
+        .expect("fleet claim task must not panic");
+    match result {
+        Ok(None) => {}
+        Ok(Some(c)) => panic!(
+            "drain must not let an in-flight fleet long-poll issue a claim: {c:?}"
+        ),
+        Err(e) => panic!("unexpected claim_any error: {e}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "drain must short-circuit fleet long-poll to 204 quickly (took {elapsed:?})"
+    );
+
+    // Unused so rustc doesn't warn on `client`; we bound the whole test
+    // on the long-poll behavior, not the rest of the client API.
+    let _ = client;
+}
