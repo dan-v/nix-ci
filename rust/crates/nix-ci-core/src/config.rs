@@ -258,12 +258,31 @@ impl Default for ServerConfig {
             request_timeout_secs: 30,
             auth_bearer: None,
             admin_bearer: None,
-            max_claims_in_flight: None,
+            // Default shedding threshold: 25k concurrent claims. That's
+            // 10× headroom over a 2500-worker fleet — any realistic
+            // production shape sits well below it. Exceeding it means a
+            // runaway worker fleet is triple-spawning or a spin-loop on
+            // /claim is pounding us; shedding with 503 + Retry-After is
+            // the right answer in either case. Operators running genuinely
+            // larger fleets raise this; operators who explicitly want the
+            // pre-default "no-shed" behavior set it to `null`.
+            max_claims_in_flight: Some(25_000),
             max_input_drvs_per_drv: 4096,
             max_required_features_per_drv: 32,
             max_eval_errors_per_batch: 10_000,
             max_claim_lifetime_secs: None,
-            worker_quarantine_failure_threshold: None,
+            // Auto-quarantine on by default: 5 failures within 5 minutes
+            // from a single worker_id auto-fences that worker for 15
+            // minutes. These values are tuned so a legitimate
+            // slow-to-build drv that fails across multiple retries
+            // doesn't trip the threshold (that would require the same
+            // worker_id to see 5 separate failing drvs, which implies a
+            // host-local infra problem, not a per-drv issue). Fleet-
+            // mode only (per-job mode is the CI run's only claimant and
+            // quarantining it would hang the run). Operators who want
+            // the pre-default "quarantine fully off" behavior set
+            // `worker_quarantine_failure_threshold: null`.
+            worker_quarantine_failure_threshold: Some(5),
             worker_quarantine_window_secs: 300,
             worker_quarantine_cooldown_secs: 900,
         }

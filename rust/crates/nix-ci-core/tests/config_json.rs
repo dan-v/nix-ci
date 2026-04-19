@@ -488,3 +488,62 @@ fn validate_rejects_log_retention_longer_than_job_retention() {
         err.errors
     );
 }
+
+/// Production-default guards: shedding and auto-quarantine must ship
+/// ON by default so operators who don't read the tuning guide still
+/// get the degradation contract firing when the coordinator is under
+/// stress. Setting either to `None` is a documented opt-out for
+/// niche deployments (e.g. single-host labs); the default must not
+/// be the opt-out.
+///
+/// These constants aren't just numbers — they encode a production
+/// contract:
+///   * `max_claims_in_flight` protects the coordinator's memory
+///     under worker flood. A missing default meant "no shedding,
+///     claims_in_flight can grow until OOM."
+///   * `worker_quarantine_failure_threshold` contains a single sick
+///     host before it poisons unrelated jobs' `failed_outputs`
+///     cache. A missing default meant every deployment needed to
+///     manually opt in, which nobody does.
+#[test]
+fn default_config_enables_shedding_and_quarantine() {
+    let cfg = ServerConfig::default();
+    assert!(
+        cfg.max_claims_in_flight.is_some(),
+        "max_claims_in_flight must default to Some(_) so overload shedding is on by default"
+    );
+    assert!(
+        cfg.worker_quarantine_failure_threshold.is_some(),
+        "worker_quarantine_failure_threshold must default to Some(_) so auto-quarantine is on by default"
+    );
+    // Sanity: values are in a reasonable range — not 1 (would shed
+    // / quarantine on the first hit) and not u32::MAX (effectively off).
+    let claims = cfg.max_claims_in_flight.unwrap();
+    assert!(
+        (1_000..=1_000_000).contains(&claims),
+        "max_claims_in_flight default should be in 1k-1M range, got {claims}"
+    );
+    let threshold = cfg.worker_quarantine_failure_threshold.unwrap();
+    assert!(
+        (2..=50).contains(&threshold),
+        "quarantine threshold should be 2-50, got {threshold}"
+    );
+}
+
+/// Operators who genuinely want the pre-default behavior (no shedding,
+/// no auto-quarantine) must still be able to express that via
+/// explicit `null`. Guards against a future PR that inadvertently
+/// makes the Option non-optional.
+#[test]
+fn operators_can_still_disable_shedding_and_quarantine_via_json() {
+    let json = r#"{
+        "max_claims_in_flight": null,
+        "worker_quarantine_failure_threshold": null
+    }"#;
+    let f = write_tmp(json);
+    let cfg = ServerConfig::load_json(f.path()).unwrap();
+    assert!(cfg.max_claims_in_flight.is_none());
+    assert!(cfg.worker_quarantine_failure_threshold.is_none());
+    // Explicit-off still passes validation.
+    cfg.validate().expect("explicit-null must remain valid");
+}
