@@ -15,13 +15,36 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Readiness: we can take traffic. Verifies a cheap DB round-trip so
-/// a coordinator that's still starting up (migrations running,
-/// rehydrate loop bootstrapping) or whose pool has saturated returns
-/// 503. An orchestrator uses this to decide whether to route traffic
-/// to this instance; unlike healthz, a failure here should NOT
-/// restart the process — it just parks us out of rotation.
+/// Readiness: this instance should receive traffic right now.
+///
+/// Unlike `/healthz` (liveness — is the process responsive at all,
+/// drives systemd / orchestrator restart), `/readyz` drives load
+/// balancer routing: 200 means "send me work," 503 means "route
+/// elsewhere." A failure here must not restart the process — it just
+/// parks us out of rotation until the underlying signal clears.
+///
+/// Three readiness checks, each short-circuiting with a distinct body:
+///   1. `draining`: an operator triggered `/admin/drain` for a
+///      rolling-upgrade cutover. New traffic belongs on a standby.
+///   2. Overload: `claims_in_flight` has reached `max_claims_in_flight`
+///      (the shedding threshold). New claims would 503 at the handler
+///      anyway; flipping readiness here lets the LB steer to a less-
+///      saturated instance and protect this one from further load.
+///   3. PG reachability: a 2s-timed `SELECT 1`. Boot-time migrations,
+///      pool saturation, or network partition all surface here.
+///
+/// Order matters: cheap in-memory checks first so a load balancer
+/// polling at 1 Hz doesn't pound PG from every replica during drain.
 pub async fn readyz(State(state): State<AppState>) -> Response {
+    if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
+    }
+    if let Some(cap) = state.cfg.max_claims_in_flight {
+        let current = state.metrics.inner.claims_in_flight.get();
+        if current >= 0 && (current as u64) >= u64::from(cap) {
+            return (StatusCode::SERVICE_UNAVAILABLE, "overloaded").into_response();
+        }
+    }
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         sqlx::query("SELECT 1").fetch_one(&state.pool),

@@ -433,11 +433,118 @@ async fn drain_rejects_further_ingest_on_existing_jobs(pool: PgPool) {
         "expected fixed 503 error shape, got: {body}"
     );
 
+    // Drain must ALSO flip /readyz → 503 so load balancers steer
+    // new traffic away during cutover. Otherwise a fresh SIGTERM
+    // candidate would keep accepting LB-routed traffic until the
+    // operator manually pulls it.
+    let readyz = http
+        .get(format!("{}/readyz", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        readyz.status().as_u16(),
+        503,
+        "drain must flip /readyz to 503 for load balancer signalling"
+    );
+    let readyz_body = readyz.text().await.unwrap();
+    assert!(
+        readyz_body.contains("draining"),
+        "readyz body during drain must identify drain, got: {readyz_body}"
+    );
+
     // Prove the new drv is NOT present — the ingest was rejected
     // before any dispatcher mutation.
     let status = client.status(job.id).await.unwrap();
     assert_eq!(
         status.counts.total, 1,
         "post-drain ingest must not have grown members"
+    );
+}
+
+/// /readyz must flip 503 once `claims_in_flight` hits
+/// `max_claims_in_flight` so load balancers steer new traffic to
+/// less-saturated replicas before the shedding threshold fires at
+/// the handler. The LB-steered traffic then avoids the 503 noise
+/// entirely — the coordinator under load stops being a routing
+/// target, not just a rejecting endpoint.
+#[sqlx::test]
+async fn readyz_flips_503_when_claims_in_flight_hits_threshold(pool: PgPool) {
+    // Tight threshold so we can exercise the overload flip without
+    // 25k actual claims.
+    let handle = common::spawn_server_with_cfg(pool, |cfg| {
+        cfg.max_claims_in_flight = Some(2);
+    })
+    .await;
+    let client = CoordinatorClient::new(handle.base_url.clone());
+    let http = reqwest::Client::new();
+
+    // Baseline: fresh coordinator, no claims → readyz is 200.
+    let pre = http
+        .get(format!("{}/readyz", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pre.status().as_u16(), 200);
+
+    // Directly bump the in_flight gauge to the threshold. Doing it
+    // via real claims is noisy (needs two jobs, two drvs, two
+    // runnable leaves, and racing real claims); this is the
+    // gauge-as-signal path and the check consumes exactly that.
+    handle.state.metrics.inner.claims_in_flight.set(2);
+
+    let at_threshold = http
+        .get(format!("{}/readyz", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        at_threshold.status().as_u16(),
+        503,
+        "readyz must 503 when claims_in_flight >= max_claims_in_flight"
+    );
+    let body = at_threshold.text().await.unwrap();
+    assert!(
+        body.contains("overload"),
+        "readyz overload body must identify overload, got: {body}"
+    );
+
+    // Back under threshold → 200.
+    handle.state.metrics.inner.claims_in_flight.set(1);
+    let under = http
+        .get(format!("{}/readyz", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        under.status().as_u16(),
+        200,
+        "readyz must return 200 once claims_in_flight drops below the threshold"
+    );
+}
+
+/// When `max_claims_in_flight = None` (operator opted out of shedding),
+/// /readyz must not 503 based on claims_in_flight at all — the
+/// overload check is silently disabled. Guards against a bug where
+/// the readyz check mishandles None.
+#[sqlx::test]
+async fn readyz_ignores_overload_when_shedding_disabled(pool: PgPool) {
+    let handle = common::spawn_server_with_cfg(pool, |cfg| {
+        cfg.max_claims_in_flight = None;
+    })
+    .await;
+    let http = reqwest::Client::new();
+
+    // Absurdly high gauge — must still be 200 when shedding is off.
+    handle.state.metrics.inner.claims_in_flight.set(1_000_000);
+    let resp = http
+        .get(format!("{}/readyz", handle.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "readyz must not 503 on overload when max_claims_in_flight is None"
     );
 }
