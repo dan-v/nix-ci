@@ -95,20 +95,54 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     tracing::info!(addr = %cfg.listen, "nix-ci coordinator listening");
 
-    let shutdown_fut = {
-        let tx = shutdown_tx.clone();
-        async move {
-            wait_for_signal().await;
-            // Flip the watch so background loops wind down concurrently
-            // with axum's graceful drain.
-            let _ = tx.send(true);
-        }
+    // Serve with an OS-signal-driven bounded drain:
+    //   1. axum serves until shutdown_rx flips true.
+    //   2. `wait_for_signal` awaits SIGTERM/Ctrl-C and flips the watch.
+    //   3. After that, axum starts its own graceful drain — which is
+    //      unbounded by default. SSE subscribers on non-terminalizing
+    //      jobs and claim long-polls can pin it indefinitely.
+    //   4. We bound that drain at `graceful_shutdown_secs`; if it
+    //      overruns we abort the serve task so the process can exit
+    //      and release the advisory lock to a standby.
+    let serve_task = {
+        let mut serve_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    // Resolve as soon as the watch holds `true`.
+                    while !*serve_shutdown.borrow() {
+                        if serve_shutdown.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                })
+                .await
+        })
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_fut)
-        .await
-        .map_err(|e| crate::Error::Internal(format!("axum serve: {e}")))?;
+    wait_for_signal().await;
+    // Kick the watch so bg tasks + the serve task's graceful_shutdown
+    // fire concurrently.
+    let _ = shutdown_tx.send(true);
+
+    let drain_budget = Duration::from_secs(cfg.graceful_shutdown_secs);
+    let serve_abort = serve_task.abort_handle();
+    match tokio::time::timeout(drain_budget, serve_task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
+            return Err(crate::Error::Internal(format!("axum serve: {e}")));
+        }
+        Ok(Err(join_err)) => {
+            tracing::warn!(error = %join_err, "axum serve task joined with error");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = drain_budget.as_secs(),
+                "axum graceful drain exceeded limit; aborting in-flight connections"
+            );
+            serve_abort.abort();
+        }
+    }
 
     drain_background_tasks(
         [
@@ -238,6 +272,148 @@ mod drain_tests {
         assert!(
             abort_flag.is_finished(),
             "stuck task must have been aborted"
+        );
+    }
+}
+
+/// Integration tests for the bounded-shutdown pattern used by `run()`.
+///
+/// The contract under test: when SIGTERM flips the shutdown watch,
+/// `axum::serve(...).with_graceful_shutdown(...)` enters its own
+/// drain, but that drain is unbounded by default — an SSE subscriber
+/// on a non-terminalizing job or a client holding a never-ending
+/// response body will pin the serve task indefinitely. Without the
+/// surrounding `tokio::time::timeout`, the process cannot exit,
+/// systemd eventually SIGKILLs it, and the Postgres advisory lock
+/// dangles until the connection dies.
+///
+/// These tests mirror the exact pattern in `run()` (spawn serve +
+/// abort_handle + timeout-bounded join) on a minimal axum app — if
+/// the pattern works here, it works in production.
+#[cfg(test)]
+mod bounded_serve_tests {
+    use axum::routing::get;
+    use axum::Router;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::sync::watch;
+
+    /// Serve with a handler that never responds; a client connects and
+    /// pins the connection. Shutdown watch flips → axum starts graceful
+    /// drain → the pinned connection would otherwise block forever.
+    /// Our bounded timeout around the serve task must abort within the
+    /// budget.
+    #[tokio::test]
+    async fn pinned_connection_is_aborted_within_drain_budget() {
+        async fn forever() -> &'static str {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        let app = Router::new().route("/stuck", get(forever));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Exact pattern from run().
+        let serve_task = {
+            let mut rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        while !*rx.borrow() {
+                            if rx.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .await
+            })
+        };
+
+        // Pin a client connection to the stuck handler. We fire a GET
+        // and don't await its body — just having the TCP connection
+        // open is enough to stall axum's graceful drain, which is the
+        // regression we're guarding against.
+        let pinned = tokio::spawn(async move {
+            // reqwest is already a workspace dep (client crate); reuse
+            // to avoid pulling another dep just for this test.
+            let _ = reqwest::Client::new()
+                .get(format!("http://{addr}/stuck"))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+        });
+
+        // Give the connect handshake a moment to land so axum knows
+        // there's an in-flight request when we trigger shutdown.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Trigger shutdown.
+        let _ = shutdown_tx.send(true);
+
+        let drain_budget = Duration::from_millis(300);
+        let serve_abort = serve_task.abort_handle();
+        let start = tokio::time::Instant::now();
+        match tokio::time::timeout(drain_budget, serve_task).await {
+            Ok(_) => panic!(
+                "serve should not drain cleanly with a pinned connection; \
+                 the unbounded drain would hang forever without our timeout"
+            ),
+            Err(_) => {
+                serve_abort.abort();
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // Budget + small overshoot. The point is: bounded, not unbounded.
+        assert!(
+            elapsed < drain_budget + Duration::from_millis(500),
+            "bounded drain took {elapsed:?}; expected close to {drain_budget:?}"
+        );
+
+        pinned.abort();
+    }
+
+    /// Positive case: when there's no pinned connection, the bounded
+    /// drain completes cleanly well under budget. Guards against a
+    /// bug where the timeout always fires (e.g. we forgot to pass
+    /// the shutdown signal through to axum, so it never starts
+    /// draining).
+    #[tokio::test]
+    async fn clean_drain_completes_fast_when_no_pinned_connection() {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let app = Router::new().route("/ok", get(ok));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let serve_task = {
+            let mut rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        while !*rx.borrow() {
+                            if rx.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .await
+            })
+        };
+
+        // No client connected. Trigger shutdown immediately.
+        let _ = shutdown_tx.send(true);
+        let drain_budget = Duration::from_secs(5);
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(drain_budget, serve_task).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_ok(), "clean drain must not hit the timeout");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "clean drain should complete near-instantly; took {elapsed:?}"
         );
     }
 }

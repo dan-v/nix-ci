@@ -70,12 +70,17 @@ pub struct ServerConfig {
     /// snapshot. Prevents a catastrophic job from producing a multi-MB
     /// JSONB row. A truncated marker is appended if exceeded.
     pub max_failures_in_result: usize,
-    /// How long to wait for axum to finish draining in-flight requests
-    /// and for background tasks (reaper / cleanup) to observe the
-    /// shutdown signal before we force the process to exit. Without a
-    /// bound, a stuck handler can wedge SIGTERM indefinitely; systemd
-    /// would eventually SIGKILL, leaving Postgres transactions to
-    /// roll back uncleanly.
+    /// Upper bound on how long we wait after SIGTERM for
+    ///   (a) axum's graceful drain to complete (in-flight requests +
+    ///       SSE streams + long-poll claims close out), AND
+    ///   (b) background tasks (reaper / cleanup / terminal-writeback
+    ///       retry) to observe the shutdown signal and exit.
+    /// Without (a), a single stuck SSE subscriber on a non-terminalizing
+    /// job can pin `axum::serve` indefinitely — systemd would eventually
+    /// SIGKILL, leaving Postgres transactions to roll back uncleanly and
+    /// the advisory lock to dangle until the underlying connection dies.
+    /// Default sized to cover the longest legitimate long-poll
+    /// (`max_claim_wait_secs`, default 60s) with headroom.
     pub graceful_shutdown_secs: u64,
     /// Per-attempt build log retention (days). Logs are pruned by the
     /// cleanup loop independently of `retention_days` because they're
@@ -244,7 +249,7 @@ impl Default for ServerConfig {
             // legitimate value for the free-form identifier fields.
             max_identifier_bytes: 512,
             max_failures_in_result: 500,
-            graceful_shutdown_secs: 30,
+            graceful_shutdown_secs: 60,
             build_log_retention_days: 7,
             submission_warn_threshold: 200_000,
             max_drvs_per_job: Some(2_000_000),
