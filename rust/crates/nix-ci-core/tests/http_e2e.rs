@@ -253,11 +253,11 @@ async fn retryable_failure_retries_then_succeeds(pool: PgPool) {
     // directly. With backoff=0, the second claim is immediately
     // eligible after the transient failure is recorded.
     //
-    // The old version mutated the in-memory step's next_attempt_at to
-    // bypass the default 30s backoff — a COMPLIANCE anti-pattern
-    // (audit H15.C): the test was proving "if we reach inside and
-    // flip a field, the retry works" rather than "the retry works as
-    // exposed by the API under a valid config."
+    // Exercise the retry via the public API under a valid config
+    // rather than mutating the in-memory step's `next_attempt_at` to
+    // bypass the 30s backoff — that would test "if we reach inside
+    // and flip a field, the retry works" rather than "the retry works
+    // as exposed by the API."
     let handle = common::spawn_server_with_cfg(pool, |cfg| {
         cfg.flaky_retry_backoff_step_ms = 0;
     })
@@ -394,18 +394,6 @@ async fn stale_complete_returns_ignored(pool: PgPool) {
         .unwrap();
     assert!(repeat.ignored);
 }
-
-// H9.2: removed `batch_ingest_full_dag_sequences_builds` (sequential
-// 3-level chain ordering) and `batch_ingest_cross_job_transitive_dedup`
-// (sequential 2-job shared-leaf dedup). Both were strictly weaker
-// than existing coverage:
-//   * topological-ordering — `contention::wide_fan_out_sequences_
-//     correctly_under_load` runs 50 leaves × 16 concurrent workers,
-//     catching CAS-on-runnable regressions the sequential version
-//     couldn't.
-//   * cross-job dedup — `cross_job_dedup_only_one_worker_builds`
-//     (immediately below) is the race variant: both jobs ingest,
-//     both race for the shared drv, exactly one worker wins.
 
 #[sqlx::test]
 async fn cross_job_dedup_only_one_worker_builds(pool: PgPool) {

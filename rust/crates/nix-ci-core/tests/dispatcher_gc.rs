@@ -1,9 +1,9 @@
-//! H15.D (dispatcher-GC closure): verifies the invariant-7 /
-//! invariant-8 contract under the "submission drops while work is
-//! in-flight" scenario. Property tests cover the invariants
-//! in-memory; chaos covers aggregate behavior; neither exercises the
-//! specific production-sensitive path where a job is cancelled while
-//! a worker is still mid-build on one of its drvs.
+//! Dispatcher-GC closure: verifies the invariant-7 / invariant-8
+//! contract under the "submission drops while work is in-flight"
+//! scenario. Property tests cover the invariants in-memory; chaos
+//! covers aggregate behavior; neither exercises the specific
+//! production-sensitive path where a job is cancelled while a worker
+//! is still mid-build on one of its drvs.
 //!
 //! Core invariant under test: an in-flight claim holds its step's
 //! Arc strong enough to survive the owning submission being removed.

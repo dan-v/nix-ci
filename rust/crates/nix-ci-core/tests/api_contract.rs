@@ -1,5 +1,4 @@
-//! H15.D regression: hard-to-get-right API contracts that the audit
-//! flagged as untested. These are adversarial / racy shapes a
+//! Hard-to-get-right API contracts: adversarial / racy shapes a
 //! production coordinator will hit and that would silently do the
 //! wrong thing if the implementation drifted.
 

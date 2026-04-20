@@ -1,5 +1,5 @@
-//! H15.D regression: the drv_parser is on the critical path — a
-//! silent parse bug would corrupt the build graph at nixpkgs scale
+//! The drv_parser is on the critical path — a silent parse bug
+//! would corrupt the build graph at nixpkgs scale
 //! (missed input_drvs → missed deps → we build the wrong thing or
 //! not enough things). Property + fuzz-style coverage makes sure
 //! arbitrary / malformed input always produces a bounded, typed

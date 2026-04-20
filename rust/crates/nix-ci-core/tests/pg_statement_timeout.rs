@@ -1,5 +1,5 @@
-//! H8.2 regression: verify `statement_timeout` is actually set on
-//! every pooled connection and is honored by Postgres. A slow-query
+//! Verify `statement_timeout` is actually set on every pooled
+//! connection and is honored by Postgres. A slow-query
 //! safety net is worthless if the session doesn't have the setting
 //! applied — this locks down the wire-up.
 

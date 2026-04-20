@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: Prometheus /metrics accuracy and admin_snapshot gauges.
+//! Prometheus /metrics accuracy and admin_snapshot gauges.
 
 mod common;
 

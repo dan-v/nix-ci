@@ -1,5 +1,5 @@
 { pkgs, self, system }:
-# H11.1: NixOS VM test that boots coordinator + worker in a two-node
+# NixOS VM test that boots coordinator + worker in a two-node
 # topology. Verifies the worker module starts, authenticates against
 # the coordinator, and successfully claims + completes a fake drv end-
 # to-end. Smoke-only: we don't drag nixpkgs into the VM; instead the

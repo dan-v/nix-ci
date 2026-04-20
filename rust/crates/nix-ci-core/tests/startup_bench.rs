@@ -16,7 +16,7 @@ use sqlx::PgPool;
 
 /// Populate 10K terminal jobs + 10K unexpired failed_outputs rows, then
 /// measure the full boot path (connect + migrate + clear_busy). Budget:
-/// 5 seconds per SPEC.md D-STARTUP-1.
+/// 5 seconds.
 ///
 /// Does NOT include the advisory-lock acquire step — that's a single
 /// SELECT taking <10ms on an uncontended Postgres.

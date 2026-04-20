@@ -91,7 +91,7 @@ pub struct MetricsInner {
     /// crossed `submission_warn_threshold`. Counts events, not drvs.
     pub submission_warn_total: Counter,
 
-    // H3 observability additions: metrics that matter at 3am.
+    // Observability metrics that matter at 3am.
     /// Histogram of how long claims live before being completed or
     /// expired. Tail = stuck workers. P99 > 10 min in a healthy
     /// nixpkgs deployment usually means a drv with runaway IO or a
@@ -401,7 +401,6 @@ impl Metrics {
             submission_warn_total.clone(),
         );
 
-        // H3: new observability metrics (not registered yet).
         let claim_age_seconds = Histogram::new([
             0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0,
         ]);

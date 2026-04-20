@@ -54,7 +54,7 @@ pub async fn complete(
         }
     };
     state.metrics.inner.claims_in_flight.dec();
-    // H3: claim-age histogram. `started_at` is an Instant, so this is
+    // Claim-age histogram. `started_at` is an Instant, so this is
     // monotonic and safe to subtract.
     let claim_age = claim.started_at.elapsed().as_secs_f64();
     state.metrics.inner.claim_age_seconds.observe(claim_age);
@@ -624,8 +624,7 @@ pub(super) async fn check_and_publish_terminal(
     // non-terminal submission we must return in O(1), not iterate
     // 10k+ toplevels. `done + failed < total` proves at least one
     // member is still non-terminal, so the submission can't be
-    // terminal yet. See docs/scale-xl-findings.md for the measured
-    // cost of the old toplevel-scan path.
+    // terminal yet.
     {
         let total = sub.members.read().len() as u32;
         let done = sub.done_count.load(Ordering::Acquire);

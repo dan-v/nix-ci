@@ -1,25 +1,17 @@
-//! Close the gap between SPEC.md exit bars and concrete regression
-//! tests. Each `#[sqlx::test]` here names the SPEC bar it covers in
-//! its first comment line — so `spec_report.sh` (H14) can parse the
-//! file and prove "this bar has a test."
+//! Regression tests for cross-cutting coordinator invariants:
+//!
+//! - No drv silently dropped from a sealed, non-terminal job — total
+//!   always = pending + building + done + failed.
+//! - For every terminal transition, exactly one
+//!   `jobs_terminal{status=x}` counter increment.
+//! - `claims_in_flight` gauge converges to 0 within 5s of quiescence.
 //!
 //! All metric assertions go through the `/metrics` HTTP endpoint
 //! (via `common::scrape_metric`) — not direct reads of
-//! `dispatcher.metrics.inner.*.get()`. The audit flagged that as a
-//! COMPLIANCE anti-pattern: it tests the in-memory shape, not the
-//! observable Prometheus contract that alerts / dashboards actually
-//! consume. Regressions in how metrics are EXPORTED (label order,
-//! name suffixing, unregistered counter) would slip by an internal
-//! read and only manifest in production when a dashboard goes blank.
-//!
-//! Scope: the bars the v2-era audit found uncovered.
-//!
-//! - C-CORRECT-3: no drv silently dropped from a sealed, non-terminal
-//!   job — total always = pending + building + done + failed.
-//! - O-METRIC-PARITY: for every terminal transition, exactly one
-//!   jobs_terminal{status=x} counter increment.
-//! - O-CLAIMS-INFLIGHT: claims_in_flight gauge converges to 0 within
-//!   5s of quiescence.
+//! `dispatcher.metrics.inner.*.get()`. Testing the observable
+//! Prometheus contract catches regressions in how metrics are
+//! EXPORTED (label order, name suffixing, unregistered counter) that
+//! an internal read would miss.
 
 use std::time::Duration;
 

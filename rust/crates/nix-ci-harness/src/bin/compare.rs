@@ -1,15 +1,9 @@
 //! nix-ci-compare: diff two `JobStatusResponse` JSONs and emit a
-//! shadow-mode divergence report.
+//! divergence report.
 //!
 //! Usage:
 //!   nix-ci-compare primary.json shadow.json
 //!   nix-ci-compare --primary <p> --shadow <s> [--output report.json]
-//!
-//! Designed to be piped from CCI post-build hooks:
-//!
-//!     curl $CCI/jobs/$ID > primary.json
-//!     curl $SHADOW_COORD/jobs/$ID > shadow.json
-//!     nix-ci-compare primary.json shadow.json | tee divergence.json
 //!
 //! Exit codes:
 //!   0 — matched (no divergence)

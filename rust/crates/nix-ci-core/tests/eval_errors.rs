@@ -1,5 +1,5 @@
-//! H7.4 regression: per-attr eval errors from nix-eval-jobs must
-//! surface in the terminal `JobStatusResponse.eval_errors` and force
+//! Per-attr eval errors from nix-eval-jobs must surface in the
+//! terminal `JobStatusResponse.eval_errors` and force
 //! the job to `Failed` even when every successfully-evaluated attr
 //! built cleanly. Previously these were logged on the runner side
 //! and invisible to the caller, so a user with one broken overlay

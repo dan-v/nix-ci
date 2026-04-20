@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: server-sent-events job_done / drv_failed / progress stream.
+//! Server-sent-events job_done / drv_failed / progress stream.
 
 mod common;
 

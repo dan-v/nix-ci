@@ -438,7 +438,7 @@ impl Submission {
     /// Used to scan every member and call `observable_state()` under
     /// `members.read()` — at 100k+ members that was ~100ms of atomic
     /// loads per call, and 1500 concurrent status polls piled up to
-    /// 500ms tail latency on `/jobs/{id}` (see docs/scale-xl-findings.md).
+    /// 500ms tail latency on `/jobs/{id}`.
     ///
     /// Now reads four atomics and does arithmetic. `total` comes from
     /// `members.read().len()` which is O(1) on HashMap. `done_count`
@@ -588,7 +588,7 @@ impl Submission {
         // `check_and_publish_terminal()` for the same pattern. Calling
         // `live_status` on a sealed job with tens of thousands of
         // toplevels 1500× concurrently was taking 450ms tail latency
-        // by iterating them all (docs/scale-xl-findings.md).
+        // by iterating them all.
         //
         // Counter invariants (maintained at transition sites):
         // - total = members.len()
@@ -940,12 +940,11 @@ mod tests {
     #[test]
     fn live_counts_totals_match_membership() {
         // `live_counts` reads cached atomic counters maintained at
-        // state-transition sites (see docs/scale-xl-findings.md). This
-        // unit test validates the arithmetic — that the four buckets
-        // add to `total` and that each bucket reflects its backing
-        // atomic — rather than the transition-site bookkeeping
-        // itself, which is covered by integration tests (complete,
-        // failure_propagation).
+        // state-transition sites. This unit test validates the
+        // arithmetic — that the four buckets add to `total` and that
+        // each bucket reflects its backing atomic — rather than the
+        // transition-site bookkeeping itself, which is covered by
+        // integration tests (complete, failure_propagation).
         let sub = Submission::new(JobId::new(), 8);
         let pending = [mk_step("p1"), mk_step("p2")];
         let building = [mk_step("b1"), mk_step("b2")];

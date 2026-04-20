@@ -1,5 +1,5 @@
-//! Regression test for H11: concurrent `POST /complete` calls on two
-//! toplevels X and Y could lose one of the failures from the
+//! Concurrent `POST /complete` calls on two toplevels X and Y could
+//! lose one of the failures from the
 //! terminal snapshot (DB `jobs.result` + the `JobDone` broadcast
 //! event).
 //!

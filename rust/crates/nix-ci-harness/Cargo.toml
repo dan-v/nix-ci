@@ -23,8 +23,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
 parking_lot = { workspace = true }
 rand = "0.8"
 

@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: terminal snapshot persistence and idempotency.
+//! Terminal snapshot persistence and idempotency.
 
 mod common;
 

@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: claim-deadline and heartbeat-timeout reaper invariants.
+//! Claim-deadline and heartbeat-timeout reaper invariants.
 
 mod common;
 

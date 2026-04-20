@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: oversized-payload caps (per-job drv cap, body size, identifier lengths).
+//! Oversized-payload caps (per-job drv cap, body size, identifier lengths).
 
 mod common;
 

@@ -1,5 +1,5 @@
-//! H7.1 regression: a worker whose build runs longer than the initial
-//! claim deadline can keep its lease alive via `POST .../extend`, and
+//! A worker whose build runs longer than the initial claim deadline
+//! can keep its lease alive via `POST .../extend`, and
 //! the coordinator must not reap a claim that the worker has just
 //! refreshed. Without this, any long nixpkgs build (webkitgtk,
 //! chromium, llvm) would be silently reclaimed, re-run on another
@@ -175,7 +175,7 @@ async fn without_extend_reaper_evicts_long_running_claim(pool: PgPool) {
 
     // Force the deadline into the past to simulate a build that took
     // too long without ever refreshing the lease — the behavior the
-    // H7.1 refresh mechanism was introduced to prevent.
+    // refresh mechanism was introduced to prevent.
     {
         let claim = handle
             .dispatcher

@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: job cancellation semantics and idempotency.
+//! Job cancellation semantics and idempotency.
 
 mod common;
 

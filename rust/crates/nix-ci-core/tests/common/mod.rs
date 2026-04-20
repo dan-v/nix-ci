@@ -157,9 +157,8 @@ pub fn ingest(
 /// Scrape the coordinator's `/metrics` endpoint and return the value
 /// of a specific metric (with optional label-set match). The value
 /// comes from the wire format Prometheus would see — not from a
-/// direct read of `dispatcher.metrics.inner.*.get()`, which the
-/// H15 audits flagged as COMPLIANCE (testing the internal shape
-/// instead of the observable contract).
+/// direct read of `dispatcher.metrics.inner.*.get()`, which tests the
+/// internal shape instead of the observable contract.
 ///
 /// - `name` is the wire metric name including any `_total` suffix
 ///   OpenMetrics adds (e.g. `nix_ci_jobs_reaped_total`,

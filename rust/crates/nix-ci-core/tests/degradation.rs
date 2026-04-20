@@ -1,11 +1,8 @@
-//! L4 degradation-contract tests.
-//!
-//! The degradation contract (see `docs/SCALE.md`):
+//! Degradation-contract tests.
 //!
 //! 1. **Claim-overload shedding** — when `claims_in_flight >=
 //!    max_claims_in_flight`, the coordinator returns 503 + Retry-After
 //!    for new claim requests. Existing claims continue unaffected.
-//!    Clients see a clean rejection, not a hang or OOM.
 //! 2. **PG outage** — claim + non-terminal complete stay live (see
 //!    `pg_faults.rs`).
 //! 3. **Oversized ingest** — rejected at ingest time with 413 +

@@ -1,4 +1,4 @@
-//! H10.1 + H10.2: drain and fence operator endpoints.
+//! Drain and fence operator endpoints.
 //!
 //! Drain is the "rolling upgrade" primitive: POST /admin/drain stops
 //! accepting new jobs / new claims, but existing in-flight work

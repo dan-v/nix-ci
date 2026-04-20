@@ -300,33 +300,31 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
         build_elapsed.as_secs()
     );
 
-    // H13 / SPEC S-CLAIM-P99: p99 claim latency must be < 200ms under
-    // this exact load shape. Catches dispatcher regressions that would
-    // inflate tail wait times (new lock contention, added PG calls on
-    // the claim hot path, etc.).
+    // p99 claim latency must be < 200ms under this exact load shape.
+    // Catches dispatcher regressions that would inflate tail wait
+    // times (new lock contention, added PG calls on the claim hot
+    // path, etc.).
     assert!(
         claim_pctiles.p99_ms < 200.0,
-        "S-CLAIM-P99 regression: p99={:.2}ms must be < 200ms (n={})",
+        "p99 regression: p99={:.2}ms must be < 200ms (n={})",
         claim_pctiles.p99_ms,
         claim_pctiles.n
     );
-    // H13 / SPEC S-CLAIM-P50: the median — a good signal for baseline
-    // dispatch overhead. 20ms is comfortably above the expected <1ms
-    // for a warm claim and safely below what a real production tail
-    // regression would look like.
+    // Median — a good signal for baseline dispatch overhead. 20ms is
+    // comfortably above the expected <1ms for a warm claim and safely
+    // below what a real production tail regression would look like.
     assert!(
         claim_pctiles.p50_ms < 20.0,
-        "S-CLAIM-P50 regression: p50={:.2}ms must be < 20ms",
+        "p50 regression: p50={:.2}ms must be < 20ms",
         claim_pctiles.p50_ms
     );
 
-    // H13 / SPEC S-INGEST-THR: at least 10K drvs/sec. This setup uses
-    // `ingest_drv` (single-drv per request) rather than batching, so
-    // the measured throughput is the per-drv latency * request rate,
-    // not the peak batch ingest rate. We assert a generous 2K/sec
-    // floor here and track the actual number in log output — raising
-    // the bar toward 10K requires switching ingest to batch mode
-    // (separate test; see spec_report.sh H14).
+    // Ingest throughput bar. This setup uses `ingest_drv` (single-drv
+    // per request) rather than batching, so the measured throughput is
+    // the per-drv latency * request rate, not the peak batch ingest
+    // rate. We assert a generous 2K/sec floor here and track the
+    // actual number in log output — the 10K/sec aspirational bar
+    // requires switching ingest to batch mode.
     let ingest_throughput = (LAYERS * WIDTH) as f64 / ingest_elapsed.as_secs_f64();
     eprintln!("ingest throughput: {ingest_throughput:.0} drvs/sec");
     assert!(
@@ -334,9 +332,9 @@ async fn production_scale_dag_with_failures(pool: PgPool) {
         "ingest throughput too low: {ingest_throughput:.0} drvs/sec (expected > 2000 with single-drv ingest)"
     );
 
-    // H13 / SPEC S-MEM-10K: coordinator RSS after 10K drvs must be
-    // bounded. 2 GiB is the SPEC bar; assert a conservative 1 GiB
-    // here as a leading indicator — a real memory leak typically
+    // Coordinator RSS after 10K drvs must be bounded. 2 GiB ceiling;
+    // assert a conservative 1 GiB here as a leading indicator — a
+    // real memory leak typically
     // shows as 10-50x growth, not a small percentage increase.
     #[cfg(target_os = "linux")]
     {

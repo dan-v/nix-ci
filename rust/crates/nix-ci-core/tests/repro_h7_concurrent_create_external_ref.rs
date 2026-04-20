@@ -1,5 +1,5 @@
-//! Reproducer for H7 (adversarial): two concurrent `POST /jobs` with
-//! the same `external_ref` can lose the idempotency race — both find
+//! Two concurrent `POST /jobs` with the same `external_ref` can
+//! lose the idempotency race — both find
 //! no existing row, both call `upsert_job`, one succeeds and the
 //! other hits the `jobs_external_ref_uniq` unique constraint and
 //! returns a 500 instead of the idempotent job id.

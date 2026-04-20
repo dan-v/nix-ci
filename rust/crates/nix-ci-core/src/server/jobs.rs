@@ -349,7 +349,7 @@ pub async fn status(
 /// snapshot — without this, a pathological job with many propagated
 /// failures would force every status call to allocate and copy a
 /// multi-megabyte `Vec<DrvFailure>`, and at 1500 concurrent callers
-/// this is a measurable hotspot (docs/scale-xl-findings.md).
+/// this is a measurable hotspot.
 ///
 /// Callers that want every failure can still get it at terminal time
 /// via `jobs.result` (written before any in-memory truncation).

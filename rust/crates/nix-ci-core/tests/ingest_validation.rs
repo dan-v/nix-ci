@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: ingest input validation (empty/malformed fields, length boundaries).
+//! Ingest input validation (empty/malformed fields, length boundaries).
 
 mod common;
 

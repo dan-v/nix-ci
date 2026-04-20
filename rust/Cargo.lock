@@ -1453,7 +1453,6 @@ name = "nix-ci-harness"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
  "nix-ci-core",
  "parking_lot",
@@ -1464,7 +1463,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

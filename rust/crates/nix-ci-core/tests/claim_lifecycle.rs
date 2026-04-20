@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: claim long-poll, deadline math, priority, fleet caps, eviction.
+//! Claim long-poll, deadline math, priority, fleet caps, eviction.
 
 mod common;
 

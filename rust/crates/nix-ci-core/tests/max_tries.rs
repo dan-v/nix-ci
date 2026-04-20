@@ -1,5 +1,5 @@
-//! H7.2 regression: a step whose retry budget is exhausted must not
-//! be issued again. Without this, a drv that repeatedly times out
+//! A step whose retry budget is exhausted must not be issued
+//! again. Without this, a drv that repeatedly times out
 //! (worker crashes, network blips that outlast the retry budget, etc.)
 //! would be re-armed by the claim reaper indefinitely — workers
 //! would take turns claiming, crashing, and getting re-armed, with no

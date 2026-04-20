@@ -515,7 +515,7 @@ fn property_many_submissions_overlapping_graphs() {
     }
 }
 
-// ─── H1: dedup-under-concurrent-submission-drop (TSan target) ────────
+// ─── Dedup-under-concurrent-submission-drop (TSan target) ────────────
 //
 // THE single load-bearing invariant of global dedup: while at least one
 // strong `Arc<Step>` for a given `drv_hash` is alive, every concurrent

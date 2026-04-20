@@ -121,7 +121,7 @@ fn invariant_4_created_before_runnable() {
     });
 }
 
-/// ─── Reservation-race (H7 regression guard) ───────────────────────
+/// ─── Reservation-race ──────────────────────────────────────────────
 ///
 /// Not one of the 8 invariants but a production-critical property: the
 /// per-job drv cap uses `fetch_add → range-check → fetch_sub rollback`.
@@ -153,7 +153,7 @@ fn reservation_cap_never_exceeded_under_race() {
             .collect::<Vec<_>>();
         assert!(
             reserved.load(Ordering::Acquire) <= CAP,
-            "reservation exceeded cap — H7 regression"
+            "reservation exceeded cap"
         );
     });
 }

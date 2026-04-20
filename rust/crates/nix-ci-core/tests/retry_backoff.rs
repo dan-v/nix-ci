@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: retryable failure retry budget and linear backoff.
+//! Retryable failure retry budget and linear backoff.
 
 mod common;
 

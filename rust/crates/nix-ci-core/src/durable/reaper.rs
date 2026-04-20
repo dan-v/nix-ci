@@ -173,8 +173,8 @@ pub fn reap_expired_claims(dispatcher: &Dispatcher) {
             continue;
         };
         dispatcher.metrics.inner.claims_in_flight.dec();
-        // H3: observe claim age on expire so the histogram captures
-        // both fast (complete) and slow (expire) tails.
+        // Observe claim age on expire so the histogram captures both
+        // fast (complete) and slow (expire) tails.
         dispatcher
             .metrics
             .inner

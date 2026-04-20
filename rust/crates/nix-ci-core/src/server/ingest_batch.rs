@@ -48,7 +48,7 @@ pub async fn submit_batch(
             "coordinator is draining; not accepting further ingest on job {id}"
         )));
     }
-    // H3: track batch size distribution so slow-ingest incidents can be
+    // Track batch size distribution so slow-ingest incidents can be
     // attributed to a runaway submitter emitting unusually large batches.
     state
         .metrics

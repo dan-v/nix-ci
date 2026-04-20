@@ -76,7 +76,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         .inner
         .steps_registry_size
         .set(state.dispatcher.steps.len() as i64);
-    // H3: PG pool usage — saturation is a leading indicator for
+    // PG pool usage — saturation is a leading indicator for
     // coordinator-induced latency spikes.
     state
         .metrics

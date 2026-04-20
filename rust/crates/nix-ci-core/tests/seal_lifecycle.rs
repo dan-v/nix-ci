@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: seal validation, cycle detection, self-loop stripping.
+//! Seal validation, cycle detection, self-loop stripping.
 
 mod common;
 

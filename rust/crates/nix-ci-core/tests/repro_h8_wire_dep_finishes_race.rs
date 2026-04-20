@@ -1,5 +1,5 @@
-//! Regression test for H8: the check-then-attach in
-//! `server::ingest_batch::wire_dep` was a TOCTOU race.
+//! The check-then-attach in `server::ingest_batch::wire_dep` was a
+//! TOCTOU race.
 //!
 //! If `dep` transitioned to `finished=true` BETWEEN the
 //! `if dep.finished.load()` check and the subsequent `attach_dep`,

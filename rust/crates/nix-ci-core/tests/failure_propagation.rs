@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: dep-failure propagation and failed_outputs cache.
+//! Dep-failure propagation and failed_outputs cache.
 
 mod common;
 

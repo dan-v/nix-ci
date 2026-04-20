@@ -1,5 +1,4 @@
-//! Auto-split from edge_cases.rs per H15.B audit decomposition.
-//! Topic: bearer-auth enforcement and public-probe bypass.
+//! Bearer-auth enforcement and public-probe bypass.
 
 mod common;
 
