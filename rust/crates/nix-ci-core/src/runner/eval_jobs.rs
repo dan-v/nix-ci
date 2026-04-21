@@ -72,6 +72,44 @@ pub struct Spawned {
     pub kill: KillHandle,
 }
 
+/// Build the `nix-eval-jobs` CLI args in exact order. Factored out of
+/// `spawn` so the option-plumbing logic is testable without spawning
+/// a real process. `--option K V` pairs come first so they apply to
+/// every subsequent flag (and to the flake-config acceptance behavior
+/// below); mode-specific args land last.
+pub(super) fn build_eval_args(
+    mode: &EvalMode,
+    workers: u32,
+    nix_options: &[(String, String)],
+    accept_flake_config: bool,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(8 + nix_options.len() * 3);
+    for (k, v) in nix_options {
+        args.push("--option".into());
+        args.push(k.clone());
+        args.push(v.clone());
+    }
+    if accept_flake_config {
+        args.push("--accept-flake-config".into());
+    }
+    args.push("--workers".into());
+    args.push(workers.to_string());
+    args.push("--show-input-drvs".into());
+    args.push("--check-cache-status".into());
+    match mode {
+        EvalMode::Flake { path, attrs } => {
+            args.push("--flake".into());
+            args.push(path.clone());
+            args.extend(attrs.iter().cloned());
+        }
+        EvalMode::Expr(e) => {
+            args.push("--expr".into());
+            args.push(e.clone());
+        }
+    }
+    args
+}
+
 /// `eval_stderr_file`: when `Some`, nix-eval-jobs stderr is redirected
 /// to this file instead of inheriting the process stderr. Keeps the
 /// runner's OutputRenderer output clean; noisy eval diagnostics land
@@ -79,25 +117,13 @@ pub struct Spawned {
 pub fn spawn(
     mode: EvalMode,
     workers: u32,
+    nix_options: &[(String, String)],
+    accept_flake_config: bool,
     eval_stderr_file: Option<&std::path::Path>,
 ) -> Result<Spawned> {
+    let args = build_eval_args(&mode, workers, nix_options, accept_flake_config);
     let mut cmd = Command::new("nix-eval-jobs");
-    cmd.arg("--workers")
-        .arg(workers.to_string())
-        .arg("--show-input-drvs")
-        .arg("--check-cache-status");
-
-    match &mode {
-        EvalMode::Flake { path, attrs } => {
-            cmd.arg("--flake").arg(path);
-            for a in attrs {
-                cmd.arg(a);
-            }
-        }
-        EvalMode::Expr(e) => {
-            cmd.arg("--expr").arg(e);
-        }
-    }
+    cmd.args(&args);
     let stderr = match eval_stderr_file {
         Some(path) => {
             let file = std::fs::File::create(path)
@@ -242,5 +268,69 @@ mod tests {
         k.kill().await;
         // Second call must also not panic / deadlock.
         k.kill().await;
+    }
+
+    #[test]
+    fn build_eval_args_no_options_flake_mode() {
+        let mode = EvalMode::Flake {
+            path: ".".into(),
+            attrs: vec!["checks.x86_64-linux".into()],
+        };
+        let args = build_eval_args(&mode, 4, &[], false);
+        assert_eq!(
+            args,
+            vec![
+                "--workers",
+                "4",
+                "--show-input-drvs",
+                "--check-cache-status",
+                "--flake",
+                ".",
+                "checks.x86_64-linux",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_eval_args_options_precede_mode_args() {
+        let mode = EvalMode::Expr("pkgs.hello".into());
+        let opts = vec![
+            ("always-allow-substitutes".into(), "true".into()),
+            ("netrc-file".into(), "/etc/nix/netrc".into()),
+        ];
+        let args = build_eval_args(&mode, 2, &opts, true);
+        assert_eq!(
+            args,
+            vec![
+                "--option",
+                "always-allow-substitutes",
+                "true",
+                "--option",
+                "netrc-file",
+                "/etc/nix/netrc",
+                "--accept-flake-config",
+                "--workers",
+                "2",
+                "--show-input-drvs",
+                "--check-cache-status",
+                "--expr",
+                "pkgs.hello",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_eval_args_accept_flake_config_independently() {
+        // Flake-config accepted without any options; the flag still
+        // lands in the right slot (after options, before --workers).
+        let mode = EvalMode::Flake {
+            path: ".".into(),
+            attrs: Vec::new(),
+        };
+        let args = build_eval_args(&mode, 1, &[], true);
+        assert_eq!(args[0], "--accept-flake-config");
+        // `--workers` immediately follows so nix-eval-jobs parses it
+        // as a flag, not as a flake attr.
+        assert_eq!(args[1], "--workers");
     }
 }

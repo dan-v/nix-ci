@@ -136,6 +136,11 @@ pub struct WorkerConfig {
     pub worker_id: Option<String>,
     /// Polling + retry tunables. Defaults preserve prior behavior.
     pub tuning: WorkerTuning,
+    /// Nix options passed as `--option KEY VALUE` to every `nix build`
+    /// the worker spawns. Mirrors `RunnerConfig::nix_options` so the
+    /// in-job worker (where runner and worker share a host) applies
+    /// identical Nix settings to both evaluate and build phases.
+    pub nix_options: Vec<(String, String)>,
 }
 
 /// Default `worker_id` when the caller doesn't override. Format:
@@ -254,6 +259,7 @@ pub async fn run(
         let job_id = claim.job_id;
         let task_shutdown = shutdown.clone();
         let tuning = cfg.tuning.clone();
+        let nix_options = cfg.nix_options.clone();
 
         join_set.spawn(async move {
             let outcome = build_and_report(
@@ -262,6 +268,7 @@ pub async fn run(
                 claim,
                 dry_run,
                 &tuning,
+                &nix_options,
                 task_shutdown,
             )
             .await;
@@ -309,6 +316,7 @@ async fn build_and_report(
     claim: ClaimResponse,
     dry_run: bool,
     tuning: &WorkerTuning,
+    nix_options: &[(String, String)],
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let started_at_wall = chrono::Utc::now();
@@ -325,7 +333,13 @@ async fn build_and_report(
     let outcome = if dry_run {
         BuildOutcome::success(0)
     } else {
-        build(&claim.drv_path, tuning.max_build_secs, &mut shutdown).await
+        build(
+            &claim.drv_path,
+            tuning.max_build_secs,
+            nix_options,
+            &mut shutdown,
+        )
+        .await
     };
     let duration_ms = start.elapsed().as_millis() as u64;
     let ended_at_wall = chrono::Utc::now();
@@ -567,10 +581,33 @@ impl CapturedLog {
     }
 }
 
+/// Build the `nix build` CLI args in exact order. Factored out of
+/// `build` so the option-plumbing is testable without spawning a real
+/// `nix` process. `--option K V` pairs come first (after `build`)
+/// so they affect every subsequent flag + the substitution behavior.
+pub(super) fn build_nix_args(
+    drv_path: &str,
+    nix_options: &[(String, String)],
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(5 + nix_options.len() * 3);
+    args.push("build".into());
+    for (k, v) in nix_options {
+        args.push("--option".into());
+        args.push(k.clone());
+        args.push(v.clone());
+    }
+    args.push("--no-link".into());
+    args.push("--print-out-paths".into());
+    args.push("--keep-going".into());
+    args.push(format!("{drv_path}^*"));
+    args
+}
+
 #[tracing::instrument(skip_all, fields(drv_path = %drv_path))]
 async fn build(
     drv_path: &str,
     max_build: Option<Duration>,
+    nix_options: &[(String, String)],
     shutdown: &mut watch::Receiver<bool>,
 ) -> BuildOutcome {
     // Fast-path: if shutdown is already set when we arrive (e.g., the
@@ -579,12 +616,9 @@ async fn build(
         return BuildOutcome::cancelled();
     }
 
+    let args = build_nix_args(drv_path, nix_options);
     let mut cmd = Command::new("nix");
-    cmd.arg("build")
-        .arg("--no-link")
-        .arg("--print-out-paths")
-        .arg("--keep-going")
-        .arg(format!("{drv_path}^*"))
+    cmd.args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         // Belt-and-suspenders: if this task is dropped (e.g., JoinSet
@@ -1599,6 +1633,54 @@ mod classify_tests {
                 "exit {code} synthesized BuildFailure from generic stderr"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod nix_args_tests {
+    use super::*;
+
+    #[test]
+    fn build_nix_args_no_options() {
+        let args = build_nix_args("/nix/store/abc-hello.drv", &[]);
+        assert_eq!(
+            args,
+            vec![
+                "build",
+                "--no-link",
+                "--print-out-paths",
+                "--keep-going",
+                "/nix/store/abc-hello.drv^*",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_nix_args_options_between_build_and_flags() {
+        // `build` is the subcommand and must come first; `--option`
+        // pairs follow it so Nix parses them as global settings for
+        // this invocation; then the rest of the flags and the drv.
+        let opts = vec![
+            ("always-allow-substitutes".into(), "true".into()),
+            ("netrc-file".into(), "/custom/netrc".into()),
+        ];
+        let args = build_nix_args("/nix/store/abc-hello.drv", &opts);
+        assert_eq!(
+            args,
+            vec![
+                "build",
+                "--option",
+                "always-allow-substitutes",
+                "true",
+                "--option",
+                "netrc-file",
+                "/custom/netrc",
+                "--no-link",
+                "--print-out-paths",
+                "--keep-going",
+                "/nix/store/abc-hello.drv^*",
+            ]
+        );
     }
 }
 

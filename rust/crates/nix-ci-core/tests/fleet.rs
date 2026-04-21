@@ -219,6 +219,7 @@ async fn fleet_worker_drains_multiple_jobs_concurrently(pool: PgPool) {
             dry_run: true,
             worker_id: None,
             tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
+            nix_options: vec![],
         };
         tokio::spawn(async move { worker::run(client, cfg, sd_rx).await })
     };
@@ -261,6 +262,7 @@ async fn fleet_worker_outlives_individual_jobs(pool: PgPool) {
             dry_run: true,
             worker_id: None,
             tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
+            nix_options: vec![],
         };
         tokio::spawn(async move { worker::run(client, cfg, sd_rx).await })
     };

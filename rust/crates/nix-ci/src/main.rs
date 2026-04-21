@@ -154,6 +154,21 @@ struct RunCmd {
     /// `eval.stderr` with nix-eval-jobs diagnostic output.
     #[arg(long)]
     artifacts_dir: Option<std::path::PathBuf>,
+    /// Nix option passed as `--option KEY VALUE` to every `nix` /
+    /// `nix-eval-jobs` invocation the runner spawns. Repeat for
+    /// multiple. Example: `--nix-option always-allow-substitutes=true`
+    /// to force substitution of drvs marked `allowSubstitutes=false`
+    /// (common with naersk / similar wrappers). Can also be supplied
+    /// via `NIX_CI_NIX_OPTIONS="k1=v1;k2=v2"`; CLI flags append after
+    /// env entries so CLI wins when the same key is set twice.
+    #[arg(long = "nix-option", value_name = "KEY=VALUE")]
+    nix_option: Vec<String>,
+    /// Pass `--accept-flake-config` to `nix-eval-jobs` so the flake's
+    /// `nixConfig` (e.g. `extra-substituters`) is honored even when
+    /// the invoking user isn't in `trusted-users`. Matches Nix's own
+    /// off-by-default posture.
+    #[arg(long)]
+    accept_flake_config: bool,
     /// Attributes to evaluate (positional). Required with --flake.
     attrs: Vec<String>,
 }
@@ -181,6 +196,12 @@ struct WorkerCmd {
     /// Dry run: don't actually invoke `nix build`, just report success.
     #[arg(long)]
     dry_run: bool,
+    /// Nix option passed as `--option KEY VALUE` to every `nix build`
+    /// the worker spawns. Repeat for multiple. Also accepts
+    /// `NIX_CI_NIX_OPTIONS="k1=v1;k2=v2"`; CLI flags append after env
+    /// entries.
+    #[arg(long = "nix-option", value_name = "KEY=VALUE")]
+    nix_option: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -491,6 +512,45 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Parse a single `KEY=VALUE` entry into a Nix option pair. Empty
+/// values are allowed (`foo=` → `("foo", "")`) — a couple of Nix
+/// settings treat empty as "reset to default." Empty keys are not.
+fn parse_nix_option(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("bad nix option {s:?}: expected KEY=VALUE"))?;
+    let k = k.trim();
+    if k.is_empty() {
+        return Err(format!("bad nix option {s:?}: empty key"));
+    }
+    Ok((k.to_string(), v.trim().to_string()))
+}
+
+/// Parse the `NIX_CI_NIX_OPTIONS` env var shape:
+/// `"k1=v1;k2=v2"` — semicolon-separated, whitespace tolerated.
+/// Empty entries skipped so `"; k=v ;"` round-trips cleanly.
+fn parse_nix_options_env(env: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for part in env.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(parse_nix_option(part)?);
+    }
+    Ok(out)
+}
+
+/// Merge env-provided options with CLI flags. Env first so CLI wins
+/// on duplicate keys (Nix's own semantics: last `--option` wins).
+fn resolve_nix_options(cli: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out = match std::env::var("NIX_CI_NIX_OPTIONS") {
+        Ok(s) if !s.trim().is_empty() => parse_nix_options_env(&s)
+            .map_err(|e| anyhow::anyhow!("NIX_CI_NIX_OPTIONS: {e}"))?,
+        _ => Vec::new(),
+    };
+    for entry in cli {
+        out.push(parse_nix_option(entry).map_err(|e| anyhow::anyhow!("--nix-option: {e}"))?);
+    }
+    Ok(out)
+}
+
 /// Parse `1h`, `30m`, `7d` etc. and return the wall-clock time
 /// `Utc::now() - dur` for use as a `since` filter.
 fn parse_duration_to_since(s: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
@@ -524,6 +584,7 @@ async fn worker_cmd(cmd: WorkerCmd) -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or(runner_defaults.supported_features);
+    let nix_options = resolve_nix_options(&cmd.nix_option)?;
 
     let client = Arc::new(CoordinatorClient::new(cmd.coordinator));
     let cfg = WorkerConfig {
@@ -534,6 +595,7 @@ async fn worker_cmd(cmd: WorkerCmd) -> anyhow::Result<()> {
         dry_run: cmd.dry_run,
         worker_id: Some(worker::default_worker_id()),
         tuning: nix_ci_core::runner::worker::WorkerTuning::default(),
+        nix_options,
     };
 
     // Wire SIGTERM / Ctrl-C to the worker's shutdown watch.
@@ -581,11 +643,14 @@ async fn run_cmd(cmd: RunCmd) -> anyhow::Result<()> {
         }
     };
 
+    let nix_options = resolve_nix_options(&cmd.nix_option)?;
     let mut cfg = RunnerConfig {
         coordinator_url: cmd.coordinator,
         eval_workers: cmd.eval_workers,
         dry_run: cmd.dry_run,
         verbose: cmd.verbose,
+        nix_options,
+        accept_flake_config: cmd.accept_flake_config,
         ..RunnerConfig::default()
     };
     if let Some(n) = cmd.max_parallel {
@@ -675,4 +740,78 @@ async fn status_cmd(url: &str) -> anyhow::Result<()> {
     let snap = client.admin_snapshot().await?;
     println!("{:#?}", snap);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nix_option_basic() {
+        assert_eq!(
+            parse_nix_option("foo=bar").unwrap(),
+            ("foo".into(), "bar".into())
+        );
+    }
+
+    #[test]
+    fn parse_nix_option_empty_value_allowed() {
+        // A few Nix settings treat the empty string as "reset to
+        // default" — don't reject it up front.
+        assert_eq!(
+            parse_nix_option("foo=").unwrap(),
+            ("foo".into(), "".into())
+        );
+    }
+
+    #[test]
+    fn parse_nix_option_empty_key_rejected() {
+        assert!(parse_nix_option("=bar").is_err());
+    }
+
+    #[test]
+    fn parse_nix_option_missing_equals_rejected() {
+        assert!(parse_nix_option("foo").is_err());
+    }
+
+    #[test]
+    fn parse_nix_option_trims_whitespace_in_key() {
+        // Whitespace around `=` shouldn't smuggle into the option name.
+        assert_eq!(
+            parse_nix_option(" foo = bar ").unwrap(),
+            ("foo".into(), "bar".into())
+        );
+    }
+
+    #[test]
+    fn parse_nix_option_value_with_equals_preserved() {
+        // Nix allows `=` in values (e.g., URL query strings). Only
+        // the first `=` is the separator.
+        assert_eq!(
+            parse_nix_option("extra-substituters=https://foo?a=b").unwrap(),
+            ("extra-substituters".into(), "https://foo?a=b".into())
+        );
+    }
+
+    #[test]
+    fn parse_nix_options_env_multiple() {
+        let got = parse_nix_options_env("a=1;b=2 ; c=3").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a".into(), "1".into()),
+                ("b".into(), "2".into()),
+                ("c".into(), "3".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_nix_options_env_empty_entries_skipped() {
+        let got = parse_nix_options_env(";a=1;;b=2;").unwrap();
+        assert_eq!(
+            got,
+            vec![("a".into(), "1".into()), ("b".into(), "2".into())]
+        );
+    }
 }

@@ -610,6 +610,19 @@ pub struct RunnerConfig {
     /// pre-redesign behavior). Default false; default mode shows
     /// periodic progress + immediate failure blocks + summary.
     pub verbose: bool,
+    /// Nix options passed as `--option KEY VALUE` to every `nix` and
+    /// `nix-eval-jobs` invocation the runner spawns. Lets operators
+    /// fix host-specific Nix config gaps (e.g.
+    /// `always-allow-substitutes=true` so naersk-style drvs get
+    /// substituted, `netrc-file=/custom/path` for non-default netrc
+    /// locations) without a code change. Order preserved; if the
+    /// same key is set twice Nix uses the last one.
+    pub nix_options: Vec<(String, String)>,
+    /// When true, pass `--accept-flake-config` to `nix-eval-jobs` so
+    /// the flake's `nixConfig` (extra-substituters, trusted-public-
+    /// keys, etc.) is honored even when the invoking user isn't in
+    /// `trusted-users`. Off by default to match Nix's own behavior.
+    pub accept_flake_config: bool,
 }
 
 impl Default for RunnerConfig {
@@ -622,6 +635,8 @@ impl Default for RunnerConfig {
             eval_workers: 4,
             dry_run: false,
             verbose: false,
+            nix_options: Vec::new(),
+            accept_flake_config: false,
         }
     }
 }

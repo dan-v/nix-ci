@@ -192,9 +192,28 @@ pub async fn run(
     Ok(stats)
 }
 
-/// Whether a top-level attr's `cacheStatus` indicates it's already
-/// substitutable. Accepts nix-eval-jobs 2.x string form and legacy
-/// boolean form.
+/// Whether a top-level attr's `cacheStatus` means we can skip ingest
+/// because the closure is verifiably available from a substituter.
+/// nix-eval-jobs emits:
+///   - `"cached"`: closure needs substitution, all paths available
+///     from a configured substituter. Safe to skip — any worker
+///     (same host or fleet elsewhere) can substitute identically.
+///   - `"local"`: closure is fully valid in the runner's local
+///     store — NOT evidence of substituter presence. A previous
+///     post-build-hook may have failed silently, leaving cachix
+///     empty. Skipping would perpetuate that: fleet workers elsewhere
+///     can't substitute and never get a chance to rebuild + re-push.
+///     We ingest instead; if the worker is co-located on the same
+///     host, `nix build` no-ops on the already-valid path (cheap). If
+///     the worker is a fleet host without the path locally, it'll
+///     substitute from cachix (hit → confirms cache populated) or
+///     rebuild + push (miss → self-heals the cache).
+///   - `"notBuilt"`: real build required; ingest and dispatch.
+///
+/// The legacy `isCached: bool` from older nix-eval-jobs unifies
+/// cached + local into `true` and we can't distinguish them through
+/// that field, so we conservatively trust it (it's what the code
+/// always did and older emitters are rare in practice).
 fn attr_is_cached(line: &EvalLine) -> bool {
     matches!(
         &line.cache_status,
@@ -318,6 +337,20 @@ mod tests {
     fn attr_is_cached_with_string_notbuilt_is_false() {
         let line = EvalLine {
             cache_status: Some(serde_json::Value::String("notBuilt".into())),
+            ..default_line()
+        };
+        assert!(!attr_is_cached(&line));
+    }
+
+    #[test]
+    fn attr_is_cached_with_string_local_is_false() {
+        // `"local"` means the closure is present in the runner's
+        // local store — NOT evidence it's in cachix. We ingest
+        // instead so fleet workers on other hosts get a chance to
+        // substitute-or-rebuild, which self-heals a previously
+        // failed post-build-hook push. See `attr_is_cached` docstring.
+        let line = EvalLine {
+            cache_status: Some(serde_json::Value::String("local".into())),
             ..default_line()
         };
         assert!(!attr_is_cached(&line));

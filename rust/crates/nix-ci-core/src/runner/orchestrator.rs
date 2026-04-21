@@ -90,6 +90,7 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
             dry_run: args.cfg.dry_run,
             worker_id: Some(worker::default_worker_id()),
             tuning: crate::runner::worker::WorkerTuning::default(),
+            nix_options: args.cfg.nix_options.clone(),
         };
         tokio::spawn(async move { worker::run(client, cfg, rx).await })
     };
@@ -121,6 +122,8 @@ pub async fn run(args: RunArgs) -> Result<RunOutcome> {
     } = crate::runner::eval_jobs::spawn(
         args.mode,
         args.cfg.eval_workers,
+        &args.cfg.nix_options,
+        args.cfg.accept_flake_config,
         eval_stderr_path.as_deref(),
     )?;
 
